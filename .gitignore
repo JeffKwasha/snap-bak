@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.so
+config/config.json
+.venv/
+.pytest_cache/
+coverage.xml
+.tox/
+.mypy_cache/
+.ruff_cache/
