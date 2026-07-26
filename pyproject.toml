@@ -3,10 +3,10 @@ name = "snap-bak"
 version = "0.1.0"
 description = "Btrfs Snapshot -> Restic Backup Orchestrator"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["pydantic>=2.0"]
 
 [project.scripts]
-snap-bak = "scripts.btrfs_restic:main"
+snap-bak = "scripts.snapbak:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
