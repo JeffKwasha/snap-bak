@@ -35,6 +35,9 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from typing import NamedTuple
+
+from dateutil.relativedelta import relativedelta
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # --- Constants ---
@@ -44,7 +47,6 @@ DEFAULT_MOUNT_BASE = Path("/bak")
 DEFAULT_STUCK_THRESHOLD = 3600  # 1 hour
 DEFAULT_TIMEOUT = 86400  # 24 hours
 DEFAULT_BACKUP_RETRIES = 3
-DEFAULT_SNAPSHOTS_TO_KEEP = 5
 DEFAULT_BACKUP_INTERVAL = 3600  # 1 hour
 RETRY_DELAY = 5  # seconds between retry attempts
 
@@ -54,6 +56,62 @@ EXIT_ERROR = 1
 EXIT_CONFIG_ERROR = 2
 EXIT_MOUNT_ERROR = 3
 EXIT_PERMISSION_ERROR = 4
+
+
+# --- Retention functions ---
+
+class Snapshot(NamedTuple):
+    path: Path
+    time: datetime
+
+
+def build_retention_exponential(n: int = 1) -> list[datetime]:
+    """Generate tier boundaries at exponential intervals: 1h, 2h, 4h, 8h..."""
+    now = datetime.now()
+    return [now - relativedelta(hours=2**i) for i in range(0, n)]
+
+
+def build_retention_datetimes(
+    hourly: int = 0, daily: int = 0, weekly: int = 0,
+    monthly: int = 0, yearly: int = 0,
+) -> list[datetime]:
+    """Generate calendar-based retention boundaries.
+
+    Each tier starts after the previous tiers end.
+    E.g., hourly=2, daily=1 → 2 hourly slots + 1 daily slot starting 2h ago.
+    """
+    now = datetime.now()
+    hours = [now - relativedelta(hours=i) for i in range(0, hourly)]
+    days = [now - relativedelta(hours=hourly, days=i) for i in range(0, daily)]
+    weeks = [now - relativedelta(hours=hourly, days=daily, weeks=i) for i in range(0, weekly)]
+    months = [now - relativedelta(hours=hourly, days=daily, weeks=weekly, months=i) for i in range(0, monthly)]
+    years = [now - relativedelta(hours=hourly, days=daily, weeks=weekly, months=monthly, years=i) for i in range(0, yearly)]
+    return list(set(hours + days + weeks + months + years))
+
+
+def build_snapshot_keeplist(snapshots: list[Snapshot], retentions: list[datetime]) -> set[Path]:
+    """Determine which snapshots to keep based on retention tier boundaries.
+
+    For each retention boundary (oldest to newest), keeps the oldest
+    snapshot that is still newer than that boundary.
+    """
+    if not snapshots or not retentions:
+        return {s.path for s in snapshots}
+
+    keeps = set()
+    for boundary in sorted(retentions):
+        candidates = [s for s in snapshots if s.time >= boundary]
+        if candidates:
+            oldest = min(candidates, key=lambda s: s.time)
+            keeps.add(oldest.path)
+    return keeps
+    return keeps
+
+
+RETENTION_FN = {
+    "exponential": build_retention_exponential,
+    "datetimes": build_retention_datetimes,
+}
 
 
 def _get_state_dir() -> Path:
@@ -203,8 +261,8 @@ class Job(BaseModel):
     name: str
     repo: str
     snapshot_dir: str
-    retention: dict = Field(default_factory=dict)
-    snapshots_to_keep: int = Field(default=DEFAULT_SNAPSHOTS_TO_KEEP, ge=1)
+    backup_retention: dict = Field(default_factory=dict)
+    snapshot_retention: dict = Field(default_factory=lambda: {"fn": "exponential", "config": {"n": 5}})
     backup_interval: int = Field(default=DEFAULT_BACKUP_INTERVAL, ge=1)
     backup_window_start: str | None = None
     backup_window_end: str | None = None
@@ -539,58 +597,45 @@ class Job(BaseModel):
 
     def _forget_and_prune(self, repo: Repo | None = None):
         """Apply retention policy via forget + prune."""
-        if not self.retention:
+        if not self.backup_retention:
             return
         cmd = self._build_restic_cmd("forget", repo)
         cmd.extend(["--tag", self.name])
-        for key, val in self.retention.items():
+        for key, val in self.backup_retention.items():
             cmd.extend([f"--keep-{key}", str(val)])
         cmd.append("--prune")
         self._run(cmd, timeout=self.timeout)
 
-    def _cleanup_snapshots_exponential(self, protected_snapshot: str | None = None):
-        """Delete snapshots using exponential staggered retention.
+    def _cleanup_snapshots(self, protected_snapshot: str | None = None):
+        """Delete snapshots using configured retention strategy.
 
-        Keeps N snapshots spaced exponentially:
-        - Tier 1: oldest snapshot within last 1 hour
-        - Tier 2: oldest snapshot within last 2 hours
-        - Tier 3: oldest snapshot within last 4 hours
-        - Tier N: oldest snapshot within last 2^(N-1) hours
-
+        Supports exponential and datetimes (calendar-based) retention.
         The protected snapshot (currently being backed up) is never deleted.
         """
-        if self.snapshots_to_keep <= 0:
+        cfg = self.snapshot_retention
+        if not cfg or cfg.get("fn") not in RETENTION_FN:
             return
 
-        now = datetime.now()
+        fn = RETENTION_FN[cfg["fn"]]
+        retentions = fn(**cfg.get("config", {}))
+
         subs = [p for p in Path(self.snapshot_dir).iterdir() if p.is_dir()]
-        valid = [(p, self._parse_snapshot_time(p)) for p in subs]
-        valid = [(p, t) for p, t in valid if t is not None]
+        valid = [Snapshot(p, t) for p, t in
+                 ((p, self._parse_snapshot_time(p)) for p in subs)
+                 if t is not None]
 
         if not valid:
             return
 
-        # Collect snapshots to keep (oldest in each tier)
-        keep_paths = set()
-        for i in range(1, self.snapshots_to_keep + 1):
-            window = timedelta(hours=2 ** (i - 1))
-            cutoff = now - window
-            candidates = [(p, t) for p, t in valid if t >= cutoff]
-            if not candidates:
-                continue
-            # Keep the OLDEST snapshot in this tier (creates exponential spacing)
-            oldest = sorted(candidates, key=lambda x: x[1])[0][0]
-            keep_paths.add(oldest)
+        keep_paths = build_snapshot_keeplist(valid, retentions)
 
-        # Also keep the protected snapshot
         if protected_snapshot:
             keep_paths.add(Path(self.snapshot_dir) / protected_snapshot)
 
-        # Delete everything not in keep_paths
-        for p, t in valid:
-            if p not in keep_paths:
-                logger.info(f"Deleting old snapshot: {p.name}")
-                self._run(["btrfs", "subvolume", "delete", str(p)])
+        for s in valid:
+            if s.path not in keep_paths:
+                logger.info(f"Deleting old snapshot: {s.path.name}")
+                self._run(["btrfs", "subvolume", "delete", str(s.path)])
 
     # --- Throughput learning ---
 
@@ -706,7 +751,7 @@ class Job(BaseModel):
                                 failed_snapshot_name,
                                 snap_time,
                             )
-                            self._cleanup_snapshots_exponential(protected_snapshot=failed_snapshot_name)
+                            self._cleanup_snapshots(protected_snapshot=failed_snapshot_name)
                             return {"job": self.name, "status": "success"}
                     except LockError:
                         self._write_status("skipped", "Another instance is running")
@@ -731,7 +776,7 @@ class Job(BaseModel):
         if time_since is not None and time_since < self.backup_interval:
             logger.info(f"Job {self.name}: {time_since:.0f}s since last backup "
                         f"(interval: {self.backup_interval}s). Skipping backup, running cleanup.")
-            self._cleanup_snapshots_exponential()
+            self._cleanup_snapshots()
             self._write_status("skipped", "Not time for backup yet")
             return {"job": self.name, "status": "skipped"}
 
@@ -739,7 +784,7 @@ class Job(BaseModel):
         if not self._is_within_backup_window():
             logger.info(f"Job {self.name}: outside backup window "
                         f"({self.backup_window_start}-{self.backup_window_end}). Skipping backup.")
-            self._cleanup_snapshots_exponential()
+            self._cleanup_snapshots()
             self._write_status("skipped", "Outside backup window")
             return {"job": self.name, "status": "skipped"}
 
@@ -781,7 +826,7 @@ class Job(BaseModel):
                     snapshot_name,
                     snap_time,
                 )
-                self._cleanup_snapshots_exponential(protected_snapshot=snapshot_name)
+                self._cleanup_snapshots(protected_snapshot=snapshot_name)
                 return {"job": self.name, "status": "success"}
 
         except LockError:

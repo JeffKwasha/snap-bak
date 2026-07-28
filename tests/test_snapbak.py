@@ -15,11 +15,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts.snapbak import (
     DEFAULT_BACKUP_RETRIES,
     DEFAULT_BACKUP_INTERVAL,
-    DEFAULT_SNAPSHOTS_TO_KEEP,
     Job,
     Repo,
     SnapBakConfig,
+    build_retention_datetimes,
+    build_retention_exponential,
+    build_snapshot_keeplist,
     load_config,
+    Snapshot,
 )
 
 
@@ -88,7 +91,7 @@ class TestParseSnapshotTime:
 
 class TestExponentialCleanup:
     def test_keeps_correct_snapshots(self, sample_job, create_snapshots):
-        """With snapshots_to_keep=4, keep oldest in each tier."""
+        """With snapshot_retention n=4, keep oldest in each tier."""
         now = datetime.now()
         snapshot_times = {
             "20m": now - timedelta(minutes=20),
@@ -104,12 +107,12 @@ class TestExponentialCleanup:
             snapshot_names[label] = name
             create_snapshots(name, dt)
 
-        sample_job.snapshots_to_keep = 4
+        sample_job.snapshot_retention = {"fn": "exponential", "config": {"n": 4}}
 
         deleted = []
         sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[3]) if cmd[0] == "btrfs" else None)
 
-        sample_job._cleanup_snapshots_exponential()
+        sample_job._cleanup_snapshots()
 
         kept_names = {snapshot_names["20m"], snapshot_names["90m"], snapshot_names["3h"], snapshot_names["7h"]}
         deleted_names = {snapshot_names["12h"], snapshot_names["20h"]}
@@ -127,10 +130,10 @@ class TestExponentialCleanup:
         create_snapshots("1h_ago", now - timedelta(hours=1))
         create_snapshots("2h_ago", now - timedelta(hours=2))
 
-        sample_job.snapshots_to_keep = 5
+        sample_job.snapshot_retention = {"fn": "exponential", "config": {"n": 5}}
         sample_job._run = MagicMock()
 
-        sample_job._cleanup_snapshots_exponential()
+        sample_job._cleanup_snapshots()
 
         btrfs_calls = [c for c in sample_job._run.call_args_list if c.args[0][0] == "btrfs"]
         assert len(btrfs_calls) == 0
@@ -142,23 +145,23 @@ class TestExponentialCleanup:
         create_snapshots("2h_ago", now - timedelta(hours=2))
         create_snapshots("3h_ago", now - timedelta(hours=3))
 
-        sample_job.snapshots_to_keep = 2
+        sample_job.snapshot_retention = {"fn": "exponential", "config": {"n": 2}}
         deleted = []
         sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[2]) if cmd[0] == "btrfs" else None)
 
-        sample_job._cleanup_snapshots_exponential(protected_snapshot="2h_ago")
+        sample_job._cleanup_snapshots(protected_snapshot="2h_ago")
 
         assert (Path(sample_job.snapshot_dir) / "2h_ago").exists()
 
     def test_zero_snapshots_to_keep_skips_cleanup(self, sample_job, create_snapshots):
-        """If snapshots_to_keep <= 0, skip cleanup entirely."""
+        """If fn not in RETENTION_FN, skip cleanup entirely."""
         now = datetime.now()
         create_snapshots("1h_ago", now - timedelta(hours=1))
 
-        sample_job.snapshots_to_keep = 0
+        sample_job.snapshot_retention = {"fn": "invalid", "config": {}}
         sample_job._run = MagicMock()
 
-        sample_job._cleanup_snapshots_exponential()
+        sample_job._cleanup_snapshots()
 
         btrfs_calls = [c for c in sample_job._run.call_args_list if c.args[0][0] == "btrfs"]
         assert len(btrfs_calls) == 0
@@ -169,11 +172,11 @@ class TestExponentialCleanup:
         create_snapshots("20240115_103000", now - timedelta(hours=1))
         create_snapshots("random_name", now - timedelta(hours=2))
 
-        sample_job.snapshots_to_keep = 5
+        sample_job.snapshot_retention = {"fn": "exponential", "config": {"n": 5}}
         deleted = []
         sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[2]) if cmd[0] == "btrfs" else None)
 
-        sample_job._cleanup_snapshots_exponential()
+        sample_job._cleanup_snapshots()
 
         assert not any("random_name" in d for d in deleted)
 
@@ -249,14 +252,6 @@ class TestConfigValidation:
             jobs=[{"name": "test", "snapshot_dir": "/tmp", "repo": "primary"}],
         )
         assert config.repos[0].password_file == "/path/to/pass"
-
-    def test_snapshots_to_keep_must_be_positive(self):
-        """snapshots_to_keep must be >= 1."""
-        with pytest.raises(Exception):
-            SnapBakConfig(
-                repos=[{"name": "primary", "path": "rclone:test"}],
-                jobs=[{"name": "test", "snapshot_dir": "/tmp", "repo": "primary", "snapshots_to_keep": 0}],
-            )
 
     def test_backup_retries_must_be_positive(self):
         """backup_retries must be >= 1."""
@@ -470,7 +465,9 @@ class TestSnapBakConfig:
                 {"name": "primary", "path": "rclone:CONFIG_ENTRY:DIRECTORY", "size_limit": 100, "latency_ms": 50, "throughput_mbps": 10},
             ],
             jobs=[
-                {"name": "test", "snapshot_dir": "/tmp", "repo": "primary", "snapshots_to_keep": 3, "backup_interval": 7200},
+                {"name": "test", "snapshot_dir": "/tmp", "repo": "primary",
+                 "snapshot_retention": {"fn": "exponential", "config": {"n": 3}},
+                 "backup_interval": 7200},
             ],
         )
         jobs = config.resolve_jobs(str(tmp_path / "config.json"))
@@ -480,7 +477,7 @@ class TestSnapBakConfig:
         assert job.name == "test"
         assert job.repo == "primary"
         assert job.repo_path == "rclone:CONFIG_ENTRY:DIRECTORY"
-        assert job.snapshots_to_keep == 3
+        assert job.snapshot_retention == {"fn": "exponential", "config": {"n": 3}}
         assert job.backup_interval == 7200
         assert len(job.repos) == 1
         assert job.repos[0].name == "primary"
@@ -494,7 +491,7 @@ class TestSnapBakConfig:
         jobs = config.resolve_jobs(str(tmp_path / "config.json"))
 
         job = jobs[0]
-        assert job.snapshots_to_keep == DEFAULT_SNAPSHOTS_TO_KEEP
+        assert job.snapshot_retention == {"fn": "exponential", "config": {"n": 5}}
         assert job.backup_interval == DEFAULT_BACKUP_INTERVAL
         assert job.backup_retries == DEFAULT_BACKUP_RETRIES
 
@@ -610,3 +607,131 @@ class TestBackupWindow:
         with patch("scripts.snapbak.datetime") as mock_dt:
             mock_dt.now.return_value = datetime(2024, 1, 15, 17, 0, 0)
             assert sample_job._is_within_backup_window() is False
+
+
+# --- Retention function tests ---
+
+class TestBuildRetentionExponential:
+    def test_generates_correct_tiers(self):
+        """n=4 should produce boundaries at 1h, 2h, 4h, 8h."""
+        now = datetime.now()
+        result = build_retention_exponential(n=4)
+        assert len(result) == 4
+        for i, dt in enumerate(result):
+            expected = now - timedelta(hours=2**i)
+            assert abs((dt - expected).total_seconds()) < 1
+
+    def test_n_1_returns_one_boundary(self):
+        result = build_retention_exponential(n=1)
+        assert len(result) == 1
+
+    def test_n_0_returns_empty(self):
+        result = build_retention_exponential(n=0)
+        assert len(result) == 0
+
+
+class TestBuildRetentionDatetimes:
+    def test_hourly_only(self):
+        now = datetime.now()
+        result = build_retention_datetimes(hourly=3)
+        assert len(result) == 3
+        for dt in result:
+            assert (now - dt).total_seconds() < 60 * 60 * 3 + 1
+
+    def test_daily_only(self):
+        now = datetime.now()
+        result = build_retention_datetimes(daily=2)
+        assert len(result) == 2
+
+    def test_combined_hourly_daily(self):
+        """hourly=2, daily=1 → 3 total boundaries."""
+        result = build_retention_datetimes(hourly=2, daily=1)
+        assert len(result) == 3
+
+    def test_all_zero_returns_empty(self):
+        result = build_retention_datetimes()
+        assert len(result) == 0
+
+
+class TestBuildSnapshotKeeplist:
+    def test_keeps_oldest_in_each_tier(self):
+        """With 4 tier boundaries, keeps the oldest snapshot in each tier."""
+        now = datetime.now()
+        snaps = [
+            Snapshot(Path("20m"), now - timedelta(minutes=20)),
+            Snapshot(Path("90m"), now - timedelta(minutes=90)),
+            Snapshot(Path("3h"), now - timedelta(hours=3)),
+            Snapshot(Path("7h"), now - timedelta(hours=7)),
+            Snapshot(Path("12h"), now - timedelta(hours=12)),
+        ]
+        rets = [
+            now - timedelta(hours=1),
+            now - timedelta(hours=2),
+            now - timedelta(hours=4),
+            now - timedelta(hours=8),
+        ]
+        keeps = build_snapshot_keeplist(snaps, rets)
+        assert keeps == {Path("20m"), Path("90m"), Path("3h"), Path("7h")}
+
+    def test_fewer_snapshots_than_tiers(self):
+        """With more tiers than snapshots, keeps what's available."""
+        now = datetime.now()
+        snaps = [
+            Snapshot(Path("1h"), now - timedelta(hours=1)),
+            Snapshot(Path("3h"), now - timedelta(hours=3)),
+        ]
+        rets = [
+            now - timedelta(hours=1),
+            now - timedelta(hours=2),
+            now - timedelta(hours=4),
+            now - timedelta(hours=8),
+        ]
+        keeps = build_snapshot_keeplist(snaps, rets)
+        assert Path("1h") in keeps
+        assert Path("3h") in keeps
+
+    def test_empty_snapshots(self):
+        keeps = build_snapshot_keeplist([], [datetime.now()])
+        assert keeps == set()
+
+    def test_empty_retentions(self):
+        snaps = [Snapshot(Path("a"), datetime.now())]
+        keeps = build_snapshot_keeplist(snaps, [])
+        assert keeps == {Path("a")}
+
+
+class TestDatetimesCleanup:
+    def test_datetimes_retention_keeps_correct_snapshots(self, sample_job, create_snapshots):
+        """Calendar-based retention keeps oldest in each tier."""
+        now = datetime.now()
+        snapshot_times = {
+            "15m": now - timedelta(minutes=15),
+            "90m": now - timedelta(minutes=90),
+            "3h": now - timedelta(hours=3),
+            "15d": now - timedelta(days=15),
+            "60d": now - timedelta(days=60),
+        }
+        for label, dt in snapshot_times.items():
+            name = dt.strftime("%Y%m%d_%H%M%S")
+            create_snapshots(name, dt)
+
+        sample_job.snapshot_retention = {
+            "fn": "datetimes",
+            "config": {"hourly": 2, "daily": 1},
+        }
+        deleted = []
+        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[3]) if cmd[0] == "btrfs" else None)
+
+        sample_job._cleanup_snapshots()
+
+        # hourly=2, daily=1 → boundaries at now, now-1h, now-2h
+        # Boundary now: no candidates. Boundary now-1h: keeps 15m. Boundary now-2h: keeps 90m.
+        # 3h, 15d, 60d should be deleted
+        deleted_names = {Path(str(d)).name for d in deleted}
+        assert len(deleted) == 3
+        for label, dt in snapshot_times.items():
+            name = dt.strftime("%Y%m%d_%H%M%S")
+            if label in ("3h", "15d", "60d"):
+                assert name in deleted_names, f"Expected {name} ({label}) to be deleted"
+            else:
+                assert (Path(sample_job.snapshot_dir) / name).exists(), f"Expected {name} ({label}) to be kept"
