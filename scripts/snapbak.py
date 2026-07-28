@@ -32,7 +32,7 @@ import sys
 import time
 import warnings
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from typing import NamedTuple
@@ -46,8 +46,10 @@ DEFAULT_CONFIG = Path(__file__).parent.parent / "config" / "config.json"
 DEFAULT_MOUNT_BASE = Path("/bak")
 DEFAULT_STUCK_THRESHOLD = 3600  # 1 hour
 DEFAULT_TIMEOUT = 86400  # 24 hours
-DEFAULT_BACKUP_RETRIES = 3
 DEFAULT_BACKUP_INTERVAL = 3600  # 1 hour
+DEFAULT_SNAPSHOT_INTERVAL = 3600  # 1 hour
+DEFAULT_SNAPSHOT_INTERVAL_MIN = 900  # 15 minutes (minimum)
+DEFAULT_SNAPSHOT_AGE_MIN = 3600  # 1 hour (minimum snapshot age for backup safety)
 RETRY_DELAY = 5  # seconds between retry attempts
 
 # --- Error codes ---
@@ -56,6 +58,12 @@ EXIT_ERROR = 1
 EXIT_CONFIG_ERROR = 2
 EXIT_MOUNT_ERROR = 3
 EXIT_PERMISSION_ERROR = 4
+EXIT_TEMP_UNREACHABLE = 30
+EXIT_TEMP_SIZE_LIMIT = 31
+EXIT_PERM_TIMEOUT = 40
+EXIT_PERM_FAILED = 41
+EXIT_SYSTEM = 50
+EXIT_STUCK_WAIT = 51
 
 
 # --- Retention functions ---
@@ -67,7 +75,7 @@ class Snapshot(NamedTuple):
 
 def build_retention_exponential(n: int = 1) -> list[datetime]:
     """Generate tier boundaries at exponential intervals: 1h, 2h, 4h, 8h..."""
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     return [now - relativedelta(hours=2**i) for i in range(0, n)]
 
 
@@ -80,7 +88,7 @@ def build_retention_datetimes(
     Each tier starts after the previous tiers end.
     E.g., hourly=2, daily=1 → 2 hourly slots + 1 daily slot starting 2h ago.
     """
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     hours = [now - relativedelta(hours=i) for i in range(0, hourly)]
     days = [now - relativedelta(hours=hourly, days=i) for i in range(0, daily)]
     weeks = [now - relativedelta(hours=hourly, days=daily, weeks=i) for i in range(0, weekly)]
@@ -152,10 +160,10 @@ def _write_lock_info(job_name: str | None = None, snapshot_name: str | None = No
     """Write current job info to the lock file as JSON."""
     info = {
         "pid": os.getpid(),
-        "started_at": datetime.now().isoformat(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
         "current_job": job_name,
         "snapshot_name": snapshot_name,
-        "backup_started_at": datetime.now().isoformat() if job_name else None,
+        "backup_started_at": datetime.now(timezone.utc).isoformat() if job_name else None,
     }
     tmp = GLOBAL_LOCK_FILE.with_suffix(".lock.tmp")
     tmp.write_text(json.dumps(info, indent=2))
@@ -258,9 +266,13 @@ class Job(BaseModel):
     """A single backup job."""
     model_config = ConfigDict(extra='allow')
 
+    # Config fields
     name: str
-    repo: str
     snapshot_dir: str
+    source_subvolume: str
+    repo: str
+    priority: int = Field(default=100, ge=1)
+    snapshot_interval: int = Field(default=DEFAULT_SNAPSHOT_INTERVAL, ge=DEFAULT_SNAPSHOT_INTERVAL_MIN)
     backup_retention: dict = Field(default_factory=dict)
     snapshot_retention: dict = Field(default_factory=lambda: {"fn": "exponential", "config": {"n": 5}})
     backup_interval: int = Field(default=DEFAULT_BACKUP_INTERVAL, ge=1)
@@ -268,13 +280,21 @@ class Job(BaseModel):
     backup_window_end: str | None = None
     ignore_file: str = ""
     excludes: list = Field(default_factory=list)
-    backup_retries: int = Field(default=DEFAULT_BACKUP_RETRIES, ge=1)
     timeout: int = Field(default=DEFAULT_TIMEOUT, ge=1)
+
     # Runtime fields (not from config)
     repos: list = Field(default_factory=list, exclude=True)
     mount_base: str = "/bak"
     dry_run: bool = False
     config_path: str | None = None
+
+    # State fields (persisted, not from config)
+    delayed: bool = Field(default=False, exclude=True)
+    delayed_reason: str | None = Field(default=None, exclude=True)
+    protected_snapshot: str | None = Field(default=None, exclude=True)
+    missed_slots: int = Field(default=0, exclude=True)
+    planned_snapshot: Path | None = Field(default=None, exclude=True)
+    backup_planned: bool = Field(default=False, exclude=True)
 
     @field_validator('snapshot_dir')
     @classmethod
@@ -337,21 +357,21 @@ class Job(BaseModel):
     def _parse_snapshot_time(self, snapshot: Path) -> datetime | None:
         """Parse timestamp from snapshot name.
 
-        Returns None if the name doesn't match our expected formats:
-        - ISO 8601: 2024-01-15T10:30:00
-        - Compact:  20240115_103000
+        Only accepts YYYY-MM-DD_HH:MM format.
+        Returns None if the name doesn't match.
         """
-        name = snapshot.name
         try:
-            if "T" in name:
-                return datetime.fromisoformat(name)
-            return datetime.strptime(name, "%Y%m%d_%H%M%S")
+            return datetime.strptime(snapshot.name, "%Y-%m-%d_%H:%M").replace(tzinfo=timezone.utc)
         except ValueError:
             return None
 
+    def _snapshot_format_name(self, dt: datetime) -> str:
+        """Format a datetime as a snapshot name: YYYY-MM-DD_HH:MM."""
+        return dt.strftime("%Y-%m-%d_%H:%M")
+
     def _find_oldest_snapshot_within(self, interval_seconds: int) -> Path | None:
         """Find the oldest snapshot newer than (now - interval)."""
-        cutoff = datetime.now() - timedelta(seconds=interval_seconds)
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=interval_seconds)
         subs = [p for p in Path(self.snapshot_dir).iterdir() if p.is_dir()]
         valid = [(p, self._parse_snapshot_time(p)) for p in subs]
         valid = [(p, t) for p, t in valid if t is not None and t >= cutoff]
@@ -377,7 +397,10 @@ class Job(BaseModel):
         try:
             data = json.loads(self.status_file.read_text())
             if data.get("status") == "success":
-                return datetime.fromisoformat(data["timestamp"])
+                ts = data["timestamp"]
+                if "T" in ts:
+                    return datetime.fromisoformat(ts)
+                return datetime.strptime(ts, "%Y-%m-%d_%H:%M").replace(tzinfo=timezone.utc)
         except (json.JSONDecodeError, KeyError, ValueError):
             pass
         return None
@@ -390,6 +413,56 @@ class Job(BaseModel):
             return json.loads(self.status_file.read_text())
         except (json.JSONDecodeError, OSError):
             return None
+
+    def delay(self, reason: str):
+        """Mark this job as delayed with a reason."""
+        self.delayed = True
+        self.delayed_reason = reason
+        self.missed_slots += 1
+        logger.info(f"Job {self.name}: delayed ({reason})")
+
+    def create_snapshot(self) -> Path:
+        """Create a new btrfs snapshot of source_subvolume.
+
+        Returns the path to the created snapshot.
+        Exits with fatal error if source_subvolume is missing or creation fails.
+        """
+        snap_name = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H:%M")
+        snap_path = Path(self.snapshot_dir) / snap_name
+
+        if not snap_path.parent.exists():
+            logger.error(f"Snapshot directory does not exist: {snap_path.parent}")
+            sys.exit(EXIT_CONFIG_ERROR)
+
+        source = Path(self.source_subvolume)
+        if not source.exists():
+            logger.error(f"Source subvolume does not exist: {source}")
+            sys.exit(EXIT_CONFIG_ERROR)
+
+        cmd = ["btrfs", "subvolume", "snapshot", "-r", str(source), str(snap_path)]
+        logger.info(f"Creating snapshot: {' '.join(cmd)}")
+        try:
+            self._run(cmd)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Snapshot creation failed: {e.stderr}")
+            sys.exit(EXIT_ERROR)
+
+        logger.info(f"Snapshot created: {snap_path}")
+        return snap_path
+
+    def _assert_snapshot_age(self, snapshot_path: Path):
+        """Fatal error if snapshot used for backup is <1 hour old."""
+        snap_time = self._parse_snapshot_time(snapshot_path)
+        if snap_time is None:
+            logger.error(f"Cannot parse snapshot time: {snapshot_path.name}")
+            sys.exit(EXIT_CONFIG_ERROR)
+        age = (datetime.now(timezone.utc) - snap_time).total_seconds()
+        if age < DEFAULT_SNAPSHOT_AGE_MIN:
+            logger.error(
+                f"Snapshot {snapshot_path.name} is only {age:.0f}s old "
+                f"(minimum {DEFAULT_SNAPSHOT_AGE_MIN}s). Refusing backup."
+            )
+            sys.exit(EXIT_PERM_FAILED)
 
     def _write_status(self, status: str, message: str,
                       snapshot_name: str | None = None,
@@ -405,13 +478,17 @@ class Job(BaseModel):
         data = {
             "job": self.name,
             "status": status,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d_%H:%M"),
             "message": message,
+            "delayed": self.delayed,
+            "delayed_reason": self.delayed_reason,
+            "protected_snapshot": self.protected_snapshot,
+            "missed_slots": self.missed_slots,
         }
         if snapshot_name:
             data["snapshot_name"] = snapshot_name
         if snapshot_time:
-            data["snapshot_time"] = snapshot_time.isoformat()
+            data["snapshot_time"] = snapshot_time.strftime("%Y-%m-%d_%H:%M")
         tmp = self.status_file.with_suffix('.json.tmp')
         tmp.write_text(json.dumps(data, indent=2))
         tmp.replace(self.status_file)
@@ -479,7 +556,7 @@ class Job(BaseModel):
         last_backup = self._get_last_backup_time()
         if last_backup is None:
             return None
-        return (datetime.now() - last_backup).total_seconds()
+        return (datetime.now(timezone.utc) - last_backup).total_seconds()
 
     def _is_within_backup_window(self) -> bool:
         """Check if current time is within the backup window.
@@ -499,7 +576,7 @@ class Job(BaseModel):
             logger.warning(f"Job {self.name}: invalid backup window format, ignoring")
             return True
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         current_minutes = now.hour * 60 + now.minute
         start_minutes = start_h * 60 + start_m
         end_minutes = end_h * 60 + end_m
@@ -572,28 +649,10 @@ class Job(BaseModel):
             return 0
 
     def _backup(self, mount_point: Path, repo: Repo | None = None):
-        """Run the actual restic backup with retry logic."""
+        """Run the actual restic backup."""
         cmd = self._build_restic_cmd("backup", repo)
         cmd.extend([str(mount_point), "--no-symlinks", "--tag", self.name])
-
-        for attempt in range(self.backup_retries + 1):
-            try:
-                self._run(cmd, timeout=self.timeout)
-                return
-            except subprocess.CalledProcessError as e:
-                if attempt < self.backup_retries:
-                    logger.warning(
-                        f"Backup attempt {attempt + 1}/{self.backup_retries + 1} "
-                        f"failed for {self.name}. Retrying in {RETRY_DELAY}s... "
-                        f"Error: {e.stderr}"
-                    )
-                    time.sleep(RETRY_DELAY)
-                else:
-                    logger.error(
-                        f"Backup failed after {self.backup_retries + 1} attempts "
-                        f"for {self.name}: {e.stderr}"
-                    )
-                    raise
+        self._run(cmd, timeout=self.timeout)
 
     def _forget_and_prune(self, repo: Repo | None = None):
         """Apply retention policy via forget + prune."""
@@ -819,10 +878,13 @@ class Job(BaseModel):
 
                 self._update_repo_throughput(selected_repo, total_size, backup_time)
 
+                self._assert_snapshot_age(snapshot_path)
+                self.create_snapshot()
+
                 snap_time = self._parse_snapshot_time(snapshot_path)
                 self._write_status(
                     "success",
-                    f"Backup completed at {datetime.now().isoformat()}",
+                    f"Backup completed at {datetime.now(timezone.utc).isoformat()}",
                     snapshot_name,
                     snap_time,
                 )

@@ -84,7 +84,10 @@ Edit `config/config.json`:
     {
       "name": "data",
       "snapshot_dir": "/mnt/data/.snapshots",
+      "source_subvolume": "data",
       "repo": "primary",
+      "priority": 100,
+      "snapshot_interval": 3600,
       "backup_retention": {"daily": 6, "monthly": 4, "yearly": 2},
       "snapshot_retention": {"fn": "exponential", "config": {"n": 5}},
       "backup_interval": 3600,
@@ -92,7 +95,6 @@ Edit `config/config.json`:
       "backup_window_end": "06:00",
       "ignore_file": "/etc/snap-bak/data.ignore",
       "excludes": ["*.tmp", "*.cache", ".DS_Store"],
-      "backup_retries": 3,
       "timeout": 86400
     }
   ]
@@ -124,7 +126,10 @@ Edit `config/config.json`:
 |-------|------|-------------|---------|
 | `name` | string | Job name (required) | — |
 | `snapshot_dir` | string | Directory containing Btrfs snapshots (required) | — |
+| `source_subvolume` | string | Btrfs subvolume to snapshot (required) | — |
 | `repo` | string | Name of repo to use (must match `repos[].name`) | — |
+| `priority` | int | Job priority (higher = more important) | `100` |
+| `snapshot_interval` | int | Seconds between snapshots (min 900) | `3600` |
 | `backup_retention` | dict | Restic forget/keep policy (e.g., `{"daily": 6}`) | `{}` |
 | `snapshot_retention` | dict | Local snapshot retention strategy | `{"fn":"exponential","config":{"n":5}}` |
 | `backup_interval` | int | Minimum seconds between backups | `3600` |
@@ -132,7 +137,6 @@ Edit `config/config.json`:
 | `backup_window_end` | string | End of allowed backup window (HH:MM, exclusive) | `null` |
 | `ignore_file` | string | Path to file with exclude patterns | `""` |
 | `excludes` | list | List of glob patterns to exclude | `[]` |
-| `backup_retries` | int | Number of retry attempts on backup failure (≥1) | `3` |
 | `timeout` | int | Command timeout in seconds | `86400` |
 
 **Note on `ignore_file` and `excludes`:** Both are passed to restic as
@@ -144,27 +148,31 @@ controls restic's offsite backup retention (how many backup versions to keep
 in the remote repo). `snapshot_retention` controls local Btrfs snapshot
 cleanup (how many snapshots to keep on disk).
 
-## When Snapshots Are Created
+## Snapshot and Backup Flow
 
-Snapshots are **not** created by snap-bak. They are created externally by a
-snapshot tool (e.g., `snapper`, `btrfs-snap`, or a cron job). snap-bak only
-reads existing snapshots from `snapshot_dir`.
+snap-bak is the exclusive authority for both snapshot creation and backup execution.
+Users SHALL NOT use any other automated snapshot management tool, and SHALL NOT
+run two copies of snap-bak concurrently.
 
-Snapshots must be named in one of these formats:
-- **ISO 8601**: `2024-01-15T10:30:00`
-- **Compact**: `20240115_103000`
+### When Snapshots Are Created (Phase 4)
 
-Non-matching names are ignored (not backed up, not deleted).
+After each successful backup, snap-bak creates a new btrfs read-only snapshot:
 
-## When Backups Are Created
+```
+btrfs subvolume snapshot -r <source_subvolume> <snapshot_dir>/<name>
+```
 
-A backup is created when **all** of the following conditions are met:
+The snapshot name uses the format `YYYY-MM-DD_HH:MM` (e.g., `2026-07-26_10:30`).
+Snapshots are created at most once per `snapshot_interval` seconds (default: 1 hour,
+minimum: 15 minutes). Non-matching names in `snapshot_dir` are ignored.
 
-1. **No failed backup to retry**: If the last run failed and the snapshot still
-   exists, snap-bak retries that snapshot instead of starting a new backup.
-2. **Interval elapsed**: Time since last successful backup ≥ `backup_interval`
+### When Backups Are Created (Phase 2-3)
+
+A backup is created when **all** of the following are met:
+
+1. **Time for backup**: Time since last successful backup ≥ `backup_interval`
    (default: 1 hour).
-3. **Within backup window** (if configured): Current time is within
+2. **Within backup window** (if configured): Current time is within
    `backup_window_start`–`backup_window_end`. Overnight windows are supported
    (e.g., `"22:00"` to `"06:00"` means 22:00–06:00). If no window is configured,
    backups are always allowed.
@@ -245,9 +253,6 @@ If a backup fails:
 3. If the snapshot still exists, it retries the backup with the **same snapshot**
    (data hasn't changed).
 4. If the snapshot no longer exists, the job is skipped with a warning.
-
-This is separate from `backup_retries`, which retries the restic command within
-a single backup run.
 
 ## 3-2-1 Coverage
 

@@ -7,6 +7,14 @@ It creates snapshots, and performs restic backups to efficiently manage retentio
 Snapshots are frequent with short retention, backups are infrequent leverage week old snapshots to avoid churn, and retain for years.
 Both schedules are configurable, but backups are never made from live filesystems or the most recent snapshot.
 
+### Constraints
+
+- snap-bak is the exclusive authority for snapshot and backup management.
+- Users SHALL NOT use any other automated snapshot management tool.
+- Users SHALL NOT run two copies of snap-bak concurrently.
+- Only snapshots matching snap-bak's expected format are managed; all others are ignored.
+- All datetimes in snap-bak are GMT/UTC.
+
 ### Design Principles
 
 1. **Planning separates from action**: Validation → Planning → Execution. No replanning after execution begins.
@@ -92,7 +100,8 @@ For each job with backup_planned:
 
 ### Phase 4: Create Snapshots (btrfs)
 
-Create new btrfs snapshots for each job by ISO timestamp `YYYY-MM-DD_HH:MM`
+Create new btrfs snapshot of `source_subvolume` at `{snapshot_dir}/{name}` for each job, using the format `YYYY-MM-DD_HH:MM`.
+Only one snapshot per `snapshot_interval` seconds per job.
 
 ### Phase 5: Cleanup Local Snapshots (btrfs)
 
@@ -127,7 +136,7 @@ RETENTION_FN = {
 def build_retention_datetimes(hourly:int = 0, daily:int = 0, weekly:int = 0, monthly:int = 0, yearly:int = 0) -> list[datetime]:
     # Alternative strategy: create a flat list of retention boundaries for normal (hierarchical) retention.
     # Can be passed as `retentions` to build_snapshot_keeplist instead of using exponential tiers.
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     hours = [ now - relativedelta(hours=i) for i in range(0, hourly) ]
     days  = [ now - relativedelta(hours=hourly, days=i) for i in range(0, daily) ]
     weeks = [ now - relativedelta(hours=hourly, days=daily, weeks=i) for i in range(0, weekly) ]
@@ -136,7 +145,7 @@ def build_retention_datetimes(hourly:int = 0, daily:int = 0, weekly:int = 0, mon
     return list(set(hours + days + weeks + months + years))
 
 def build_retention_exponential(n:int = 1) -> list[datetime]:
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     return [ now - relativedelta(hours=2**i) for i in range(0, n) ]
 
 
@@ -178,7 +187,7 @@ def cleanup_snapshots(self:Job) -> int:
 ### Safety Constraint: Snapshot Age Assertion
 
 ```python
-assert (datetime.now() - snapshot.time) > timedelta(hours=1), \
+assert (datetime.now(timezone.utc) - snapshot.time) > timedelta(hours=1), \
     f"Snapshot {snapshot_name} is too new ({snapshot_time}). " \
     f"Backups must use snapshots >1 hour old."
 ```
@@ -209,10 +218,10 @@ When we detect a previous run is still running, we wait stuck_wait and keep chec
 ```json
 {
   "name": "undefined",
-  "uri": "",
+  "path": "",
   "password_file": "/home/user/.restic_password",
-  "size_limit": 0
-  "latency_ms": 300,
+  "size_limit": 0,
+  "latency_ms": 100,
   "throughput_mbps": 1
 }
 ```
@@ -220,7 +229,7 @@ When we detect a previous run is still running, we wait stuck_wait and keep chec
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | string | required | Unique repo identifier |
-| `uri` | string | required | Restic repo path (e.g., `rclone:CONFIG_ENTRY:DIRECTORY`) |
+| `path` | string | required | Restic repo path (e.g., `rclone:CONFIG_ENTRY:DIRECTORY`) |
 | `password_file` | string | "" | Path to restic password file |
 | `size_limit` | int | 0 | Max repo size in bytes (0 = unlimited) |
 | `latency_ms` | int | 100 | Estimated latency for ETA calculation |
@@ -232,8 +241,10 @@ When we detect a previous run is still running, we wait stuck_wait and keep chec
 {
   "name": "data",
   "snapshot_dir": "/mnt/data/.snapshots",
+  "source_subvolume": "srv/web",
   "repo": "primary",
   "priority": 100,
+  "snapshot_interval": 3600,
   "backup_retention": {"daily": 6, "monthly": 4, "yearly": 2},
   "snapshot_retention": {"fn": "exponential", "config": {"n": 5}},
   "backup_interval": 3600,
@@ -249,8 +260,10 @@ When we detect a previous run is still running, we wait stuck_wait and keep chec
 |-------|------|---------|------------|-------------|
 | `name` | string | required | — | Unique job identifier |
 | `snapshot_dir` | string | required | must exist | Path to btrfs snapshot directory |
+| `source_subvolume` | string | required | — | Btrfs subvolume to snapshot |
 | `repo` | string | required | must reference repo.name | Repo to backup to |
 | `priority` | int | `100` | `ge=1` | Job priority (higher = more important) |
+| `snapshot_interval` | int | `3600` | `ge=900` | Seconds between snapshot creation |
 | `backup_retention` | dict | `{}` | — | Restic retention policy (e.g., `{"daily": 6}`) |
 | `snapshot_retention` | dict | `{"fn":"exponential","config":{"n":5}}` | — | Local snapshot retention strategy |
 | `backup_interval` | int | `3600` | `ge=1` | Seconds between backups |
@@ -286,9 +299,11 @@ class Job(BaseModel):
 
     # Config fields
     name: str
-    repo: str
     snapshot_dir: str
+    source_subvolume: str
+    repo: str
     priority: int = Field(default=100, ge=1)
+    snapshot_interval: int = Field(default=3600, ge=900)
     backup_retention: dict = Field(default_factory=dict)
     snapshot_retention: dict = Field(default_factory=lambda: {"fn": "exponential", "config": {"n": 5}})
     backup_interval: int = Field(default=3600, ge=1)
@@ -339,8 +354,8 @@ Per-job status stored at `~/.local/state/snapbak/<job_name>_status.json`.
   "status": "success|skipped|delayed|failed|dry_run",
   "timestamp": "2026-07-26T10:30:00",
   "message": "Backup completed",
-  "snapshot_name": "20260725_220000",
-  "snapshot_time": "2026-07-25T22:00:00",
+  "snapshot_name": "2026-07-25_22:00",
+  "snapshot_time": "2026-07-25 22:00",
   "delayed": false,
   "delayed_reason": null,
   "protected_snapshot": null,
@@ -491,12 +506,8 @@ B runs first (400), then C (200), then A (100).
 
 ## Snapshot Naming
 
-### Format
-
-Two formats supported:
-
-- ISO 8601: `2026-07-26T10:30:00`
-- Compact: `20260726_103000`
+- Format: `YYYY-MM-DD_HH:MM`
+- This is the only accepted format. Snapshots with any other naming convention are ignored.
 
 ### Selection Logic
 
@@ -509,7 +520,7 @@ Two formats supported:
 **Never backup a snapshot newer than 1 hour old.**
 
 ```python
-assert (datetime.now() - snapshot_time).total_seconds() >= 3600
+assert (datetime.now(timezone.utc) - snapshot_time).total_seconds() >= 3600
 ```
 
 ---

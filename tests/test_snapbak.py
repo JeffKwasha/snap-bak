@@ -3,7 +3,7 @@
 import json
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -13,8 +13,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.snapbak import (
-    DEFAULT_BACKUP_RETRIES,
-    DEFAULT_BACKUP_INTERVAL,
+    DEFAULT_SNAPSHOT_INTERVAL,
+    DEFAULT_SNAPSHOT_INTERVAL_MIN,
     Job,
     Repo,
     SnapBakConfig,
@@ -43,8 +43,9 @@ def sample_job(tmp_path, sample_repos):
     snapshot_dir.mkdir()
     return Job(
         name="test_job",
-        repo="primary",
         snapshot_dir=str(snapshot_dir),
+        source_subvolume=str(snapshot_dir),
+        repo="primary",
         repos=sample_repos,
         config_path=str(tmp_path / "config.json"),
     )
@@ -63,17 +64,11 @@ def create_snapshots(sample_job):
 # --- Snapshot time parsing tests ---
 
 class TestParseSnapshotTime:
-    def test_iso8601_format(self, sample_job, tmp_path):
-        snap = tmp_path / "snapshots" / "2024-01-15T10:30:00"
+    def test_yyyy_mm_dd_hh_mm_format(self, sample_job, tmp_path):
+        snap = tmp_path / "snapshots" / "2024-01-15_10:30"
         snap.mkdir(parents=True)
         result = sample_job._parse_snapshot_time(snap)
-        assert result == datetime(2024, 1, 15, 10, 30, 0)
-
-    def test_compact_format(self, sample_job, tmp_path):
-        snap = tmp_path / "snapshots" / "20240115_103000"
-        snap.mkdir(parents=True)
-        result = sample_job._parse_snapshot_time(snap)
-        assert result == datetime(2024, 1, 15, 10, 30, 0)
+        assert result == datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
 
     def test_invalid_format(self, sample_job, tmp_path):
         snap = tmp_path / "snapshots" / "random_name"
@@ -92,7 +87,7 @@ class TestParseSnapshotTime:
 class TestExponentialCleanup:
     def test_keeps_correct_snapshots(self, sample_job, create_snapshots):
         """With snapshot_retention n=4, keep oldest in each tier."""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         snapshot_times = {
             "20m": now - timedelta(minutes=20),
             "90m": now - timedelta(minutes=90),
@@ -103,7 +98,7 @@ class TestExponentialCleanup:
         }
         snapshot_names = {}
         for label, dt in snapshot_times.items():
-            name = dt.strftime("%Y%m%d_%H%M%S")
+            name = dt.strftime("%Y-%m-%d_%H:%M")
             snapshot_names[label] = name
             create_snapshots(name, dt)
 
@@ -126,7 +121,7 @@ class TestExponentialCleanup:
 
     def test_fewer_than_n_snapshots_keeps_all(self, sample_job, create_snapshots):
         """If fewer than N snapshots exist, keep all."""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         create_snapshots("1h_ago", now - timedelta(hours=1))
         create_snapshots("2h_ago", now - timedelta(hours=2))
 
@@ -140,7 +135,7 @@ class TestExponentialCleanup:
 
     def test_protected_snapshot_not_deleted(self, sample_job, create_snapshots):
         """The protected snapshot should never be deleted."""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         create_snapshots("1h_ago", now - timedelta(hours=1))
         create_snapshots("2h_ago", now - timedelta(hours=2))
         create_snapshots("3h_ago", now - timedelta(hours=3))
@@ -155,7 +150,7 @@ class TestExponentialCleanup:
 
     def test_zero_snapshots_to_keep_skips_cleanup(self, sample_job, create_snapshots):
         """If fn not in RETENTION_FN, skip cleanup entirely."""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         create_snapshots("1h_ago", now - timedelta(hours=1))
 
         sample_job.snapshot_retention = {"fn": "invalid", "config": {}}
@@ -168,7 +163,7 @@ class TestExponentialCleanup:
 
     def test_non_standard_names_skipped(self, sample_job, create_snapshots):
         """Non-standard snapshot names should be skipped (not deleted)."""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         create_snapshots("20240115_103000", now - timedelta(hours=1))
         create_snapshots("random_name", now - timedelta(hours=2))
 
@@ -224,7 +219,7 @@ class TestConfigValidation:
     def test_valid_config_passes(self):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:test"}],
-            jobs=[{"name": "test", "snapshot_dir": "/tmp", "repo": "primary"}],
+            jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
         )
         assert len(config.repos) == 1
         assert len(config.jobs) == 1
@@ -249,24 +244,26 @@ class TestConfigValidation:
         """password_file should be on Repo, not top-level."""
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:test", "password_file": "/path/to/pass"}],
-            jobs=[{"name": "test", "snapshot_dir": "/tmp", "repo": "primary"}],
+            jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
         )
         assert config.repos[0].password_file == "/path/to/pass"
 
-    def test_backup_retries_must_be_positive(self):
-        """backup_retries must be >= 1."""
+    def test_source_subvolume_is_required(self, tmp_path, sample_repos):
+        """source_subvolume is required in Job config."""
         with pytest.raises(Exception):
-            SnapBakConfig(
-                repos=[{"name": "primary", "path": "rclone:test"}],
-                jobs=[{"name": "test", "snapshot_dir": "/tmp", "repo": "primary", "backup_retries": 0}],
+            Job(
+                name="test",
+                snapshot_dir="/tmp",
+                repo="primary",
+                repos=sample_repos,
             )
 
-    def test_snapshot_dir_must_exist(self):
+    def test_snapshot_dir_must_exist(self, tmp_path, sample_repos):
         """snapshot_dir must exist on the filesystem."""
         with pytest.raises(Exception):
             SnapBakConfig(
                 repos=[{"name": "primary", "path": "rclone:test"}],
-                jobs=[{"name": "test", "snapshot_dir": "/nonexistent/path", "repo": "primary"}],
+                jobs=[{"name": "test", "snapshot_dir": "/nonexistent/path", "source_subvolume": "data", "repo": "primary"}],
             )
 
 
@@ -308,9 +305,9 @@ class TestJob:
 
 class TestFindOldestSnapshotWithin:
     def test_finds_oldest_within_interval(self, sample_job, create_snapshots):
-        now = datetime.now()
-        snap_30m = (now - timedelta(minutes=30)).strftime("%Y%m%d_%H%M%S")
-        snap_15m = (now - timedelta(minutes=15)).strftime("%Y%m%d_%H%M%S")
+        now = datetime.now(timezone.utc)
+        snap_30m = (now - timedelta(minutes=30)).strftime("%Y-%m-%d_%H:%M")
+        snap_15m = (now - timedelta(minutes=15)).strftime("%Y-%m-%d_%H:%M")
         create_snapshots(snap_30m, now - timedelta(minutes=30))
         create_snapshots(snap_15m, now - timedelta(minutes=15))
 
@@ -323,7 +320,7 @@ class TestFindOldestSnapshotWithin:
         assert result is None
 
     def test_returns_none_when_all_outside_interval(self, sample_job, create_snapshots):
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         create_snapshots("5h_ago", now - timedelta(hours=5))
         create_snapshots("10h_ago", now - timedelta(hours=10))
 
@@ -331,8 +328,8 @@ class TestFindOldestSnapshotWithin:
         assert result is None
 
     def test_skips_non_standard_names(self, sample_job, create_snapshots):
-        now = datetime.now()
-        snap_name = (now - timedelta(minutes=30)).strftime("%Y%m%d_%H%M%S")
+        now = datetime.now(timezone.utc)
+        snap_name = (now - timedelta(minutes=30)).strftime("%Y-%m-%d_%H:%M")
         create_snapshots(snap_name, now - timedelta(minutes=30))
         create_snapshots("random_name", now - timedelta(minutes=15))
 
@@ -399,7 +396,7 @@ class TestThroughputCalculation:
 class TestFailedBackupRetry:
     def test_failed_status_triggers_retry(self, sample_job, create_snapshots, tmp_path):
         """When last status is 'failed' with snapshot_name, retry with that snapshot."""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         snap_name = "20240115_103000"
         create_snapshots(snap_name, now - timedelta(hours=1))
 
@@ -437,7 +434,7 @@ class TestFailedBackupRetry:
 
     def test_failed_snapshot_gone_skips(self, sample_job, tmp_path):
         """When failed snapshot no longer exists, skip job."""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         snap_name = "20240115_103000"
 
         # Write a failed status file
@@ -465,7 +462,7 @@ class TestSnapBakConfig:
                 {"name": "primary", "path": "rclone:CONFIG_ENTRY:DIRECTORY", "size_limit": 100, "latency_ms": 50, "throughput_mbps": 10},
             ],
             jobs=[
-                {"name": "test", "snapshot_dir": "/tmp", "repo": "primary",
+                {"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary",
                  "snapshot_retention": {"fn": "exponential", "config": {"n": 3}},
                  "backup_interval": 7200},
             ],
@@ -486,19 +483,19 @@ class TestSnapBakConfig:
     def test_defaults_applied(self, tmp_path):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:test"}],
-            jobs=[{"name": "test", "snapshot_dir": "/tmp", "repo": "primary"}],
+            jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
         )
         jobs = config.resolve_jobs(str(tmp_path / "config.json"))
 
         job = jobs[0]
         assert job.snapshot_retention == {"fn": "exponential", "config": {"n": 5}}
-        assert job.backup_interval == DEFAULT_BACKUP_INTERVAL
-        assert job.backup_retries == DEFAULT_BACKUP_RETRIES
+        assert job.backup_interval == 3600
+        assert job.snapshot_interval == DEFAULT_SNAPSHOT_INTERVAL
 
     def test_repo_path_resolves(self, tmp_path):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:CONFIG_ENTRY:DIRECTORY"}],
-            jobs=[{"name": "test", "snapshot_dir": "/tmp", "repo": "primary"}],
+            jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
         )
         jobs = config.resolve_jobs(str(tmp_path / "config.json"))
         assert jobs[0].repo_path == "rclone:CONFIG_ENTRY:DIRECTORY"
@@ -506,14 +503,14 @@ class TestSnapBakConfig:
     def test_mount_base_default(self):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:test"}],
-            jobs=[{"name": "test", "snapshot_dir": "/tmp", "repo": "primary"}],
+            jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
         )
         assert config.mount_base == "/bak"
 
     def test_stuck_threshold_default(self):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:test"}],
-            jobs=[{"name": "test", "snapshot_dir": "/tmp", "repo": "primary"}],
+            jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
         )
         assert config.stuck_threshold == 3600
 
@@ -525,7 +522,7 @@ class TestLoadConfig:
         config_path = tmp_path / "config.json"
         config_path.write_text(json.dumps({
             "repos": [{"name": "primary", "path": "rclone:test"}],
-            "jobs": [{"name": "test", "snapshot_dir": "/tmp", "repo": "primary"}],
+            "jobs": [{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
         }))
         result = load_config(config_path)
         assert len(result.repos) == 1
@@ -614,7 +611,7 @@ class TestBackupWindow:
 class TestBuildRetentionExponential:
     def test_generates_correct_tiers(self):
         """n=4 should produce boundaries at 1h, 2h, 4h, 8h."""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         result = build_retention_exponential(n=4)
         assert len(result) == 4
         for i, dt in enumerate(result):
@@ -632,14 +629,14 @@ class TestBuildRetentionExponential:
 
 class TestBuildRetentionDatetimes:
     def test_hourly_only(self):
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         result = build_retention_datetimes(hourly=3)
         assert len(result) == 3
         for dt in result:
             assert (now - dt).total_seconds() < 60 * 60 * 3 + 1
 
     def test_daily_only(self):
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         result = build_retention_datetimes(daily=2)
         assert len(result) == 2
 
@@ -656,7 +653,7 @@ class TestBuildRetentionDatetimes:
 class TestBuildSnapshotKeeplist:
     def test_keeps_oldest_in_each_tier(self):
         """With 4 tier boundaries, keeps the oldest snapshot in each tier."""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         snaps = [
             Snapshot(Path("20m"), now - timedelta(minutes=20)),
             Snapshot(Path("90m"), now - timedelta(minutes=90)),
@@ -675,7 +672,7 @@ class TestBuildSnapshotKeeplist:
 
     def test_fewer_snapshots_than_tiers(self):
         """With more tiers than snapshots, keeps what's available."""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         snaps = [
             Snapshot(Path("1h"), now - timedelta(hours=1)),
             Snapshot(Path("3h"), now - timedelta(hours=3)),
@@ -691,11 +688,11 @@ class TestBuildSnapshotKeeplist:
         assert Path("3h") in keeps
 
     def test_empty_snapshots(self):
-        keeps = build_snapshot_keeplist([], [datetime.now()])
+        keeps = build_snapshot_keeplist([], [datetime.now(timezone.utc)])
         assert keeps == set()
 
     def test_empty_retentions(self):
-        snaps = [Snapshot(Path("a"), datetime.now())]
+        snaps = [Snapshot(Path("a"), datetime.now(timezone.utc))]
         keeps = build_snapshot_keeplist(snaps, [])
         assert keeps == {Path("a")}
 
@@ -703,7 +700,7 @@ class TestBuildSnapshotKeeplist:
 class TestDatetimesCleanup:
     def test_datetimes_retention_keeps_correct_snapshots(self, sample_job, create_snapshots):
         """Calendar-based retention keeps oldest in each tier."""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         snapshot_times = {
             "15m": now - timedelta(minutes=15),
             "90m": now - timedelta(minutes=90),
@@ -712,7 +709,7 @@ class TestDatetimesCleanup:
             "60d": now - timedelta(days=60),
         }
         for label, dt in snapshot_times.items():
-            name = dt.strftime("%Y%m%d_%H%M%S")
+            name = dt.strftime("%Y-%m-%d_%H:%M")
             create_snapshots(name, dt)
 
         sample_job.snapshot_retention = {
@@ -730,7 +727,7 @@ class TestDatetimesCleanup:
         deleted_names = {Path(str(d)).name for d in deleted}
         assert len(deleted) == 3
         for label, dt in snapshot_times.items():
-            name = dt.strftime("%Y%m%d_%H%M%S")
+            name = dt.strftime("%Y-%m-%d_%H:%M")
             if label in ("3h", "15d", "60d"):
                 assert name in deleted_names, f"Expected {name} ({label}) to be deleted"
             else:
