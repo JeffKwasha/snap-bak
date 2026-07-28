@@ -30,13 +30,18 @@ cleans up old snapshots using exponential retention.
 
 ### Snapshot retention (local)
 
-After a successful backup, old Btrfs snapshots are deleted using exponential
-retention. Keeps N snapshots spaced at ~1h, 2h, 4h, 8h, 16h for fast local
-recovery. Controlled by `snapshots_to_keep`.
+After a successful backup, old Btrfs snapshots are deleted using the
+configured strategy. Controlled by `snapshot_retention` (default: exponential
+with N=5). Two strategies are available:
+
+- **exponential** — keeps N snapshots spaced at ~1h, 2h, 4h, 8h, 16h for fast
+  local recovery
+- **datetimes** — keeps snapshots at specific calendar boundaries (e.g.,
+  hourly, daily, weekly)
 
 ### Backup retention (offsite)
 
-restic manages its own retention via the `retention` config (e.g.,
+restic manages its own retention via the `backup_retention` config (e.g.,
 `{"daily": 6, "monthly": 4, "yearly": 2}`). Controls how long backup history
 is kept in the remote repo. Runs `restic forget --prune` after each backup.
 
@@ -50,7 +55,7 @@ After a successful backup, snapshots older than the backup time are deleted
 
 - **Per-repo password files** — each restic repo has its own password file
 - **Rate tracking** — measures backup speed, updates config for visibility
-- **Exponential snapshot retention** — intelligent local cleanup
+- **Pluggable snapshot retention** — exponential or calendar-based cleanup
 - **Failed backup recovery** — automatic retry with same snapshot
 - **Backup windows** — restrict to off-peak hours
 - **Configurable retry** — per-job restic retry count
@@ -80,8 +85,8 @@ Edit `config/config.json`:
       "name": "data",
       "snapshot_dir": "/mnt/data/.snapshots",
       "repo": "primary",
-      "retention": {"daily": 6, "monthly": 4, "yearly": 2},
-      "snapshots_to_keep": 5,
+      "backup_retention": {"daily": 6, "monthly": 4, "yearly": 2},
+      "snapshot_retention": {"fn": "exponential", "config": {"n": 5}},
       "backup_interval": 3600,
       "backup_window_start": "22:00",
       "backup_window_end": "06:00",
@@ -115,29 +120,29 @@ Edit `config/config.json`:
 
 ### Job settings
 
-| Field | Description | Default |
-|-------|-------------|---------|
-| `name` | Job name (required) | — |
-| `snapshot_dir` | Directory containing Btrfs snapshots (required) | — |
-| `repo` | Name of repo to use (must match `repos[].name`) | — |
-| `retention` | Restic forget/keep policy (e.g., `{"daily": 6}`) | `{}` |
-| `snapshots_to_keep` | Number of snapshots to keep with exponential spacing | `5` |
-| `backup_interval` | Minimum seconds between backups | `3600` |
-| `backup_window_start` | Start of allowed backup window (HH:MM) | `null` |
-| `backup_window_end` | End of allowed backup window (HH:MM, exclusive) | `null` |
-| `ignore_file` | Path to file with exclude patterns | `""` |
-| `excludes` | List of glob patterns to exclude | `[]` |
-| `backup_retries` | Number of retry attempts on backup failure (≥1) | `3` |
-| `timeout` | Command timeout in seconds | `86400` |
+| Field | Type | Description | Default |
+|-------|------|-------------|---------|
+| `name` | string | Job name (required) | — |
+| `snapshot_dir` | string | Directory containing Btrfs snapshots (required) | — |
+| `repo` | string | Name of repo to use (must match `repos[].name`) | — |
+| `backup_retention` | dict | Restic forget/keep policy (e.g., `{"daily": 6}`) | `{}` |
+| `snapshot_retention` | dict | Local snapshot retention strategy | `{"fn":"exponential","config":{"n":5}}` |
+| `backup_interval` | int | Minimum seconds between backups | `3600` |
+| `backup_window_start` | string | Start of allowed backup window (HH:MM) | `null` |
+| `backup_window_end` | string | End of allowed backup window (HH:MM, exclusive) | `null` |
+| `ignore_file` | string | Path to file with exclude patterns | `""` |
+| `excludes` | list | List of glob patterns to exclude | `[]` |
+| `backup_retries` | int | Number of retry attempts on backup failure (≥1) | `3` |
+| `timeout` | int | Command timeout in seconds | `86400` |
 
 **Note on `ignore_file` and `excludes`:** Both are passed to restic as
 `--exclude-file` and `--exclude` flags respectively. They are additive —
 both apply. `ignore_file` uses `.gitignore`-style syntax.
 
-**Note on `snapshots_to_keep` vs `retention`:** `snapshots_to_keep` controls
-exponential local snapshot cleanup (how many Btrfs snapshots to keep on disk).
-`retention` controls restic's offsite backup retention (how many backup
-versions to keep in the remote repo).
+**Note on `backup_retention` vs `snapshot_retention`:** `backup_retention`
+controls restic's offsite backup retention (how many backup versions to keep
+in the remote repo). `snapshot_retention` controls local Btrfs snapshot
+cleanup (how many snapshots to keep on disk).
 
 ## When Snapshots Are Created
 
@@ -182,10 +187,17 @@ When a backup is triggered:
 
 ## When Snapshots Are Deleted
 
-After a successful backup, snapshots are deleted using **exponential staggered
-retention** controlled by `snapshots_to_keep` (default: 5).
+After a successful backup, snapshots are deleted using the configured strategy
+(`snapshot_retention`). Two strategies are available:
 
-The algorithm divides time into exponentially increasing tiers:
+### Exponential strategy
+
+```json
+{"fn": "exponential", "config": {"n": 5}}
+```
+
+Keeps N snapshots with exponentially increasing time gaps. The algorithm
+divides time into exponentially increasing tiers:
 
 | Tier | Window | `2^(tier-1)` |
 |------|--------|--------------|
@@ -199,27 +211,31 @@ For each tier, the **oldest snapshot** within that window is kept. All other
 snapshots in that tier are deleted. This produces snapshots spaced approximately
 at 1h, 2h, 4h, 8h, 16h ago — true exponential spacing.
 
-The snapshot currently being backed up is **never deleted** during cleanup
-(protected snapshot).
+### Datetimes strategy
 
-### Example
+```json
+{"fn": "datetimes", "config": {"hourly": 3, "daily": 1, "weekly": 1}}
+```
 
-With `snapshots_to_keep=5` and snapshots at 20m, 90m, 3h, 7h, 12h, 20h ago:
+Keeps snapshots at specific calendar boundaries. Each boundary defines how
+many snapshots to keep at that granularity:
 
-- Tier 1 (1h): keeps 20m snapshot
-- Tier 2 (2h): keeps 90m snapshot
-- Tier 3 (4h): keeps 3h snapshot
-- Tier 4 (8h): keeps 7h snapshot
-- Tier 5 (16h): keeps 12h snapshot
+- `hourly`: keeps N most recent hourly snapshots
+- `daily`: keeps N most recent daily snapshots (one per day)
+- `weekly`: keeps N most recent weekly snapshots (one per week)
+- `monthly`: keeps N most recent monthly snapshots (one per month)
+- `yearly`: keeps N most recent yearly snapshots (one per year)
 
-Deleted: 20h snapshot (outside all tiers). The 12h snapshot is the oldest in
-the 16h tier.
+### Common behavior
+
+- The snapshot currently being backed up is **never deleted** during cleanup
+  (protected snapshot).
+- Non-standard snapshot names are skipped (not deleted).
 
 ### Edge cases
 
-- If fewer than `snapshots_to_keep` snapshots exist, all are kept (no deletion).
-- If `snapshots_to_keep` is `0` or negative, cleanup is skipped entirely.
-- Non-standard snapshot names are skipped (not deleted).
+- If fewer snapshots exist than the strategy requests, all are kept.
+- If `n` is `0` or negative (exponential), cleanup is skipped entirely.
 
 ## Failed Backup Recovery
 
@@ -314,6 +330,7 @@ diagnose what was running when the crash occurred.
 PYTHONPATH=. python -m pytest tests/test_snapbak.py -v
 ```
 
-Tests cover exponential cleanup, snapshot parsing, config validation, repo
-selection, failed backup retry, backup window logic, throughput calculation,
-and config loading. No remote restic or actual Btrfs operations are required.
+Tests cover retention functions (exponential, datetimes, keeplist), snapshot
+parsing, config validation, repo selection, failed backup retry, backup window
+logic, throughput calculation, and config loading. No remote restic or actual
+Btrfs operations are required.
