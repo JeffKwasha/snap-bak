@@ -105,7 +105,7 @@ class TestExponentialCleanup:
         sample_job.snapshot_retention = {"fn": "exponential", "config": {"n": 4}}
 
         deleted = []
-        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[3]) if cmd[0] == "btrfs" else None)
+        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[4]) if cmd[1].endswith("btrfs") else None)
 
         sample_job._cleanup_snapshots()
 
@@ -130,7 +130,7 @@ class TestExponentialCleanup:
 
         sample_job._cleanup_snapshots()
 
-        btrfs_calls = [c for c in sample_job._run.call_args_list if c.args[0][0] == "btrfs"]
+        btrfs_calls = [c for c in sample_job._run.call_args_list if c.args[0][1].endswith("btrfs")]
         assert len(btrfs_calls) == 0
 
     def test_protected_snapshot_not_deleted(self, sample_job, create_snapshots):
@@ -142,7 +142,7 @@ class TestExponentialCleanup:
 
         sample_job.snapshot_retention = {"fn": "exponential", "config": {"n": 2}}
         deleted = []
-        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[2]) if cmd[0] == "btrfs" else None)
+        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[3]) if cmd[1].endswith("btrfs") else None)
 
         sample_job._cleanup_snapshots(protected_snapshot="2h_ago")
 
@@ -158,7 +158,7 @@ class TestExponentialCleanup:
 
         sample_job._cleanup_snapshots()
 
-        btrfs_calls = [c for c in sample_job._run.call_args_list if c.args[0][0] == "btrfs"]
+        btrfs_calls = [c for c in sample_job._run.call_args_list if c.args[0][1].endswith("btrfs")]
         assert len(btrfs_calls) == 0
 
     def test_non_standard_names_skipped(self, sample_job, create_snapshots):
@@ -169,7 +169,7 @@ class TestExponentialCleanup:
 
         sample_job.snapshot_retention = {"fn": "exponential", "config": {"n": 5}}
         deleted = []
-        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[2]) if cmd[0] == "btrfs" else None)
+        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[3]) if cmd[1].endswith("btrfs") else None)
 
         sample_job._cleanup_snapshots()
 
@@ -717,7 +717,7 @@ class TestDatetimesCleanup:
             "config": {"hourly": 2, "daily": 1},
         }
         deleted = []
-        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[3]) if cmd[0] == "btrfs" else None)
+        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[4]) if cmd[1].endswith("btrfs") else None)
 
         sample_job._cleanup_snapshots()
 

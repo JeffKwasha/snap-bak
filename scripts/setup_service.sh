@@ -61,11 +61,27 @@ fi
 install -o root -g root -m 0644 "$SCRIPT_SRC" "$SCRIPT_PATH"
 
 # --- 2. GENERATE EXAMPLE CONFIG ---
+# This is JSONC: // and /* */ comments are allowed and stripped by
+# snapbak.py (whitespace-preserving, so line numbers stay valid). Every real
+# field is shown with a value you must edit. This file loads as-is.
 echo "[*] Generating example configuration at $CONFIG_FILE"
-cat <<EOF > "$CONFIG_FILE"
+cat <<'SNAPBACK_EOF' > "$CONFIG_FILE"
 {
+  // Top-level settings
+  //   mount_base      : where read-only snapshots get mounted before backup (string)
+  //   stuck_threshold : seconds after which a 'running' lock is considered stuck (int)
+  "mount_base": "/mnt/snapbak_mounts",
+  "stuck_threshold": 3600,
+
   "repos": [
     {
+      // Repos are restic repositories where backups are stored.
+      //   name           : unique repo id referenced by a job's 'repo'  (string)
+      //   path           : restic location; local path or 'rclone:REMOTE:DIR'  (string)
+      //   password_file  : file containing the restic repo password  (string)
+      //   size_limit     : stop when repo hits this many bytes; 0 = unlimited  (int)
+      //   latency_ms     : expected repo latency, scheduling hint  (int ms)
+      //   throughput_mbps: expected repo throughput, scheduling hint  (int)
       "name": "primary-cloud",
       "path": "rclone:PROVIDER:DIR",
       "password_file": "/opt/snap-bak/passwords/provider",
@@ -74,26 +90,48 @@ cat <<EOF > "$CONFIG_FILE"
       "throughput_mbps": 10
     }
   ],
-  "mount_base": "/mnt/snapbak_mounts",
-  "stuck_threshold": 3600,
+
   "jobs": [
     {
+      // name             : unique job id  (string). Used to derive:
+      //                     mount point  = <mount_base>/<name>
+      //                     restic tag   = --tag <name>
+      //                     lock file    = <state>/<name>.lock
+      //                     status file  = <state>/<name>_status.json
+      //                     Use only [A-Za-z0-9_-]; '/' or '..' would break out
+      //                     of the mount base and spoil the tag/state filenames.
+      // snapshot_dir     : existing dir where btrfs snapshots go; must exist  (string)
+      // source_subvolume : btrfs subvolume to snapshot  (string)
+      // repo             : repo id from the repos list  (string)
+      // priority         : scheduling order, higher = earlier  (int >= 1)
+      // snapshot_interval: seconds between snapshots, min 900  (seconds)
+      // snapshot_retention: how long to keep LOCAL snapshots;
+      //                     fn = exponential|datetimes; see SPEC.md for config
+      // backup_retention : restic forget/prune keep-policy;
+      //                     keys: last, hourly, daily, weekly, monthly, yearly
+      // backup_interval  : seconds between restic uploads; 604800 = weekly  (seconds)
+      // backup_window_start/end: 'HH:MM' UTC time window backups run in; omit any
+      // ignore_file      : restic --exclude-file (gitignore-style, one pattern/line)
+      // excludes         : list of restic --exclude patterns (gitignore-style)
+      // timeout          : max seconds for the restic backup step  (default 7200)
       "name": "Home-Protection",
       "snapshot_dir": "/home/.snapshots",
       "source_subvolume": "home",
       "repo": "primary-cloud",
       "priority": 150,
       "snapshot_interval": 3600,
-      "backup_retention": {"daily": 7, "weekly": 4},
       "snapshot_retention": {"fn": "exponential", "config": {"n": 5}},
+      "backup_retention": {"daily": 7, "weekly": 4},
       "backup_interval": 604800,
       "backup_window_start": "02:00",
       "backup_window_end": "06:00",
-      "excludes": ["*.tmp", "*.cache"]
+      "ignore_file": "/opt/snap-bak/excludes/home.ignore",
+      "excludes": ["*.tmp", "*.cache"],
+      "timeout": 7200
     }
   ]
 }
-EOF
+SNAPBACK_EOF
 chown root:root "$CONFIG_FILE"
 chmod 644 "$CONFIG_FILE"
 
@@ -103,6 +141,19 @@ chmod 644 "$CONFIG_FILE"
 mkdir -p "$SNAPBAK_DIR/passwords"
 chown "$SERVICE_USER":"$SERVICE_GROUP" "$SNAPBAK_DIR/passwords"
 chmod 750 "$SNAPBAK_DIR/passwords"
+
+# Create directory holding gitignore-style exclude files (referenced by
+# each job's "ignore_file"). Readable by the service user.
+mkdir -p "$SNAPBAK_DIR/excludes"
+chown root:"$SERVICE_GROUP" "$SNAPBAK_DIR/excludes"
+chmod 750 "$SNAPBAK_DIR/excludes"
+if [ ! -f "$SNAPBAK_DIR/excludes/home.ignore" ]; then
+    cat > "$SNAPBAK_DIR/excludes/home.ignore" <<'EOF'
+# gitignore-style patterns, one per line (restic --exclude-file)
+*.tmp
+*.cache
+EOF
+fi
 
 # Create mount base directory and ensure service user owns it
 mkdir -p "$MOUNT_BASE"

@@ -50,7 +50,67 @@ DEFAULT_BACKUP_INTERVAL = 3600  # 1 hour
 DEFAULT_SNAPSHOT_INTERVAL = 3600  # 1 hour
 DEFAULT_SNAPSHOT_INTERVAL_MIN = 900  # 15 minutes (minimum)
 DEFAULT_SNAPSHOT_AGE_MIN = 3600  # 1 hour (minimum snapshot age for backup safety)
+SUDO = "/usr/bin/sudo"
+BTRFS = "/usr/bin/btrfs"
+MOUNT = "/usr/bin/mount"
+UMOUNT = "/usr/bin/umount"
+
 RETRY_DELAY = 5  # seconds between retry attempts
+
+
+def strip_json_comments(src: str) -> str:
+    """Strip // and /* */ comments from JSON(C), preserving line/column positions.
+
+    Comments are replaced with whitespace (newlines are kept) so that JSON
+    error offsets still point at the original text. String literals are left
+    untouched, so values like "rclone://host:*/dir" are never treated as
+    comments. This mirrors the behaviour of the npm 'strip-json-comments'
+    package (which is not available on PyPI).
+    """
+    out = list(src)
+    i, n = 0, len(src)
+    in_string = False
+    while i < n:
+        c = src[i]
+        if in_string:
+            out[i] = c
+            if c == "\\" and i + 1 < n:
+                out[i + 1] = src[i + 1]
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+            out[i] = c
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            while i < n and src[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            out[i] = out[i + 1] = " "
+            i += 2
+            while i + 1 < n and not (src[i] == "*" and src[i + 1] == "/"):
+                out[i] = " " if src[i] != "\n" else "\n"
+                i += 1
+            if i + 1 < n:
+                out[i] = out[i + 1] = " "
+                i += 2
+            continue
+        out[i] = c
+        i += 1
+    return "".join(out)
+
+
+def load_config_json(text: str) -> dict:
+    """Parse a config string that may contain // and /* */ comments."""
+    return json.loads(strip_json_comments(text))
+
 
 # --- Error codes ---
 EXIT_SUCCESS = 0
@@ -439,7 +499,7 @@ class Job(BaseModel):
             logger.error(f"Source subvolume does not exist: {source}")
             sys.exit(EXIT_CONFIG_ERROR)
 
-        cmd = ["btrfs", "subvolume", "snapshot", "-r", str(source), str(snap_path)]
+        cmd = [SUDO, BTRFS, "subvolume", "snapshot", "-r", str(source), str(snap_path)]
         logger.info(f"Creating snapshot: {' '.join(cmd)}")
         try:
             self._run(cmd)
@@ -694,7 +754,7 @@ class Job(BaseModel):
         for s in valid:
             if s.path not in keep_paths:
                 logger.info(f"Deleting old snapshot: {s.path.name}")
-                self._run(["btrfs", "subvolume", "delete", str(s.path)])
+                self._run([SUDO, BTRFS, "subvolume", "delete", str(s.path)])
 
     # --- Throughput learning ---
 
@@ -713,7 +773,7 @@ class Job(BaseModel):
             return
         try:
             config_path = Path(self.config_path)
-            config = json.loads(config_path.read_text())
+            config = load_config_json(config_path.read_text())
             for repo in config.get("repos", []):
                 if repo.get("name") == repo_name:
                     repo["throughput_mbps"] = throughput_mbps
@@ -752,13 +812,15 @@ class Job(BaseModel):
             mount_point.mkdir(parents=True, exist_ok=True)
             if os.path.ismount(mount_point):
                 logger.warning(f"{mount_point} already mounted. Unmounting first.")
-                self._run(["umount", "-l", str(mount_point)])
-            self._run(["mount", "-o", "ro", str(snapshot_path), str(mount_point)])
+                self._run([SUDO, UMOUNT, "-l", str(mount_point)])
+            uid = os.getuid()
+            gid = os.getgid()
+            self._run([SUDO, MOUNT, "-o", f"ro,uid={uid},gid={gid}", str(snapshot_path), str(mount_point)])
             yield mount_point
         finally:
             if mount_point.exists() and os.path.ismount(mount_point):
                 try:
-                    self._run(["umount", "-l", str(mount_point)])
+                    self._run([SUDO, UMOUNT, "-l", str(mount_point)])
                 except subprocess.CalledProcessError:
                     logger.warning(f"Failed to unmount {mount_point}")
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
@@ -948,7 +1010,7 @@ def load_config(config_path: Path) -> SnapBakConfig:
         logger.error(f"Config not found: {config_path}")
         sys.exit(EXIT_CONFIG_ERROR)
     try:
-        return SnapBakConfig(**json.loads(config_path.read_text()))
+        return SnapBakConfig(**load_config_json(config_path.read_text()))
     except Exception as e:
         logger.error(f"Config validation error: {e}")
         sys.exit(EXIT_CONFIG_ERROR)

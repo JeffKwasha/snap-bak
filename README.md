@@ -8,13 +8,56 @@ A simple, robust, maintainable script that leverages Btrfs snapshots and
 restic to efficiently meet 3-2-1 backup coverage with minimal disruption
 to daily use.
 
-## Quickstart
+## Requirements
 
-1. Install: `pip install -e .`
-2. Configure: edit `config/config.json` (repos + jobs)
-3. Create snapshots externally (snapper, btrfs-snap, cron)
-4. Run: `snap-bak` or `snap-bak --dry-run`
-5. Schedule: cron or systemd timer
+- **Linux with Btrfs** — used for read-only snapshots and subvolume mount
+- **Python ≥ 3.10**
+- **restic** (in `$PATH`) — the backup engine; must be exec'd by the service user
+- **`btrfs-progs` / `btrfs`** — `btrfs subvolume snapshot|delete` via sudo
+- **`pydantic >= 2`** and **`python-dateutil >= 2`** — runtime Python deps
+- **optional:** `rclone` — for `rclone:REMOTE:DIR` repos
+- **optional:** systemd (Linux) — for the timer-driven service
+
+## Installation
+
+### Option A — Manual / development
+
+```bash
+# install python package + deps (or: cd repo && uv sync)
+pip install -e .
+```
+
+Then configure `config/config.json` and run manually (`snap-bak --dry-run`)
+or schedule via cron/systemd yourself.
+
+### Option B — Systemd service (recommended for production)
+
+The fully-automated setup script creates an unprivileged system user, installs
+`snapbak.py`, configures granular sudo permissions, and wires up a
+systemd *service + timer*.
+
+```bash
+sudo scripts/setup_service.sh
+sudo systemctl enable --now snap-bak.timer
+```
+
+What `scripts/setup_service.sh` does:
+
+1. Verifies you are `root`.
+2. Creates the `snapbak-svc` user/group and `/opt/snap-bak`.
+3. Installs the orchestrator to `/opt/snap-bak/snapbak.py` (root-owned).
+4. Writes an annotated example config to `/opt/snap-bak/config.json`.
+5. Creates `/opt/snap-bak/passwords` and `/opt/snap-bak/excludes`.
+6. Creates `/mnt/snapbak_mounts` and grants `snapbak-svc` minimal sudo rights
+   (btrfs snapshot create/delete restricted to `YYYY-MM-DD_HH:MM` names;
+   mount/umount pinned to the mount base).
+7. Writes `snap-bak.service` (oneshot) and `snap-bak.timer` (hourly).
+
+The timer runs hourly; restic uploads happen per-job only when
+`backup_interval` has elapsed (so weekly backups = `backup_interval: 604800`).
+
+Before enabling, edit `/opt/snap-bak/config.json` to match your environment and
+create the per-repo restic password files under `/opt/snap-bak/passwords/`.
 
 ## How It Works
 
@@ -51,7 +94,19 @@ Snapshots are young (minutes to hours old). Backups are always slightly older.
 After a successful backup, snapshots older than the backup time are deleted
 (data is now offsite). Younger snapshots remain for quick local restore.
 
-## Features
+## Permissions & Security
+
+To balance security with the need for system-level operations, `snap-bak` employs a **Hybrid Privilege Model**.
+
+### The Strategy
+The orchestrator runs as a dedicated, unprivileged system user (`snapbak-svc`). It does not require full root access. Instead, it uses granular `sudo` permissions for specific kernel-level operations and leverages mount-time UID/GID mapping to bypass filesystem permission barriers.
+
+### How it Works
+1.  **Granular Escalation**: The `snapbak-svc` user is granted `NOPASSWD` access via `sudoers` only for the specific commands required to manage Btrfs subvolumes and mount/unmount filesystems.
+2. **Mount with uid/gid mapping** — Snapshots are mounted read-only using the service user's uid/gid so restic can read all files without ACL complications:
+    * **Command**: `mount -o ro,uid=<svc_uid>,gid=<svc_gid> <source> <target>`
+    * **Effect**: The kernel presents the snapshot's contents as owned by the service user, allowing `restic` to read all files without modifying the original filesystem's permissions.
+3.  **Minimal Surface Area**: The Restic process itself runs as the unprivileged `snapbak-svc` user, ensuring that even if the backup tool is compromised, the attacker's scope is limited to the service user's context.
 
 - **Per-repo password files** — each restic repo has its own password file
 - **Rate tracking** — measures backup speed, updates config for visibility
@@ -63,6 +118,11 @@ After a successful backup, snapshots older than the backup time are deleted
 - **Crash recovery** — lock file with JSON job info
 
 ## Configuration
+
+The config file is JSONC: standard JSON plus `//` and `/* */` comments and
+trailing commas (comments are stripped by `snap-bak` before parsing). The
+default config written by `setup_service.sh` includes inline comments
+describing every field.
 
 Edit `config/config.json`:
 
@@ -124,7 +184,7 @@ Edit `config/config.json`:
 
 | Field | Type | Description | Default |
 |-------|------|-------------|---------|
-| `name` | string | Job name (required) | — |
+| `name` | string | Job name (required). Also derives local paths/tags (see below) | — |
 | `snapshot_dir` | string | Directory containing Btrfs snapshots (required) | — |
 | `source_subvolume` | string | Btrfs subvolume to snapshot (required) | — |
 | `repo` | string | Name of repo to use (must match `repos[].name`) | — |
@@ -147,6 +207,15 @@ both apply. `ignore_file` uses `.gitignore`-style syntax.
 controls restic's offsite backup retention (how many backup versions to keep
 in the remote repo). `snapshot_retention` controls local Btrfs snapshot
 cleanup (how many snapshots to keep on disk).
+
+**Note on `name`:** the job name is used to derive several paths and labels, so
+it must be filesystem- and tag-safe. Use only `[A-Za-z0-9_-]` (no `/`, no `..`).
+
+- Mount point: `<mount_base>/<name>` — the read-only snapshot is mounted here
+  before backup
+- restic tag: `--tag <name>` on every backup/forget
+- Lock file: `<state_dir>/<name>.lock`
+- Status file: `<state_dir>/<name>_status.json`
 
 ## Snapshot and Backup Flow
 
