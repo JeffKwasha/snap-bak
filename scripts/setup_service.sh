@@ -41,8 +41,12 @@ else
 fi
 echo "[*] Creating system user: $SERVICE_USER"
 if ! id "$SERVICE_USER" &>/dev/null; then
-    # Create a system user with a home directory for XDG_STATE_HOME
-    useradd --system --create-home --home-dir "$SNAPBAK_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
+    # Create a system user with a home directory for XDG_STATE_HOME. Use -g so
+    # the pre-created group is assigned as the primary group; without it useradd
+    # tries to create a user-private group of the same name and fails (and is
+    # not idempotent).
+    useradd --system --create-home --home-dir "$SNAPBAK_DIR" \
+        --shell /usr/sbin/nologin -g "$SERVICE_GROUP" "$SERVICE_USER"
 else
     echo "[!] User $SERVICE_USER already exists. Skipping creation."
 fi
@@ -64,8 +68,13 @@ install -o root -g root -m 0644 "$SCRIPT_SRC" "$SCRIPT_PATH"
 # This is JSONC: // and /* */ comments are allowed and stripped by
 # snapbak.py (whitespace-preserving, so line numbers stay valid). Every real
 # field is shown with a value you must edit. This file loads as-is.
-echo "[*] Generating example configuration at $CONFIG_FILE"
-cat <<'SNAPBACK_EOF' > "$CONFIG_FILE"
+# Idempotent: an existing config is left untouched so your edits survive a
+# re-run (use --force ... or rm the file to regenerate).
+if [ -e "$CONFIG_FILE" ]; then
+    echo "[!] $CONFIG_FILE already exists. Skipping generation (keeps your edits)."
+else
+    echo "[*] Generating example configuration at $CONFIG_FILE"
+    cat <<'SNAPBACK_EOF' > "$CONFIG_FILE"
 {
   // Top-level settings
   //   mount_base      : where read-only snapshots get mounted before backup (string)
@@ -132,8 +141,9 @@ cat <<'SNAPBACK_EOF' > "$CONFIG_FILE"
   ]
 }
 SNAPBACK_EOF
-chown root:root "$CONFIG_FILE"
-chmod 644 "$CONFIG_FILE"
+    chown root:root "$CONFIG_FILE"
+    chmod 644 "$CONFIG_FILE"
+fi
 
 # Create password directory. Restic runs as the service user and must be able
 # to read the password file, so the directory is owned by the service user
@@ -162,15 +172,18 @@ chmod 755 "$MOUNT_BASE"
 
 # --- 3. CONFIGURE SUDOERS ---
 SUDOERS_FILE="/etc/sudoers.d/snapbak-svc"
-ISO_SNAPSHOT='[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]:[0-9][0-9]'
+ISO_SNAPSHOT='[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]?[0-9][0-9]'
 echo "[*] Configuring granular sudo permissions in $SUDOERS_FILE"
 cat <<EOF > "$SUDOERS_FILE"
 # snap-bak specific permissions
-# The service user may only manage Btrfs snapshots whose basename is exactly
-# the ISO format used by snapbak.py (YYYY-MM-DD_HH:MM, UTC). The rule is a
-# single line; the glob is injected via a shell variable that expands to the
-# per-character digit ranges. Mount target is pinned to the mount base dir.
-$SERVICE_USER ALL=(root) NOPASSWD:/usr/bin/btrfs subvolume snapshot -r * */${ISO_SNAPSHOT}, /usr/bin/btrfs subvolume delete */${ISO_SNAPSHOT}, /usr/bin/mount -o ro,uid=*,gid=* */${ISO_SNAPSHOT} ${MOUNT_BASE}/*, /usr/bin/umount -l ${MOUNT_BASE}/*
+# The service user may only manage Btrfs snapshots whose basename matches the
+# format used by snapbak.py (YYYY-MM-DD_HH:MM, UTC). Due to sudoers quirks:
+#   - a literal ':' is not allowed in a command arg, so the HH:MM colon is
+#     matched by '?' (any single char, digits still enforced either side)
+#   - commas must be escaped (\,) in the mount options so they do not separate
+#     commands
+# Mount target is pinned to the mount base dir. Whole rule = one line.
+$SERVICE_USER ALL=(root) NOPASSWD:/usr/bin/btrfs subvolume snapshot -r * */${ISO_SNAPSHOT}, /usr/bin/btrfs subvolume delete */${ISO_SNAPSHOT}, /usr/bin/mount -o ro\\,uid=*\\,gid=* */${ISO_SNAPSHOT} ${MOUNT_BASE}/*, /usr/bin/umount -l ${MOUNT_BASE}/*
 EOF
 chmod 0440 "$SUDOERS_FILE"
 
@@ -180,6 +193,19 @@ if ! visudo -c -f "$SUDOERS_FILE"; then
     rm -f "$SUDOERS_FILE"
     exit 1
 fi
+
+# --- 3b. RESOLVE SUDO BINARY ---
+# snapbak.py runs btrfs/mount/umount through sudo. On distros where sudo-rs
+# owns /usr/bin/sudo (Fedora/OpenSUSE family), its stricter glob handling
+# rejects the NOPASSWD rules above, whereas the C implementation (sudo.ws)
+# accepts them. Pick the C sudo explicitly and hand it to snapbak via
+# SNAPBAK_SUDO; snapbak falls back to /usr/bin/sudo for non-service use.
+if [ -x /usr/bin/sudo.ws ]; then
+    SUDO_BIN="/usr/bin/sudo.ws"
+else
+    SUDO_BIN="/usr/bin/sudo"
+fi
+echo "[*] Using sudo binary: $SUDO_BIN"
 
 # --- 4. CREATE SYSTEMD SERVICE ---
 echo "[*] Creating systemd service: $SERVICE_NAME.service"
@@ -195,6 +221,7 @@ User=$SERVICE_USER
 Group=$SERVICE_GROUP
 Environment=SNAPBAK_CONFIG_FILE=$CONFIG_FILE
 Environment=XDG_STATE_HOME=$SNAPBAK_DIR
+Environment=SNAPBAK_SUDO=$SUDO_BIN
 ExecStart=/usr/bin/python3 $SCRIPT_PATH
 
 [Install]

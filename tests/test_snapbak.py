@@ -1,8 +1,10 @@
-#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Unit tests for snapbak.py — no remote restic, minimal IO."""
 import json
 import os
+import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -12,12 +14,19 @@ import pytest
 # Ensure scripts package is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import scripts.snapbak as snapbak_module
+
 from scripts.snapbak import (
     DEFAULT_SNAPSHOT_INTERVAL,
     DEFAULT_SNAPSHOT_INTERVAL_MIN,
+    FAIL_CREDENTIALS,
+    FAIL_INTERNAL,
+    CredentialsError,
     Job,
     Repo,
+    RemoteUnavailableError,
     SnapBakConfig,
+    _categorize_restic_error,
     build_retention_datetimes,
     build_retention_exponential,
     build_snapshot_keeplist,
@@ -27,6 +36,19 @@ from scripts.snapbak import (
 
 
 # --- Fixtures ---
+
+@pytest.fixture(autouse=True)
+def isolated_state(tmp_path, monkeypatch):
+    """Give every test its own STATE_DIR / GLOBAL_LOCK_FILE.
+
+    Without this, run() writes status/lock files into the real ~/.local/state
+    and tests leak state into each other.
+    """
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(snapbak_module, "STATE_DIR", state)
+    monkeypatch.setattr(snapbak_module, "GLOBAL_LOCK_FILE", state / "snapbak.lock")
+
 
 @pytest.fixture
 def sample_repos():
@@ -59,6 +81,30 @@ def create_snapshots(sample_job):
         snap_dir.mkdir(exist_ok=True)
         return snap_dir
     return _create
+
+
+@contextmanager
+def _mock_mount(*args, **kwargs):
+    """Context manager replacing Job.mount_and_lock in run() tests."""
+    yield Path("/tmp/fake_mount")
+
+
+@pytest.fixture
+def mocked_backup_job(sample_job):
+    """Sample job with all backup sub-steps mocked so run() reaches success.
+
+    create_snapshot/_write_status are mocked too: individual tests override
+    their side_effect/return_value as needed.
+    """
+    sample_job.mount_and_lock = _mock_mount
+    sample_job._preflight = MagicMock(return_value=1_000_000_000)
+    sample_job._backup = MagicMock(return_value="restic_snap_id")
+    sample_job._forget_and_prune = MagicMock()
+    sample_job._update_repo_throughput = MagicMock()
+    sample_job._cleanup_snapshots = MagicMock()
+    sample_job.create_snapshot = MagicMock()
+    sample_job._write_status = MagicMock()
+    return sample_job
 
 
 # --- Snapshot time parsing tests ---
@@ -394,14 +440,14 @@ class TestThroughputCalculation:
 # --- Failed backup retry tests ---
 
 class TestFailedBackupRetry:
-    def test_failed_status_triggers_retry(self, sample_job, create_snapshots, tmp_path):
+    def test_failed_status_triggers_retry(self, mocked_backup_job, create_snapshots):
         """When last status is 'failed' with snapshot_name, retry with that snapshot."""
         now = datetime.now(timezone.utc)
-        snap_name = "20240115_103000"
+        snap_name = (now - timedelta(hours=1)).strftime("%Y-%m-%d_%H:%M")
         create_snapshots(snap_name, now - timedelta(hours=1))
 
         # Write a failed status file
-        status_file = sample_job.status_file
+        status_file = mocked_backup_job.status_file
         status_file.parent.mkdir(parents=True, exist_ok=True)
         status_file.write_text(json.dumps({
             "job": "test_job",
@@ -411,34 +457,24 @@ class TestFailedBackupRetry:
             "snapshot_name": snap_name,
         }))
 
-        # Mock the backup steps
-        sample_job._preflight = MagicMock(return_value=1_000_000_000)
-        sample_job._backup = MagicMock()
-        sample_job._forget_and_prune = MagicMock()
-        sample_job._cleanup_snapshots_exponential = MagicMock()
-        sample_job._update_repo_throughput = MagicMock()
-        sample_job._write_status = MagicMock()
-
-        # Mock mount_and_lock to avoid actual mounting
-        from contextlib import contextmanager
-        @contextmanager
-        def mock_mount(*args, **kwargs):
-            yield Path("/tmp/fake_mount")
-        sample_job.mount_and_lock = mock_mount
-
-        result = sample_job.run()
+        # The 1h-old snapshot is due on schedule; fixture mocks create_snapshot.
+        result = mocked_backup_job.run()
 
         assert result["status"] == "success"
-        # Verify backup was called (retry happened)
-        sample_job._backup.assert_called_once()
+        # Snapshot creation fired on schedule and the failed snapshot was retried.
+        mocked_backup_job.create_snapshot.assert_called_once()
+        mocked_backup_job._backup.assert_called_once()
+        # The retry success carries restic's reported snapshot id.
+        success_call = mocked_backup_job._write_status.call_args_list[-1]
+        assert success_call.kwargs["restic_snapshot_id"] == "restic_snap_id"
 
-    def test_failed_snapshot_gone_skips(self, sample_job, tmp_path):
+    def test_failed_snapshot_gone_skips(self, mocked_backup_job):
         """When failed snapshot no longer exists, skip job."""
         now = datetime.now(timezone.utc)
-        snap_name = "20240115_103000"
+        snap_name = (now - timedelta(hours=1)).strftime("%Y-%m-%d_%H:%M")
 
         # Write a failed status file
-        status_file = sample_job.status_file
+        status_file = mocked_backup_job.status_file
         status_file.parent.mkdir(parents=True, exist_ok=True)
         status_file.write_text(json.dumps({
             "job": "test_job",
@@ -448,9 +484,117 @@ class TestFailedBackupRetry:
             "snapshot_name": snap_name,
         }))
 
-        result = sample_job.run()
+        # Fresh install (no snapshots) -> snapshot_due fires; fixture mocks it.
+        result = mocked_backup_job.run()
 
         assert result["status"] == "skipped"
+        mocked_backup_job._backup.assert_not_called()
+
+
+# --- Snapshot schedule tests ---
+
+class TestSnapshotSchedule:
+    def test_fresh_install_creates_snapshot_and_defers(self, mocked_backup_job):
+        """Fresh install: no snapshots -> create one on schedule, but it's too
+        young to back up yet, so the run ends in a graceful skip."""
+        now = datetime.now(timezone.utc)
+        created = Path(mocked_backup_job.snapshot_dir) / now.strftime("%Y-%m-%d_%H:%M")
+
+        def _fake_create():
+            created.mkdir(exist_ok=True)
+            return created
+        mocked_backup_job.create_snapshot = MagicMock(side_effect=_fake_create)
+
+        result = mocked_backup_job.run()
+
+        mocked_backup_job.create_snapshot.assert_called_once()
+        mocked_backup_job._backup.assert_not_called()
+        assert result["status"] == "skipped"
+
+    def test_creates_snapshot_when_none_exist_and_continues(self, mocked_backup_job):
+        """A brand-new (eligible) snapshot lets the run continue to backup."""
+        created = Path(mocked_backup_job.snapshot_dir) / (
+            datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%d_%H:%M")
+
+        def _fake_create():
+            created.mkdir(exist_ok=True)
+            return created
+        mocked_backup_job.create_snapshot = MagicMock(side_effect=_fake_create)
+
+        result = mocked_backup_job.run()
+
+        mocked_backup_job.create_snapshot.assert_called_once()
+        assert result["status"] == "success"
+        success_call = mocked_backup_job._write_status.call_args_list[-1]
+        assert success_call.kwargs["restic_snapshot_id"] == "restic_snap_id"
+
+    def test_does_not_create_when_snapshot_within_interval(self, mocked_backup_job, create_snapshots):
+        """Snapshot younger than snapshot_interval -> no new snapshot."""
+        recent = datetime.now(timezone.utc) - timedelta(minutes=90)
+        create_snapshots(recent.strftime("%Y-%m-%d_%H:%M"), recent)
+        mocked_backup_job.snapshot_interval = 7200
+
+        result = mocked_backup_job.run()
+
+        mocked_backup_job.create_snapshot.assert_not_called()
+        assert result["status"] == "success"
+
+    def test_too_young_snapshot_defers_backup(self, mocked_backup_job, create_snapshots):
+        """A snapshot under the minimum age is skipped gracefully, not backed up."""
+        recent = datetime.now(timezone.utc) - timedelta(minutes=30)
+        create_snapshots(recent.strftime("%Y-%m-%d_%H:%M"), recent)
+
+        result = mocked_backup_job.run()
+
+        mocked_backup_job._backup.assert_not_called()
+        assert result["status"] == "skipped"
+
+    def test_dry_run_does_not_create_snapshot(self, mocked_backup_job):
+        mocked_backup_job.dry_run = True
+
+        result = mocked_backup_job.run()
+
+        mocked_backup_job.create_snapshot.assert_not_called()
+        assert result["status"] == "skipped"
+
+
+# --- Failure category tests ---
+
+class TestFailureCategories:
+    def test_restic_exit_code_mapping(self):
+        err = subprocess.CalledProcessError(12, "restic", stderr="wrong password")
+        assert isinstance(_categorize_restic_error(err), CredentialsError)
+
+        for rc in (1, 3, 10, 11):
+            err = subprocess.CalledProcessError(rc, "restic", stderr="boom")
+            assert isinstance(_categorize_restic_error(err), RemoteUnavailableError), rc
+
+    def test_failed_backup_records_category(self, mocked_backup_job, create_snapshots):
+        """A categorized failure is persisted on the failed status."""
+        now = datetime.now(timezone.utc)
+        create_snapshots((now - timedelta(hours=2)).strftime("%Y-%m-%d_%H:%M"), now - timedelta(hours=2))
+        mocked_backup_job._backup = MagicMock(side_effect=CredentialsError("wrong password"))
+
+        result = mocked_backup_job.run()
+
+        assert result["status"] == "failed"
+        assert result["error"] == "wrong password"
+        call = mocked_backup_job._write_status.call_args
+        assert call.kwargs["failure_category"] == FAIL_CREDENTIALS
+        assert "wrong password" in call.kwargs["last_error"]
+
+    def test_unknown_failure_defaults_to_internal(self, mocked_backup_job, create_snapshots):
+        """Exceptions without a category default to FAIL_INTERNAL."""
+        now = datetime.now(timezone.utc)
+        create_snapshots((now - timedelta(hours=2)).strftime("%Y-%m-%d_%H:%M"), now - timedelta(hours=2))
+        mocked_backup_job._backup = MagicMock(side_effect=RuntimeError("mystery"))
+
+        result = mocked_backup_job.run()
+
+        assert result["status"] == "failed"
+        call = mocked_backup_job._write_status.call_args
+        assert call.kwargs["failure_category"] == FAIL_INTERNAL
+        assert "mystery" in call.kwargs["last_error"]
 
 
 # --- SnapBakConfig tests ---

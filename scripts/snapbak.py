@@ -50,7 +50,11 @@ DEFAULT_BACKUP_INTERVAL = 3600  # 1 hour
 DEFAULT_SNAPSHOT_INTERVAL = 3600  # 1 hour
 DEFAULT_SNAPSHOT_INTERVAL_MIN = 900  # 15 minutes (minimum)
 DEFAULT_SNAPSHOT_AGE_MIN = 3600  # 1 hour (minimum snapshot age for backup safety)
-SUDO = "/usr/bin/sudo"
+# Which sudo binary to use. The systemd unit sets SNAPBAK_SUDO to the C
+# implementation (e.g. /usr/bin/sudo.ws) when sudo-rs owns /usr/bin/sudo,
+# since sudo-rs has stricter/divergent glob handling and rejects the NOPASSWD
+# btrfs/mount rules that C sudo accepts.
+SUDO = os.environ.get("SNAPBAK_SUDO", "/usr/bin/sudo")
 BTRFS = "/usr/bin/btrfs"
 MOUNT = "/usr/bin/mount"
 UMOUNT = "/usr/bin/umount"
@@ -125,6 +129,17 @@ EXIT_PERM_FAILED = 41
 EXIT_SYSTEM = 50
 EXIT_STUCK_WAIT = 51
 
+# --- Failure categories (for cheap watchdog triage; snapbak does NOT
+#     decide escalation — it only records the cause so the watchdog can).
+#     Categories are assigned EXPLICITLY at the call site (which operation
+#     failed), never inferred from log text. ---
+FAIL_CREDENTIALS = "credentials"        # bad/expired password, auth rejected -> user action
+FAIL_PERMISSION = "permission"          # sudo denied, EPERM -> user action
+FAIL_MOUNT = "mount"                    # snapshot mount failed -> system problem
+FAIL_REMOTE = "remote_unavailable"      # restic repo/network down, timeout -> transient
+FAIL_SNAPSHOT = "snapshot"              # btrfs snapshot creation failed -> system problem
+FAIL_INTERNAL = "internal"              # unknown
+
 
 # --- Retention functions ---
 
@@ -173,7 +188,6 @@ def build_snapshot_keeplist(snapshots: list[Snapshot], retentions: list[datetime
             oldest = min(candidates, key=lambda s: s.time)
             keeps.add(oldest.path)
     return keeps
-    return keeps
 
 
 RETENTION_FN = {
@@ -191,18 +205,20 @@ def _get_state_dir() -> Path:
 
 
 STATE_DIR = _get_state_dir()
-LOG_FILE = STATE_DIR / "snapbak.log"
 GLOBAL_LOCK_FILE = STATE_DIR / "snapbak.lock"
 
 # Ensure state directory exists before logging setup
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Logging ---
-logging.basicConfig(
-    filename=str(LOG_FILE),
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+# stderr ONLY. For a systemd service, systemd captures stderr into the journal
+# (journalctl) which is the canonical, always-available log. We deliberately do
+# NOT write a separate log file by default: that would duplicate every line and
+# is redundant. A file copy is OPT-IN via --log-file for ad-hoc/non-service use.
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+_stream_handler = logging.StreamHandler(sys.stderr)
+_stream_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+logging.basicConfig(level=logging.INFO, handlers=[_stream_handler])
 logger = logging.getLogger(__name__)
 
 
@@ -212,6 +228,39 @@ class LockError(Exception):
 
 class StuckInstanceError(Exception):
     """Raised when a previous snap-bak instance appears stuck."""
+
+
+class BackupError(Exception):
+    """Base class for failures carrying a category (see FAIL_* constants)."""
+    category = FAIL_INTERNAL
+
+
+class CredentialsError(BackupError):
+    """Authentication/credential problem; requires user action."""
+    category = FAIL_CREDENTIALS
+
+
+class RemoteUnavailableError(BackupError):
+    """Remote repository/network unavailable; transient."""
+    category = FAIL_REMOTE
+
+
+class MountError(BackupError):
+    """Snapshot could not be mounted."""
+    category = FAIL_MOUNT
+
+
+def _categorize_restic_error(e: subprocess.CalledProcessError) -> BackupError:
+    """Map a restic subprocess failure to a categorized BackupError.
+
+    Uses restic's documented exit codes (cmd/restic/main.go):
+      3  invalid source data, 10 repository not found,
+      11 repository locked, 12 wrong key/password.
+    """
+    msg = f"restic failed (rc={e.returncode}): {e.stderr or ''}".strip()
+    if e.returncode == 12:
+        return CredentialsError(msg)
+    return RemoteUnavailableError(msg)
 
 
 # --- Global lock ---
@@ -348,14 +397,6 @@ class Job(BaseModel):
     dry_run: bool = False
     config_path: str | None = None
 
-    # State fields (persisted, not from config)
-    delayed: bool = Field(default=False, exclude=True)
-    delayed_reason: str | None = Field(default=None, exclude=True)
-    protected_snapshot: str | None = Field(default=None, exclude=True)
-    missed_slots: int = Field(default=0, exclude=True)
-    planned_snapshot: Path | None = Field(default=None, exclude=True)
-    backup_planned: bool = Field(default=False, exclude=True)
-
     @field_validator('snapshot_dir')
     @classmethod
     def snapshot_dir_must_exist(cls, v):
@@ -474,13 +515,6 @@ class Job(BaseModel):
         except (json.JSONDecodeError, OSError):
             return None
 
-    def delay(self, reason: str):
-        """Mark this job as delayed with a reason."""
-        self.delayed = True
-        self.delayed_reason = reason
-        self.missed_slots += 1
-        logger.info(f"Job {self.name}: delayed ({reason})")
-
     def create_snapshot(self) -> Path:
         """Create a new btrfs snapshot of source_subvolume.
 
@@ -504,33 +538,56 @@ class Job(BaseModel):
         try:
             self._run(cmd)
         except subprocess.CalledProcessError as e:
-            logger.error(f"Snapshot creation failed: {e.stderr}")
+            msg = f"Snapshot creation failed: {e.stderr}"
+            logger.error(msg)
+            # Record the failure as a scheduled-task error rather than die
+            # silently with status stuck at 'started'. snapbak failed to
+            # perform a scheduled task -> it failed.
+            self._write_status(
+                "failed", msg, failure_category=FAIL_SNAPSHOT, last_error=msg
+            )
             sys.exit(EXIT_ERROR)
 
         logger.info(f"Snapshot created: {snap_path}")
         return snap_path
 
-    def _assert_snapshot_age(self, snapshot_path: Path):
-        """Fatal error if snapshot used for backup is <1 hour old."""
+    @property
+    def snapshot_due(self) -> bool:
+        """True when a snapshot should be created on this run.
+
+        Fresh installs (no valid snapshot yet) and snapshots older than
+        snapshot_interval both count as due. Never fires in dry-run mode.
+        """
+        if self.dry_run:
+            return False
+        try:
+            last_time = self._parse_snapshot_time(self._get_latest_snapshot())
+        except (ValueError, OSError):
+            return True
+        if last_time is None:
+            return True
+        return (datetime.now(timezone.utc) - last_time).total_seconds() >= self.snapshot_interval
+
+    def _snapshot_too_young(self, snapshot_path: Path) -> bool:
+        """True when the snapshot is younger than the minimum backup age."""
         snap_time = self._parse_snapshot_time(snapshot_path)
         if snap_time is None:
-            logger.error(f"Cannot parse snapshot time: {snapshot_path.name}")
-            sys.exit(EXIT_CONFIG_ERROR)
+            return True
         age = (datetime.now(timezone.utc) - snap_time).total_seconds()
-        if age < DEFAULT_SNAPSHOT_AGE_MIN:
-            logger.error(
-                f"Snapshot {snapshot_path.name} is only {age:.0f}s old "
-                f"(minimum {DEFAULT_SNAPSHOT_AGE_MIN}s). Refusing backup."
-            )
-            sys.exit(EXIT_PERM_FAILED)
+        return age < DEFAULT_SNAPSHOT_AGE_MIN
 
     def _write_status(self, status: str, message: str,
                       snapshot_name: str | None = None,
-                      snapshot_time: datetime | None = None):
+                      snapshot_time: datetime | None = None,
+                      restic_snapshot_id: str | None = None,
+                      failure_category: str | None = None,
+                      last_error: str | None = None):
         """Atomically write status to per-job status file.
 
         Uses tmp file + rename for atomicity. If a .tmp file exists
         from a previous interrupted run, it indicates a stuck process.
+        failure_category/last_error record the cause of a 'failed' status so
+        consumers can judge severity even for categories they don't know.
         """
         if self.dry_run:
             return
@@ -540,15 +597,17 @@ class Job(BaseModel):
             "status": status,
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d_%H:%M"),
             "message": message,
-            "delayed": self.delayed,
-            "delayed_reason": self.delayed_reason,
-            "protected_snapshot": self.protected_snapshot,
-            "missed_slots": self.missed_slots,
         }
         if snapshot_name:
             data["snapshot_name"] = snapshot_name
         if snapshot_time:
             data["snapshot_time"] = snapshot_time.strftime("%Y-%m-%d_%H:%M")
+        if restic_snapshot_id:
+            data["restic_snapshot_id"] = restic_snapshot_id
+        if failure_category:
+            data["failure_category"] = failure_category
+        if last_error:
+            data["last_error"] = last_error
         tmp = self.status_file.with_suffix('.json.tmp')
         tmp.write_text(json.dumps(data, indent=2))
         tmp.replace(self.status_file)
@@ -571,45 +630,28 @@ class Job(BaseModel):
     # --- Security ---
 
     def _check_password_file_permissions(self):
-        """Warn if password file is readable by group or others."""
+        """Warn if password file is readable/writable by OTHER (untrusted users).
+
+        Group access is intentionally allowed: the file is owned by the
+        service account (read) with the admin group granted write so the
+        administrator can rotate credentials. Only 'other' (any user who is
+        neither the owner nor in the group) access is a real leak.
+        """
         repo = self.repo_obj
         if not repo.password_file:
             return
         try:
             stat = os.stat(repo.password_file)
             mode = stat.st_mode
-            if mode & 0o077:
+            if mode & 0o007:
                 logger.warning(
-                    f"Password file {repo.password_file} is readable by group or others "
-                    f"(mode {oct(mode & 0o777)}). Consider: chmod 600 {repo.password_file}"
+                    f"Password file {repo.password_file} is accessible by OTHER "
+                    f"(mode {oct(mode & 0o777)}). Restrict with: chmod o-rwx {repo.password_file}"
                 )
         except OSError as e:
             logger.warning(f"Cannot stat password file {repo.password_file}: {e}")
 
     # --- Decision ---
-
-    def should_run(self) -> bool:
-        """Return True if the latest snapshot is newer than the last backup."""
-        try:
-            snap_time = self.latest_snapshot_time
-        except (ValueError, OSError) as e:
-            logger.warning(f"Job {self.name}: cannot determine snapshot time: {e}")
-            return True
-
-        last_backup = self._get_last_backup_time()
-        if last_backup is None:
-            logger.info(f"Job {self.name}: no previous backup, will run")
-            return True
-
-        if snap_time > last_backup:
-            logger.info(
-                f"Job {self.name}: new snapshot ({snap_time}) "
-                f"since last backup ({last_backup})"
-            )
-            return True
-
-        logger.info(f"Job {self.name}: no new snapshots, skipping")
-        return False
 
     def _time_since_last_success(self) -> float | None:
         """Return seconds since last successful backup, or None."""
@@ -701,18 +743,47 @@ class Job(BaseModel):
             logger.info(f"PREFLIGHT: {total_files} files, {total_size / 1e9:.2f} GB")
             return total_size
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"Preflight failed (remote connectivity or config issue): {e.stderr}"
-            )
+            raise _categorize_restic_error(e) from e
         except (json.JSONDecodeError, IndexError) as e:
             logger.warning(f"Could not parse preflight output: {e}")
             return 0
 
-    def _backup(self, mount_point: Path, repo: Repo | None = None):
-        """Run the actual restic backup."""
+    def _backup(self, mount_point: Path, repo: Repo | None = None) -> str | None:
+        """Run the actual restic backup.
+
+        Trusts restic's contract: a non-zero exit means failure (raised by
+        _run() and mapped to a category via restic's exit codes); a zero exit
+        means success. We additionally capture restic's --json summary so the
+        recorded "success" is backed by restic's reported snapshot id. Any
+        restic stderr (warnings included) is surfaced at WARNING level so it
+        can never be silently lost.
+        """
         cmd = self._build_restic_cmd("backup", repo)
-        cmd.extend([str(mount_point), "--no-symlinks", "--tag", self.name])
-        self._run(cmd, timeout=self.timeout)
+        cmd.extend([str(mount_point), "--no-symlinks", "--tag", self.name, "--json"])
+        try:
+            result = self._run(cmd, timeout=self.timeout)
+        except subprocess.CalledProcessError as e:
+            raise _categorize_restic_error(e) from e
+        # Surface restic's own stderr as a warning (it may note incomplete paths,
+        # changed repository, etc.). We believe what restic reports.
+        if result.stderr and result.stderr.strip():
+            for line in result.stderr.strip().splitlines():
+                logger.warning(f"restic: {line}")
+        # Parse restic's own success report for the snapshot id. A zero exit with
+        # no usable summary is still success per restic's contract.
+        snapshot_id = None
+        for line in reversed(result.stdout.strip().splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                summary = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(summary, dict) and summary.get("message_type") == "summary":
+                snapshot_id = summary.get("snapshot_id")
+                break
+        return snapshot_id
 
     def _forget_and_prune(self, repo: Repo | None = None):
         """Apply retention policy via forget + prune."""
@@ -815,7 +886,10 @@ class Job(BaseModel):
                 self._run([SUDO, UMOUNT, "-l", str(mount_point)])
             uid = os.getuid()
             gid = os.getgid()
-            self._run([SUDO, MOUNT, "-o", f"ro,uid={uid},gid={gid}", str(snapshot_path), str(mount_point)])
+            try:
+                self._run([SUDO, MOUNT, "-o", f"ro,uid={uid},gid={gid}", str(snapshot_path), str(mount_point)])
+            except subprocess.CalledProcessError as e:
+                raise MountError(f"Failed to mount {snapshot_path}: {e.stderr}") from e
             yield mount_point
         finally:
             if mount_point.exists() and os.path.ismount(mount_point):
@@ -829,6 +903,56 @@ class Job(BaseModel):
 
     # --- Main entry point ---
 
+    def _run_backup(self, mount_point: Path, snapshot_path: Path,
+                    snapshot_name: str, retry: bool = False) -> dict:
+        """Shared backup body for the normal and retry flows."""
+        total_size = self._preflight(mount_point)
+
+        if self.dry_run:
+            logger.info(f"DRY-RUN: Would run backup for {self.name}")
+            self._write_status("dry_run", "Preflight passed (dry-run)")
+            return {"job": self.name, "status": "dry_run"}
+
+        backup_start = time.time()
+        selected_repo = self.repo_obj
+        restic_snapshot_id = self._backup(mount_point, selected_repo)
+        self._forget_and_prune(selected_repo)
+        backup_time = time.time() - backup_start
+
+        self._update_repo_throughput(selected_repo, total_size, backup_time)
+
+        snap_time = self._parse_snapshot_time(snapshot_path)
+        message = (
+            f"Backup completed at {datetime.now(timezone.utc).isoformat()}"
+            if not retry else "Backup completed (retry of failed snapshot)"
+        )
+        self._write_status(
+            "success", message, snapshot_name, snap_time,
+            restic_snapshot_id=restic_snapshot_id,
+        )
+        self._cleanup_snapshots(protected_snapshot=snapshot_name)
+        return {"job": self.name, "status": "success"}
+
+    def _backup_snapshot(self, snapshot_path: Path, retry: bool = False) -> dict:
+        """Mount a snapshot and run the backup flow with lock + failure handling."""
+        snapshot_name = snapshot_path.name
+        try:
+            touch_global_lock(self.name, snapshot_name)
+            with self.mount_and_lock(snapshot_path) as mount_point:
+                return self._run_backup(mount_point, snapshot_path, snapshot_name, retry=retry)
+        except LockError:
+            self._write_status("skipped", "Another instance is running")
+            return {"job": self.name, "status": "skipped"}
+        except Exception as e:
+            category = getattr(e, "category", FAIL_INTERNAL)
+            msg = str(e)
+            logger.error(f"Job {self.name} failed: {msg}", exc_info=True)
+            self._write_status(
+                "failed", msg, snapshot_name,
+                failure_category=category, last_error=msg,
+            )
+            return {"job": self.name, "status": "failed", "error": msg}
+
     def run(self, config_overrides: dict | None = None) -> dict:
         """Execute the backup job. Returns a result dict."""
         if config_overrides:
@@ -838,128 +962,73 @@ class Job(BaseModel):
 
         logger.info(f"--- Starting Job: {self.name} ---")
         self._check_stale_tmp()
+        # Read the previous run's status BEFORE overwriting it with "started";
+        # otherwise the failed-backup retry below could never trigger.
+        last_status = self._get_last_status()
         self._write_status("started", "Backup initiated")
 
-        # 1. Check for failed backup from previous run
-        last_status = self._get_last_status()
-        if last_status and last_status.get("status") == "failed":
-            failed_snapshot_name = last_status.get("snapshot_name")
-            if failed_snapshot_name:
-                failed_snapshot_path = Path(self.snapshot_dir) / failed_snapshot_name
-                if failed_snapshot_path.exists():
-                    logger.info(f"Retrying failed backup for snapshot: {failed_snapshot_name}")
-                    touch_global_lock(self.name, failed_snapshot_name)
-                    try:
-                        with self.mount_and_lock(failed_snapshot_path) as mount_point:
-                            total_size = self._preflight(mount_point)
-                            if self.dry_run:
-                                logger.info(f"DRY-RUN: Would run backup for {self.name}")
-                                self._write_status("dry_run", "Preflight passed (dry-run)")
-                                return {"job": self.name, "status": "dry_run"}
+        # 0. Create a snapshot on schedule — independent of backup success, so
+        #    fresh installs self-start and long backups don't stall cadence.
+        if self.snapshot_due:
+            self.create_snapshot()
 
-                            backup_start = time.time()
-                            selected_repo = self.repo_obj
-                            self._backup(mount_point, selected_repo)
-                            self._forget_and_prune(selected_repo)
-                            backup_time = time.time() - backup_start
-
-                            self._update_repo_throughput(selected_repo, total_size, backup_time)
-
-                            snap_time = self._parse_snapshot_time(failed_snapshot_path)
-                            self._write_status(
-                                "success",
-                                f"Backup completed (retry of failed snapshot)",
-                                failed_snapshot_name,
-                                snap_time,
-                            )
-                            self._cleanup_snapshots(protected_snapshot=failed_snapshot_name)
-                            return {"job": self.name, "status": "success"}
-                    except LockError:
-                        self._write_status("skipped", "Another instance is running")
-                        return {"job": self.name, "status": "skipped"}
-                    except Exception as e:
-                        logger.error(f"Job {self.name} failed: {e}", exc_info=True)
-                        self._write_status("failed", str(e), failed_snapshot_name)
-                        return {"job": self.name, "status": "failed", "error": str(e)}
-                    finally:
-                        logger.info(f"--- Finished Job: {self.name} ---")
-                else:
+        try:
+            # 1. Check for failed backup from previous run
+            if last_status and last_status.get("status") == "failed":
+                failed_snapshot_name = last_status.get("snapshot_name")
+                if failed_snapshot_name:
+                    failed_snapshot_path = Path(self.snapshot_dir) / failed_snapshot_name
+                    if failed_snapshot_path.exists():
+                        logger.info(f"Retrying failed backup for snapshot: {failed_snapshot_name}")
+                        return self._backup_snapshot(failed_snapshot_path, retry=True)
                     logger.warning(f"Failed snapshot {failed_snapshot_name} no longer exists")
                     self._write_status("skipped", "Previous backup failed but snapshot is gone")
                     return {"job": self.name, "status": "skipped"}
-            else:
                 logger.warning("Previous backup failed but no snapshot name recorded")
                 self._write_status("skipped", "Previous backup failed (no snapshot info)")
                 return {"job": self.name, "status": "skipped"}
 
-        # 2. Check if it's time to backup
-        time_since = self._time_since_last_success()
-        if time_since is not None and time_since < self.backup_interval:
-            logger.info(f"Job {self.name}: {time_since:.0f}s since last backup "
-                        f"(interval: {self.backup_interval}s). Skipping backup, running cleanup.")
-            self._cleanup_snapshots()
-            self._write_status("skipped", "Not time for backup yet")
-            return {"job": self.name, "status": "skipped"}
-
-        # 3. Check if within backup window
-        if not self._is_within_backup_window():
-            logger.info(f"Job {self.name}: outside backup window "
-                        f"({self.backup_window_start}-{self.backup_window_end}). Skipping backup.")
-            self._cleanup_snapshots()
-            self._write_status("skipped", "Outside backup window")
-            return {"job": self.name, "status": "skipped"}
-
-        # 4. Time to backup — find oldest snapshot within interval
-        snapshot_path = self._find_oldest_snapshot_within(self.backup_interval)
-        if snapshot_path is None:
-            # Fall back to latest snapshot if none within interval
-            try:
-                snapshot_path = self._get_latest_snapshot()
-            except (ValueError, OSError) as e:
-                logger.warning(f"Job {self.name}: cannot find snapshot: {e}")
-                self._write_status("skipped", f"No snapshot found: {e}")
+            # 2. Check if it's time to backup
+            time_since = self._time_since_last_success()
+            if time_since is not None and time_since < self.backup_interval:
+                logger.info(f"Job {self.name}: {time_since:.0f}s since last backup "
+                            f"(interval: {self.backup_interval}s). Skipping backup, running cleanup.")
+                self._cleanup_snapshots()
+                self._write_status("skipped", "Not time for backup yet")
                 return {"job": self.name, "status": "skipped"}
 
-        snapshot_name = snapshot_path.name
-        touch_global_lock(self.name, snapshot_name)
+            # 3. Check if within backup window
+            if not self._is_within_backup_window():
+                logger.info(f"Job {self.name}: outside backup window "
+                            f"({self.backup_window_start}-{self.backup_window_end}). Skipping backup.")
+                self._cleanup_snapshots()
+                self._write_status("skipped", "Outside backup window")
+                return {"job": self.name, "status": "skipped"}
 
-        try:
-            with self.mount_and_lock(snapshot_path) as mount_point:
-                total_size = self._preflight(mount_point)
+            # 4. Time to backup — find oldest snapshot within interval
+            snapshot_path = self._find_oldest_snapshot_within(self.backup_interval)
+            if snapshot_path is None:
+                # Fall back to latest snapshot if none within interval
+                try:
+                    snapshot_path = self._get_latest_snapshot()
+                except (ValueError, OSError) as e:
+                    logger.warning(f"Job {self.name}: cannot find snapshot: {e}")
+                    self._write_status("skipped", f"No snapshot found: {e}")
+                    return {"job": self.name, "status": "skipped"}
 
-                if self.dry_run:
-                    logger.info(f"DRY-RUN: Would run backup for {self.name}")
-                    self._write_status("dry_run", "Preflight passed (dry-run)")
-                    return {"job": self.name, "status": "dry_run"}
-
-                backup_start = time.time()
-                selected_repo = self.repo_obj
-                self._backup(mount_point, selected_repo)
-                self._forget_and_prune(selected_repo)
-                backup_time = time.time() - backup_start
-
-                self._update_repo_throughput(selected_repo, total_size, backup_time)
-
-                self._assert_snapshot_age(snapshot_path)
-                self.create_snapshot()
-
-                snap_time = self._parse_snapshot_time(snapshot_path)
+            # Refuse to back up snapshots younger than the minimum age. This is
+            # a graceful skip, not a failure: the snapshot will be picked up on
+            # a later run (e.g. the fresh-install case where we just created it).
+            if self._snapshot_too_young(snapshot_path):
+                logger.info(f"Job {self.name}: snapshot {snapshot_path.name} is younger than "
+                            f"{DEFAULT_SNAPSHOT_AGE_MIN}s; deferring to a later run.")
                 self._write_status(
-                    "success",
-                    f"Backup completed at {datetime.now(timezone.utc).isoformat()}",
-                    snapshot_name,
-                    snap_time,
+                    "skipped",
+                    f"Snapshot {snapshot_path.name} younger than {DEFAULT_SNAPSHOT_AGE_MIN}s",
                 )
-                self._cleanup_snapshots(protected_snapshot=snapshot_name)
-                return {"job": self.name, "status": "success"}
+                return {"job": self.name, "status": "skipped"}
 
-        except LockError:
-            self._write_status("skipped", "Another instance is running")
-            return {"job": self.name, "status": "skipped"}
-        except Exception as e:
-            logger.error(f"Job {self.name} failed: {e}", exc_info=True)
-            self._write_status("failed", str(e), snapshot_name)
-            return {"job": self.name, "status": "failed", "error": str(e)}
+            return self._backup_snapshot(snapshot_path)
         finally:
             logger.info(f"--- Finished Job: {self.name} ---")
 
@@ -1019,6 +1088,17 @@ def load_config(config_path: Path) -> SnapBakConfig:
 # --- CLI ---
 
 def main():
+    try:
+        _main_impl()
+    except SystemExit:
+        raise
+    except Exception as e:
+        # No failure in a backup orchestrator should be silent.
+        logger.critical(f"FATAL: snap-bak crashed: {e}", exc_info=True)
+        sys.exit(EXIT_ERROR)
+
+
+def _main_impl():
     parser = argparse.ArgumentParser(
         description="Btrfs Snapshot -> Restic Backup Orchestrator",
         epilog="Config: %(default)s | Env: SNAPBAK_CONFIG_FILE, SNAPBAK_JOB",
@@ -1032,9 +1112,18 @@ def main():
                         help="Run a specific job by name (default: all jobs).")
     parser.add_argument("-n", "--dry-run", action="store_true",
                         help="Simulate backup. Runs preflight but skips upload & deletion.")
+    parser.add_argument("--log-file", default=None,
+                        help="Also write logs to this file (default: stderr only).")
     parser.add_argument("-l", "--list-jobs", action="store_true",
                         help="List all configured jobs and exit.")
     args = parser.parse_args()
+
+    # Optional file log: reconfigure root logger to ALSO write to args.log_file.
+    # Default (no --log-file) is stderr-only, persisted to the journal by systemd.
+    if args.log_file:
+        _fh = logging.FileHandler(args.log_file)
+        _fh.setFormatter(logging.Formatter(_LOG_FORMAT))
+        logging.getLogger().addHandler(_fh)
 
     config = load_config(Path(args.config))
     jobs = config.resolve_jobs(str(args.config))

@@ -56,6 +56,10 @@ What `scripts/setup_service.sh` does:
 The timer runs hourly; restic uploads happen per-job only when
 `backup_interval` has elapsed (so weekly backups = `backup_interval: 604800`).
 
+The setup script is **idempotent** — re-running it is safe: it skips the user,
+group, and existing `config.json` (so your edits are preserved), refreshes the
+program + unit files, and re-validates sudoers.
+
 Before enabling, edit `/opt/snap-bak/config.json` to match your environment and
 create the per-repo restic password files under `/opt/snap-bak/passwords/`.
 
@@ -63,12 +67,11 @@ create the per-repo restic password files under `/opt/snap-bak/passwords/`.
 
 ### What snap-bak does
 
-Reads existing Btrfs snapshots, mounts read-only, backs up to restic,
-cleans up old snapshots using exponential retention.
+Creates Btrfs snapshots on a schedule, mounts them read-only, backs them
+up to restic, and cleans up old snapshots using exponential retention.
 
 ### What snap-bak does NOT do
 
-- Create snapshots (use snapper, btrfs-snap, or cron)
 - Manage restic repos (init, etc.)
 
 ### Snapshot retention (local)
@@ -223,9 +226,10 @@ snap-bak is the exclusive authority for both snapshot creation and backup execut
 Users SHALL NOT use any other automated snapshot management tool, and SHALL NOT
 run two copies of snap-bak concurrently.
 
-### When Snapshots Are Created (Phase 4)
+### When Snapshots Are Created
 
-After each successful backup, snap-bak creates a new btrfs read-only snapshot:
+At the start of every run, snap-bak creates a new btrfs read-only snapshot
+whenever `snapshot_interval` has elapsed since the last one (or none exists yet):
 
 ```
 btrfs subvolume snapshot -r <source_subvolume> <snapshot_dir>/<name>
@@ -233,9 +237,11 @@ btrfs subvolume snapshot -r <source_subvolume> <snapshot_dir>/<name>
 
 The snapshot name uses the format `YYYY-MM-DD_HH:MM` (e.g., `2026-07-26_10:30`).
 Snapshots are created at most once per `snapshot_interval` seconds (default: 1 hour,
-minimum: 15 minutes). Non-matching names in `snapshot_dir` are ignored.
+minimum: 15 minutes). Creation is independent of backup success: fresh installs
+create their first snapshot immediately, and a long-running backup never stalls
+the snapshot cadence. Non-matching names in `snapshot_dir` are ignored.
 
-### When Backups Are Created (Phase 2-3)
+### When Backups Are Created
 
 A backup is created when **all** of the following are met:
 
@@ -249,6 +255,9 @@ A backup is created when **all** of the following are met:
 When a backup is triggered:
 - The **oldest snapshot within the last `backup_interval`** is selected for backup.
 - If no snapshot falls within the interval, the latest snapshot is used as a fallback.
+- Snapshots younger than the minimum age (1 hour) are never backed up: the run
+  records `skipped` and defers to a later cycle, so a snapshot just created by
+  the scheduler is only uploaded after it has aged (e.g. on a fresh install).
 - The snapshot is mounted read-only, preflight-checked, then backed up to the
   configured repo.
 - After a successful backup, the repo's `throughput_mbps` is updated in the
