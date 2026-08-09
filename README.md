@@ -37,11 +37,11 @@ The fully-automated setup script creates an unprivileged system user, installs
 systemd *service + timer*.
 
 ```bash
-sudo scripts/setup_service.sh
+sudo scripts/snapbak-setup.sh
 sudo systemctl enable --now snap-bak.timer
 ```
 
-What `scripts/setup_service.sh` does:
+What `scripts/snapbak-setup.sh` does:
 
 1. Verifies you are `root`.
 2. Creates the `snapbak-svc` user/group and `/opt/snap-bak`.
@@ -124,7 +124,7 @@ The orchestrator runs as a dedicated, unprivileged system user (`snapbak-svc`). 
 
 The config file is JSONC: standard JSON plus `//` and `/* */` comments and
 trailing commas (comments are stripped by `snap-bak` before parsing). The
-default config written by `setup_service.sh` includes inline comments
+default config written by `snapbak-setup.sh` includes inline comments
 describing every field.
 
 Edit `config/config.json`:
