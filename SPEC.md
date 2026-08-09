@@ -198,7 +198,7 @@ assert (datetime.now(timezone.utc) - snapshot.time) > timedelta(hours=1), \
 
 ### Config File Location
 
-Default: `$HOME/.config/snapbak/config.json`
+Default: `config/config.json` (repo-relative)
 Override: `-c/--config` flag or `SNAPBAK_CONFIG_FILE` env var
 
 ### Config Schema
@@ -222,7 +222,8 @@ When we detect a previous run is still running, we wait stuck_wait and keep chec
   "password_file": "/home/user/.restic_password",
   "size_limit": 0,
   "latency_ms": 100,
-  "throughput_mbps": 1
+  "throughput_mbps": 1,
+  "restic_options": ["--compression=better"]
 }
 ```
 
@@ -233,7 +234,8 @@ When we detect a previous run is still running, we wait stuck_wait and keep chec
 | `password_file` | string | "" | Path to restic password file |
 | `size_limit` | int | 0 | Max repo size in bytes (0 = unlimited) |
 | `latency_ms` | int | 100 | Estimated latency for ETA calculation |
-| `throughput_mbps` | int | 1 | Estimated throughput for ETA calculation |
+| `throughput_mbps` | int | 1 | Estimated throughput for ETA calculation (seeding hint) |
+| `restic_options` | list | `[]` | Extra restic CLI flags for every command against this repo |
 
 ### Job Schema
 
@@ -250,9 +252,11 @@ When we detect a previous run is still running, we wait stuck_wait and keep chec
   "backup_interval": 3600,
   "backup_window_start": "22:00",
   "backup_window_end": "06:00",
-  "ignore_file": "/etc/snap-bak/data.ignore",
+  "ignore_file": "/opt/snap-bak/excludes/data.ignore",
   "excludes": ["*.tmp", "*.cache", ".DS_Store"],
-  "timeout": 7200
+  "timeout": 7200,
+  "tag": "data",
+  "restic_options": []
 }
 ```
 
@@ -272,6 +276,14 @@ When we detect a previous run is still running, we wait stuck_wait and keep chec
 | `ignore_file` | string | `""` | — | Restic exclude-from file |
 | `excludes` | list | `[]` | — | Restic exclude patterns |
 | `timeout` | int | `86400` | `ge=1` | Subprocess timeout in seconds |
+| `tag` | string | job name | `[A-Za-z0-9_-]` | Restic tag override |
+| `restic_options` | list | `[]` | — | Extra restic CLI flags for this job |
+
+`restic_options` on both Repo and Job are appended verbatim to restic
+command lines (repo options first, then job options). Flags snap-bak manages
+itself are filtered out with a warning if a config author sets them:
+`-r/--repo`, `--password-file`, `--json`, `--dry-run`, `--tag`, `--keep-*`,
+`--prune`, `--exclude`, `--exclude-file`.
 
 ---
 
@@ -289,6 +301,7 @@ class Repo(BaseModel):
     size_limit: int = Field(default=0, ge=0)
     latency_ms: int = Field(default=100, ge=0)
     throughput_mbps: int = Field(default=1, ge=0)
+    restic_options: list = Field(default_factory=list)
 ```
 
 ### Job
@@ -312,6 +325,8 @@ class Job(BaseModel):
     ignore_file: str = ""
     excludes: list = Field(default_factory=list)
     timeout: int = Field(default=86400, ge=1)
+    tag: str | None = None
+    restic_options: list = Field(default_factory=list)
 
     # Runtime fields (not from config)
     repos: list = Field(default_factory=list, exclude=True)
@@ -344,7 +359,7 @@ class SnapBakConfig(BaseModel):
 
 ## Status File
 
-Per-job status stored at `~/.local/state/snapbak/<job_name>_status.json`.
+Per-job status stored at `~/.local/state/snap-bak/<job_name>_status.json`.
 
 ### Schema
 
@@ -561,7 +576,7 @@ Prevents multiple snap-bak instances from running simultaneously.
 
 ### Implementation
 
-- Lock file: `~/.local/state/snapbak/snapbak.lock`
+- Lock file: `~/.local/state/snap-bak/snap-bak.lock`
 - Uses `fcntl.flock(LOCK_EX | LOCK_NB)`
 - Lock file contains JSON with PID, job info, timestamps
 - Stuck detection: if lock age > `stuck_threshold` (default 3600s)
@@ -573,26 +588,38 @@ Prevents multiple snap-bak instances from running simultaneously.
 ### Per-Job Lock
 
 Each job also has a per-job lock file for `mount_and_lock`:
-- Lock file: `~/.local/state/snapbak/<job_name>.lock`
+- Lock file: `~/.local/state/snap-bak/<job_name>.lock`
 - Prevents concurrent execution of the same job
 
 ---
 
 ## State Directory
 
-Default: `~/.local/state/snapbak/`
+Default: `~/.local/state/snap-bak/`
 
 Override: `XDG_STATE_HOME` env var
 
 ### Contents
 
 ```
-~/.local/state/snapbak/
-  snapbak.log          # Log file
-  snapbak.lock         # Global lock file
-  <job_name>.lock      # Per-job lock file
+~/.local/state/snap-bak/
+  snap-bak.log          # Log file
+  snap-bak.lock         # Global lock file
+  throughput.json       # Per-repo transfer-rate history (capped at 10/repo)
+  <job_name>.lock       # Per-job lock file
   <job_name>_status.json  # Per-job status
 ```
+
+---
+
+## Throughput History
+
+Observed transfer rates are recorded per repo in `throughput.json` (JSON
+`{"repos": {"<name>": [mbps, ...]}}`, newest-first), capped at 10 entries per
+repo. New rates seed from the median of existing entries (falling back to the
+repo's configured `throughput_mbps`). The config file itself is never
+rewritten. If the state directory is unwritable, the rate is logged and the
+run continues.
 
 ---
 
@@ -601,7 +628,7 @@ Override: `XDG_STATE_HOME` env var
 ### Usage
 
 ```bash
-snapbak.py [OPTIONS]
+snap-bak [OPTIONS]
 ```
 
 ### Options
@@ -620,6 +647,36 @@ snapbak.py [OPTIONS]
 | `SNAPBAK_CONFIG_FILE` | Config file path |
 | `SNAPBAK_JOB` | Job name to run |
 | `XDG_STATE_HOME` | State directory base |
+| `XDG_CACHE_HOME` | Restic cache base |
+| `SNAPBAK_SUDO` | Sudo binary used to invoke the wrapper |
+| `SNAPBAK_IO_WRAPPER` | Path to the root-owned wrapper |
+
+---
+
+## Privileged Operations
+
+Btrfs snapshot create/delete and mount/umount require root. snap-bak runs as
+an unprivileged service user and delegates these to a **root-owned wrapper**
+(`snap-bak-io`), reachable via a single static sudoers rule:
+
+```
+snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/snap-bak-io *
+```
+
+This rule is valid on both sudo-rs and sudo.ws (a trailing `*` is the only
+wildcard form sudo-rs permits). The wrapper:
+
+- Accepts only `snapshot|delete|mount|umount <job> [snapshot]`.
+- Validates `<job>` against the root-owned `/opt/snap-bak/config.json`.
+- Validates `[snapshot]` against `^\d{4}-\d{2}-\d{2}_\d{2}:\d{2}$`.
+- Confines every path under the job's `snapshot_dir` / `mount_base`
+  (via `os.path.realpath` traversal guard).
+- Executes `btrfs`, `mount`, `umount` with config-derived paths; mount
+  applies the caller's uid/gid (`SUDO_UID`/`SUDO_GID`) so restic can read all
+  files without ACL changes.
+
+Because the wrapper derives paths from config at runtime, changing
+`mount_base` or `snapshot_dir` never requires editing sudoers.
 
 ---
 
@@ -643,6 +700,8 @@ snapbak.py [OPTIONS]
 - Job model properties
 - Snapshot selection
 - Repo throughput learning
+- Restic option filtering / reserved-flag rejection
+- snap-bak-io wrapper validation and path confinement
 - Failed backup handling
 - Config model
 - Config loading
@@ -651,7 +710,7 @@ snapbak.py [OPTIONS]
 ### Verification
 
 ```bash
-PYTHONPATH=. python -m pytest tests/test_snapbak.py -v
+uv run pytest -q
 ```
 
 ---

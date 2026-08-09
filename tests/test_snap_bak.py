@@ -14,9 +14,9 @@ import pytest
 # Ensure scripts package is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import scripts.snapbak as snapbak_module
+import scripts.snap_bak as snapbak_module
 
-from scripts.snapbak import (
+from scripts.snap_bak import (
     DEFAULT_SNAPSHOT_INTERVAL,
     DEFAULT_SNAPSHOT_INTERVAL_MIN,
     FAIL_CREDENTIALS,
@@ -47,7 +47,7 @@ def isolated_state(tmp_path, monkeypatch):
     state = tmp_path / "state"
     state.mkdir()
     monkeypatch.setattr(snapbak_module, "STATE_DIR", state)
-    monkeypatch.setattr(snapbak_module, "GLOBAL_LOCK_FILE", state / "snapbak.lock")
+    monkeypatch.setattr(snapbak_module, "GLOBAL_LOCK_FILE", state / "snap-bak.lock")
 
 
 @pytest.fixture
@@ -151,7 +151,7 @@ class TestExponentialCleanup:
         sample_job.snapshot_retention = {"fn": "exponential", "config": {"n": 4}}
 
         deleted = []
-        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[4]) if cmd[1].endswith("btrfs") else None)
+        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[4]) if cmd[1].endswith("snap-bak-io") else None)
 
         sample_job._cleanup_snapshots()
 
@@ -188,7 +188,7 @@ class TestExponentialCleanup:
 
         sample_job.snapshot_retention = {"fn": "exponential", "config": {"n": 2}}
         deleted = []
-        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[3]) if cmd[1].endswith("btrfs") else None)
+        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[4]) if cmd[1].endswith("snap-bak-io") else None)
 
         sample_job._cleanup_snapshots(protected_snapshot="2h_ago")
 
@@ -215,7 +215,7 @@ class TestExponentialCleanup:
 
         sample_job.snapshot_retention = {"fn": "exponential", "config": {"n": 5}}
         deleted = []
-        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[3]) if cmd[1].endswith("btrfs") else None)
+        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[4]) if cmd[1].endswith("snap-bak-io") else None)
 
         sample_job._cleanup_snapshots()
 
@@ -390,7 +390,6 @@ class TestThroughputCalculation:
     def test_basic_calculation(self, sample_job, tmp_path):
         """total_size=1GB, backup_time=10s → 800 Mbps."""
         repo = Repo(name="primary", path="rclone:test", throughput_mbps=10)
-        sample_job._save_config_throughput = MagicMock()
 
         sample_job._update_repo_throughput(repo, 1_000_000_000, 10.0)
 
@@ -400,39 +399,58 @@ class TestThroughputCalculation:
 
     def test_zero_backup_time_no_update(self, sample_job):
         repo = Repo(name="primary", path="rclone:test", throughput_mbps=10)
-        sample_job._save_config_throughput = MagicMock()
 
         sample_job._update_repo_throughput(repo, 1_000_000_000, 0.0)
         assert repo.throughput_mbps == 10  # unchanged
 
     def test_zero_total_size_no_update(self, sample_job):
         repo = Repo(name="primary", path="rclone:test", throughput_mbps=10)
-        sample_job._save_config_throughput = MagicMock()
 
         sample_job._update_repo_throughput(repo, 0, 10.0)
         assert repo.throughput_mbps == 10  # unchanged
 
-    def test_saves_to_config(self, sample_job, tmp_path):
+    def test_records_history_per_repo(self, sample_job):
+        """Observations are appended to the per-repo history in the state file."""
+        repo_a = Repo(name="primary", path="rclone:test", throughput_mbps=10)
+        repo_b = Repo(name="secondary", path="rclone:test2", throughput_mbps=5)
+
+        for _ in range(3):
+            sample_job._update_repo_throughput(repo_a, 1_000_000_000, 10.0)
+        sample_job._update_repo_throughput(repo_b, 500_000_000, 10.0)
+
+        data = json.loads(sample_job.throughput_file.read_text())
+        assert data["repos"]["primary"] == [800, 800, 800]
+        assert data["repos"]["secondary"] == [400]
+
+    def test_history_capped_at_10(self, sample_job):
+        """History per repo is capped at THROUGHPUT_HISTORY_SIZE entries."""
         repo = Repo(name="primary", path="rclone:test", throughput_mbps=10)
-        config_path = tmp_path / "config.json"
-        config_path.write_text(json.dumps({
-            "repos": [{"name": "primary", "path": "rclone:test", "throughput_mbps": 10}],
-            "jobs": [],
-        }))
-        sample_job.config_path = str(config_path)
 
-        sample_job._update_repo_throughput(repo, 1_000_000_000, 10.0)
+        for _ in range(15):
+            sample_job._update_repo_throughput(repo, 1_000_000_000, 10.0)
 
-        config = json.loads(config_path.read_text())
-        assert config["repos"][0]["throughput_mbps"] == 800
+        data = json.loads(sample_job.throughput_file.read_text())
+        assert len(data["repos"]["primary"]) == 10
 
-    def test_config_not_writable_continues(self, sample_job, tmp_path):
-        """If config file is not writable, log warning and continue."""
+    def test_seed_uses_median_of_history(self, sample_job):
+        """Seeding picks the median of observed history, falling back to config."""
         repo = Repo(name="primary", path="rclone:test", throughput_mbps=10)
-        config_path = tmp_path / "nonexistent_dir" / "config.json"
-        sample_job.config_path = str(config_path)
+        for mbps in (100, 200, 300, 400, 100000):
+            bytes_size = round(mbps * 1_000_000 * 1.0 / 8)
+            sample_job._update_repo_throughput(repo, bytes_size, 1.0)
 
-        # Should not raise
+        fresh = Repo(name="primary", path="rclone:test", throughput_mbps=10)
+        assert sample_job._seed_repo_throughput(fresh) == 300
+
+        no_history = Repo(name="other", path="rclone:test", throughput_mbps=42)
+        assert sample_job._seed_repo_throughput(no_history) == 42
+
+    def test_state_write_failure_continues(self, sample_job, monkeypatch):
+        """If the state file cannot be written, log a warning and continue."""
+        repo = Repo(name="primary", path="rclone:test", throughput_mbps=10)
+        monkeypatch.setattr(snapbak_module, "STATE_DIR", Path("/nonexistent_abyss"))
+
+        # Should not raise even when STATE_DIR is unwritable
         sample_job._update_repo_throughput(repo, 1_000_000_000, 10.0)
         assert repo.throughput_mbps == 800
 
@@ -699,7 +717,7 @@ class TestBackupWindow:
         """Same-day window: 09:00-17:00, current time 12:00 → allowed."""
         sample_job.backup_window_start = "09:00"
         sample_job.backup_window_end = "17:00"
-        with patch("scripts.snapbak.datetime") as mock_dt:
+        with patch("scripts.snap_bak.datetime") as mock_dt:
             mock_dt.now.return_value = datetime(2024, 1, 15, 12, 0, 0)
             assert sample_job._is_within_backup_window() is True
 
@@ -707,7 +725,7 @@ class TestBackupWindow:
         """Same-day window: 09:00-17:00, current time 18:00 → not allowed."""
         sample_job.backup_window_start = "09:00"
         sample_job.backup_window_end = "17:00"
-        with patch("scripts.snapbak.datetime") as mock_dt:
+        with patch("scripts.snap_bak.datetime") as mock_dt:
             mock_dt.now.return_value = datetime(2024, 1, 15, 18, 0, 0)
             assert sample_job._is_within_backup_window() is False
 
@@ -715,7 +733,7 @@ class TestBackupWindow:
         """Overnight window: 22:00-06:00, current time 23:00 → allowed."""
         sample_job.backup_window_start = "22:00"
         sample_job.backup_window_end = "06:00"
-        with patch("scripts.snapbak.datetime") as mock_dt:
+        with patch("scripts.snap_bak.datetime") as mock_dt:
             mock_dt.now.return_value = datetime(2024, 1, 15, 23, 0, 0)
             assert sample_job._is_within_backup_window() is True
 
@@ -723,7 +741,7 @@ class TestBackupWindow:
         """Overnight window: 22:00-06:00, current time 03:00 → allowed."""
         sample_job.backup_window_start = "22:00"
         sample_job.backup_window_end = "06:00"
-        with patch("scripts.snapbak.datetime") as mock_dt:
+        with patch("scripts.snap_bak.datetime") as mock_dt:
             mock_dt.now.return_value = datetime(2024, 1, 15, 3, 0, 0)
             assert sample_job._is_within_backup_window() is True
 
@@ -731,7 +749,7 @@ class TestBackupWindow:
         """Overnight window: 22:00-06:00, current time 12:00 → not allowed."""
         sample_job.backup_window_start = "22:00"
         sample_job.backup_window_end = "06:00"
-        with patch("scripts.snapbak.datetime") as mock_dt:
+        with patch("scripts.snap_bak.datetime") as mock_dt:
             mock_dt.now.return_value = datetime(2024, 1, 15, 12, 0, 0)
             assert sample_job._is_within_backup_window() is False
 
@@ -745,7 +763,7 @@ class TestBackupWindow:
         """Window end is exclusive: 09:00-17:00, current time 17:00 → not allowed."""
         sample_job.backup_window_start = "09:00"
         sample_job.backup_window_end = "17:00"
-        with patch("scripts.snapbak.datetime") as mock_dt:
+        with patch("scripts.snap_bak.datetime") as mock_dt:
             mock_dt.now.return_value = datetime(2024, 1, 15, 17, 0, 0)
             assert sample_job._is_within_backup_window() is False
 
@@ -861,7 +879,7 @@ class TestDatetimesCleanup:
             "config": {"hourly": 2, "daily": 1},
         }
         deleted = []
-        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[4]) if cmd[1].endswith("btrfs") else None)
+        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[4]) if cmd[1].endswith("snap-bak-io") else None)
 
         sample_job._cleanup_snapshots()
 

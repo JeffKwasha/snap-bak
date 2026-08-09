@@ -33,24 +33,26 @@ or schedule via cron/systemd yourself.
 ### Option B — Systemd service (recommended for production)
 
 The fully-automated setup script creates an unprivileged system user, installs
-`snapbak.py`, configures granular sudo permissions, and wires up a
-systemd *service + timer*.
+the orchestrator + a root-owned sudo wrapper, configures a static sudoers
+rule, and wires up a systemd *service + timer*.
 
 ```bash
-sudo scripts/snapbak-setup.sh
+sudo scripts/snap-bak-setup.sh
 sudo systemctl enable --now snap-bak.timer
 ```
 
-What `scripts/snapbak-setup.sh` does:
+What `scripts/snap-bak-setup.sh` does:
 
 1. Verifies you are `root`.
-2. Creates the `snapbak-svc` user/group and `/opt/snap-bak`.
-3. Installs the orchestrator to `/opt/snap-bak/snapbak.py` (root-owned).
+2. Creates the `snap-bak` user/group and `/opt/snap-bak`.
+3. Installs the orchestrator to `/opt/snap-bak/snap_bak.py` (root:root 0644)
+   and the wrapper to `/opt/snap-bak/snap-bak-io` (root:root 0755).
 4. Writes an annotated example config to `/opt/snap-bak/config.json`.
-5. Creates `/opt/snap-bak/passwords` and `/opt/snap-bak/excludes`.
-6. Creates `/mnt/snapbak_mounts` and grants `snapbak-svc` minimal sudo rights
-   (btrfs snapshot create/delete restricted to `YYYY-MM-DD_HH:MM` names;
-   mount/umount pinned to the mount base).
+5. Creates service-writable `state/`, `cache/`, `passwords/` and
+   `.config/rclone/`; root:snap-bak `excludes/`.
+6. Creates the mount base `/bak` and installs a single static sudoers rule —
+   `snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/snap-bak-io *` — valid on both
+   sudo-rs and sudo.ws.
 7. Writes `snap-bak.service` (oneshot) and `snap-bak.timer` (hourly).
 
 The timer runs hourly; restic uploads happen per-job only when
@@ -99,32 +101,48 @@ After a successful backup, snapshots older than the backup time are deleted
 
 ## Permissions & Security
 
-To balance security with the need for system-level operations, `snap-bak` employs a **Hybrid Privilege Model**.
+snap-bak uses a **root-owned sudo wrapper** privilege model.
 
 ### The Strategy
-The orchestrator runs as a dedicated, unprivileged system user (`snapbak-svc`). It does not require full root access. Instead, it uses granular `sudo` permissions for specific kernel-level operations and leverages mount-time UID/GID mapping to bypass filesystem permission barriers.
+The orchestrator runs as a dedicated, unprivileged system user (`snap-bak`). It
+does not require full root access. Privileged operations (btrfs snapshot,
+mount/umount) are delegated to a **root-owned wrapper** that is the only thing
+sudoers lets the service user run.
 
 ### How it Works
-1.  **Granular Escalation**: The `snapbak-svc` user is granted `NOPASSWD` access via `sudoers` only for the specific commands required to manage Btrfs subvolumes and mount/unmount filesystems.
-2. **Mount with uid/gid mapping** — Snapshots are mounted read-only using the service user's uid/gid so restic can read all files without ACL complications:
-    * **Command**: `mount -o ro,uid=<svc_uid>,gid=<svc_gid> <source> <target>`
-    * **Effect**: The kernel presents the snapshot's contents as owned by the service user, allowing `restic` to read all files without modifying the original filesystem's permissions.
-3.  **Minimal Surface Area**: The Restic process itself runs as the unprivileged `snapbak-svc` user, ensuring that even if the backup tool is compromised, the attacker's scope is limited to the service user's context.
+1.  **Static sudoers rule**: `snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/snap-bak-io *`
+    — a single trailing `*` wildcard, the only form both sudo-rs and sudo.ws
+    accept. Changing `mount_base` or `snapshot_dir` in config NEVER requires
+    touching sudoers, because the wrapper derives every path from the
+    root-owned config at runtime.
+2.  **The wrapper** (`snap-bak-io`, root-owned 0755) accepts only
+    `snapshot|delete|mount|umount <job> [snapshot]`, validates the job against
+    `/opt/snap-bak/config.json` and the snapshot name against
+    `YYYY-MM-DD_HH:MM`, and confines all paths under the configured
+    `snapshot_dir` / `mount_base` (realpath traversal guard).
+3.  **Mount with uid/gid mapping** — snapshots are mounted read-only using the
+    calling user's uid/gid (from `SUDO_UID`/`SUDO_GID`) so restic can read all
+    files without ACL complications.
+4.  **Minimal Surface Area**: The restic process runs as the unprivileged
+    `snap-bak` user. `/opt/snap-bak` is root-owned; only `state/`, `cache/`,
+    `passwords/`, `.config/rclone/` are writable by the service user, so a
+    compromised backup tool cannot replace the wrapper (which would be trivial
+    root escalation).
 
 - **Per-repo password files** — each restic repo has its own password file
-- **Rate tracking** — measures backup speed, updates config for visibility
+- **Rate tracking** — measured backup speed is kept in state (`throughput.json`)
 - **Pluggable snapshot retention** — exponential or calendar-based cleanup
 - **Failed backup recovery** — automatic retry with same snapshot
 - **Backup windows** — restrict to off-peak hours
 - **Configurable retry** — per-job restic retry count
-- **XDG-compliant paths** — state in `~/.local/state/snapbak/`
+- **XDG-compliant paths** — state in `$XDG_STATE_HOME/snap-bak/`
 - **Crash recovery** — lock file with JSON job info
 
 ## Configuration
 
 The config file is JSONC: standard JSON plus `//` and `/* */` comments and
 trailing commas (comments are stripped by `snap-bak` before parsing). The
-default config written by `snapbak-setup.sh` includes inline comments
+default config written by `snap-bak-setup.sh` includes inline comments
 describing every field.
 
 Edit `config/config.json`:
@@ -135,10 +153,11 @@ Edit `config/config.json`:
     {
       "name": "primary",
       "path": "rclone:CONFIG_ENTRY:DIRECTORY",
-      "password_file": "/home/user/.restic_password",
+      "password_file": "/opt/snap-bak/passwords/primary",
       "size_limit": 1099511627776,
       "latency_ms": 50,
-      "throughput_mbps": 10
+      "throughput_mbps": 10,
+      "restic_options": ["--compression=better"]
     }
   ],
   "mount_base": "/bak",
@@ -156,7 +175,7 @@ Edit `config/config.json`:
       "backup_interval": 3600,
       "backup_window_start": "22:00",
       "backup_window_end": "06:00",
-      "ignore_file": "/etc/snap-bak/data.ignore",
+      "ignore_file": "/opt/snap-bak/excludes/data.ignore",
       "excludes": ["*.tmp", "*.cache", ".DS_Store"],
       "timeout": 86400
     }
@@ -181,7 +200,8 @@ Edit `config/config.json`:
 | `password_file` | Path to one-line text file containing the restic password | `""` |
 | `size_limit` | Max backup size in bytes; `0` = unlimited | `0` |
 | `latency_ms` | Estimated latency in milliseconds (metadata) | `100` |
-| `throughput_mbps` | Estimated throughput in Mbps; updated after backups | `1` |
+| `throughput_mbps` | Estimated throughput in Mbps (seeding hint) | `1` |
+| `restic_options` | Extra restic CLI flags for every command against this repo | `[]` |
 
 ### Job settings
 
@@ -201,6 +221,18 @@ Edit `config/config.json`:
 | `ignore_file` | string | Path to file with exclude patterns | `""` |
 | `excludes` | list | List of glob patterns to exclude | `[]` |
 | `timeout` | int | Command timeout in seconds | `86400` |
+| `tag` | string | Restic tag override for this job's backups/forget | job name |
+| `restic_options` | list | Extra restic CLI flags for this job | `[]` |
+
+**Note on `restic_options`:** Both `repos[].restic_options` and
+`jobs[].restic_options` are appended verbatim to restic command lines. Flags
+snap-bak manages itself are **ignored with a warning** if configured here:
+`-r/--repo`, `--password-file`, `--json`, `--dry-run`, `--tag`, `--keep-*`,
+`--prune`, `--exclude`, `--exclude-file`.
+
+**Note on `tag`:** Defaults to the job name, so `--tag <name>` is applied to
+every backup and forget. Set it to change the restic tag; use
+`restic snapshots --tag <your-tag>` to filter by it.
 
 **Note on `ignore_file` and `excludes`:** Both are passed to restic as
 `--exclude-file` and `--exclude` flags respectively. They are additive —
@@ -216,7 +248,7 @@ it must be filesystem- and tag-safe. Use only `[A-Za-z0-9_-]` (no `/`, no `..`).
 
 - Mount point: `<mount_base>/<name>` — the read-only snapshot is mounted here
   before backup
-- restic tag: `--tag <name>` on every backup/forget
+- restic tag: `--tag <name>` on every backup/forget (overridable via `tag`)
 - Lock file: `<state_dir>/<name>.lock`
 - Status file: `<state_dir>/<name>_status.json`
 
@@ -260,8 +292,9 @@ When a backup is triggered:
   the scheduler is only uploaded after it has aged (e.g. on a fresh install).
 - The snapshot is mounted read-only, preflight-checked, then backed up to the
   configured repo.
-- After a successful backup, the repo's `throughput_mbps` is updated in the
-  config file based on observed performance.
+- After a successful backup, the observed transfer rate is recorded in the
+  per-repo history in `throughput.json` (state dir), which seeds future rate
+  estimates. The config file itself is never rewritten.
 
 ### Backup window examples
 
@@ -370,16 +403,20 @@ snap-bak --config /path/to/config.json
 | `SNAPBAK_CONFIG_FILE` | Path to config JSON file | `config/config.json` |
 | `SNAPBAK_JOB` | Run a specific job by name | (all jobs) |
 | `XDG_STATE_HOME` | Base directory for state files | `~/.local/state` |
+| `XDG_CACHE_HOME` | Base directory for the restic cache | `~/.cache` |
+| `SNAPBAK_SUDO` | Sudo binary used to invoke the wrapper | `sudo` |
+| `SNAPBAK_IO_WRAPPER` | Path to the root-owned wrapper | `/opt/snap-bak/snap-bak-io` |
 
 ## State Files
 
-All state files live under `$XDG_STATE_HOME/snapbak/` (defaults to
-`~/.local/state/snapbak/`):
+All state files live under `$XDG_STATE_HOME/snap-bak/` (defaults to
+`~/.local/state/snap-bak/`):
 
 ```
-$XDG_STATE_HOME/snapbak/
-├── snapbak.lock              # Global lock + current job info (JSON)
-├── snapbak.log               # Log file
+$XDG_STATE_HOME/snap-bak/
+├── snap-bak.lock             # Global lock + current job info (JSON)
+├── snap-bak.log              # Log file
+├── throughput.json           # Per-repo transfer-rate history (capped)
 ├── {job_name}.lock           # Per-job lock
 ├── {job_name}_status.json    # Per-job status (success/failed/skipped)
 └── {job_name}_status.json.tmp # Atomic write temp file
@@ -410,10 +447,11 @@ diagnose what was running when the crash occurred.
 ## Testing
 
 ```bash
-PYTHONPATH=. python -m pytest tests/test_snapbak.py -v
+uv run pytest -q
 ```
 
 Tests cover retention functions (exponential, datetimes, keeplist), snapshot
 parsing, config validation, repo selection, failed backup retry, backup window
-logic, throughput calculation, and config loading. No remote restic or actual
+logic, throughput calculation, config loading, restic option filtering, and the
+snap-bak-io wrapper's validation/confinement. No remote restic or actual
 Btrfs operations are required.

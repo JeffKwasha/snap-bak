@@ -6,10 +6,10 @@ Strictly data-driven: jobs are defined entirely in the config file.
 Supports CLI overrides, env vars, and preflight checks.
 
 Usage:
-  snapbak.py --help
-  snapbak.py --list-jobs
-  snapbak.py --job <name> --dry-run
-  SNAPBAK_JOB=home snapbak.py
+  snap_bak.py --help
+  snap_bak.py --list-jobs
+  snap_bak.py --job <name> --dry-run
+  SNAPBAK_JOB=home snap_bak.py
 
 Protection strategy:
   - Snapshots are young (minutes to hours old)
@@ -35,7 +35,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 from dateutil.relativedelta import relativedelta
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -50,14 +50,14 @@ DEFAULT_BACKUP_INTERVAL = 3600  # 1 hour
 DEFAULT_SNAPSHOT_INTERVAL = 3600  # 1 hour
 DEFAULT_SNAPSHOT_INTERVAL_MIN = 900  # 15 minutes (minimum)
 DEFAULT_SNAPSHOT_AGE_MIN = 3600  # 1 hour (minimum snapshot age for backup safety)
-# Which sudo binary to use. The systemd unit sets SNAPBAK_SUDO to the C
-# implementation (e.g. /usr/bin/sudo.ws) when sudo-rs owns /usr/bin/sudo,
-# since sudo-rs has stricter/divergent glob handling and rejects the NOPASSWD
-# btrfs/mount rules that C sudo accepts.
+# Sudo invocation for privileged (btrfs/mount) operations. snap-bak calls a
+# root-owned wrapper (installed by snap-bak-setup.sh) rather than running
+# btrfs/mount/umount directly. The wrapper derives every path from the
+# root-owned config and validates the job/snapshot name, so a single static
+# sudoers rule (NOPASSWD:/opt/snap-bak/snap-bak-io *) works on both sudo-rs
+# and sudo.ws. Default /usr/bin/sudo; overridable via SNAPBAK_SUDO for tests.
 SUDO = os.environ.get("SNAPBAK_SUDO", "/usr/bin/sudo")
-BTRFS = "/usr/bin/btrfs"
-MOUNT = "/usr/bin/mount"
-UMOUNT = "/usr/bin/umount"
+IO_WRAPPER = os.environ.get("SNAPBAK_IO_WRAPPER", "/opt/snap-bak/snap-bak-io")
 
 RETRY_DELAY = 5  # seconds between retry attempts
 
@@ -197,15 +197,15 @@ RETENTION_FN = {
 
 
 def _get_state_dir() -> Path:
-    """Get XDG state directory for snapbak."""
+    """Get XDG state directory for snap-bak."""
     state_home = os.environ.get("XDG_STATE_HOME")
     if state_home:
-        return Path(state_home) / "snapbak"
-    return Path.home() / ".local" / "state" / "snapbak"
+        return Path(state_home) / "snap-bak"
+    return Path.home() / ".local" / "state" / "snap-bak"
 
 
 STATE_DIR = _get_state_dir()
-GLOBAL_LOCK_FILE = STATE_DIR / "snapbak.lock"
+GLOBAL_LOCK_FILE = STATE_DIR / "snap-bak.lock"
 
 # Ensure state directory exists before logging setup
 STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -367,6 +367,7 @@ class Repo(BaseModel):
     size_limit: int = Field(default=0, ge=0)
     latency_ms: int = Field(default=100, ge=0)
     throughput_mbps: int = Field(default=1, ge=0)
+    restic_options: list = Field(default_factory=list)
 
 
 # --- Job model ---
@@ -390,6 +391,8 @@ class Job(BaseModel):
     ignore_file: str = ""
     excludes: list = Field(default_factory=list)
     timeout: int = Field(default=DEFAULT_TIMEOUT, ge=1)
+    tag: str | None = None
+    restic_options: list = Field(default_factory=list)
 
     # Runtime fields (not from config)
     repos: list = Field(default_factory=list, exclude=True)
@@ -533,7 +536,7 @@ class Job(BaseModel):
             logger.error(f"Source subvolume does not exist: {source}")
             sys.exit(EXIT_CONFIG_ERROR)
 
-        cmd = [SUDO, BTRFS, "subvolume", "snapshot", "-r", str(source), str(snap_path)]
+        cmd = [SUDO, IO_WRAPPER, "snapshot", self.name, snap_name]
         logger.info(f"Creating snapshot: {' '.join(cmd)}")
         try:
             self._run(cmd)
@@ -708,11 +711,41 @@ class Job(BaseModel):
             logger.error(f"Command failed (rc={e.returncode}): {e.cmd} | stderr: {e.stderr}")
             raise
 
+    # restic flags that snap-bak sets itself; config restic_options may not
+    # override them (they would collide and break summary parsing/retention).
+    _RESERVED_RESTIC_FLAGS = {
+        "-r", "--repo", "--password-file", "--json", "--dry-run",
+        "--tag", "--keep-last", "--keep-hourly", "--keep-daily",
+        "--keep-weekly", "--keep-monthly", "--keep-yearly", "--prune",
+        "--exclude", "--exclude-file",
+    }
+
+    def _filter_restic_options(self, options: list, source: str) -> list:
+        """Drop reserved restic flags (with a warning) from config options.
+
+        Reserved flags are ones snap-bak sets itself for bookkeeping (repo
+        location, password, JSON output, tags, retention, excludes). Config
+        authors may specify any other restic flag via restic_options.
+        """
+        kept = []
+        for opt in options:
+            flag = opt.split("=", 1)[0] if isinstance(opt, str) else opt
+            if flag in self._RESERVED_RESTIC_FLAGS:
+                logger.warning(
+                    f"{source} restic_options contains reserved flag '{opt}' "
+                    f"which snap-bak manages; ignoring it."
+                )
+                continue
+            kept.append(opt)
+        return kept
+
     def _build_restic_cmd(self, subcommand: str, repo: Repo | None = None) -> list[str]:
         """Build a restic command with common arguments."""
         if repo is None:
             repo = self.repo_obj
         cmd = ["restic", "-r", repo.path, subcommand]
+        cmd.extend(self._filter_restic_options(repo.restic_options, f"repo '{repo.name}'"))
+        cmd.extend(self._filter_restic_options(self.restic_options, f"job '{self.name}'"))
         if repo.password_file:
             cmd.extend(["--password-file", repo.password_file])
         if self.ignore_file:
@@ -720,6 +753,11 @@ class Job(BaseModel):
         for pattern in self.excludes:
             cmd.extend(["--exclude", pattern])
         return cmd
+
+    @property
+    def tag_arg(self) -> str:
+        """Restic tag used for this job (config override or job name)."""
+        return self.tag if self.tag else self.name
 
     # --- Backup steps ---
 
@@ -729,8 +767,7 @@ class Job(BaseModel):
         cmd = self._build_restic_cmd("backup", repo)
         cmd.extend([
             str(mount_point),
-            "--no-symlinks",
-            "--tag", self.name,
+            "--tag", self.tag_arg,
             "--json",
             "--dry-run",
         ])
@@ -759,7 +796,7 @@ class Job(BaseModel):
         can never be silently lost.
         """
         cmd = self._build_restic_cmd("backup", repo)
-        cmd.extend([str(mount_point), "--no-symlinks", "--tag", self.name, "--json"])
+        cmd.extend([str(mount_point), "--tag", self.tag_arg, "--json"])
         try:
             result = self._run(cmd, timeout=self.timeout)
         except subprocess.CalledProcessError as e:
@@ -790,7 +827,7 @@ class Job(BaseModel):
         if not self.backup_retention:
             return
         cmd = self._build_restic_cmd("forget", repo)
-        cmd.extend(["--tag", self.name])
+        cmd.extend(["--tag", self.tag_arg])
         for key, val in self.backup_retention.items():
             cmd.extend([f"--keep-{key}", str(val)])
         cmd.append("--prune")
@@ -825,9 +862,57 @@ class Job(BaseModel):
         for s in valid:
             if s.path not in keep_paths:
                 logger.info(f"Deleting old snapshot: {s.path.name}")
-                self._run([SUDO, BTRFS, "subvolume", "delete", str(s.path)])
+                self._run([SUDO, IO_WRAPPER, "delete", self.name, s.path.name])
 
     # --- Throughput learning ---
+
+    THROUGHPUT_HISTORY_SIZE: ClassVar[int] = 10
+
+    @property
+    def throughput_file(self) -> Path:
+        return STATE_DIR / "throughput.json"
+
+    def _load_throughput_history(self) -> dict:
+        """Load observed throughput history from the state file.
+
+        Format: {"repos": {"<repo_name>": [<mbps>, ...]}}.
+        """
+        try:
+            if self.throughput_file.exists():
+                data = load_config_json(self.throughput_file.read_text())
+                return data.get("repos", {})
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"Could not read throughput history: {e}")
+        return {}
+
+    def _seed_repo_throughput(self, repo: Repo) -> int:
+        """Seed repo.throughput_mbps with the median of observed history.
+
+        The median is robust to a single bad run. Falls back to the config
+        value when there is no history.
+        """
+        history = self._load_throughput_history().get(repo.name, [])
+        if not history:
+            return repo.throughput_mbps
+        ordered = sorted(history)
+        mid = len(ordered) // 2
+        median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) // 2
+        return max(median, 1)
+
+    def _record_throughput(self, repo_name: str, throughput_mbps: int):
+        """Append an observation to the rolling per-repo history in state."""
+        history = self._load_throughput_history()
+        values = history.get(repo_name, [])
+        values.append(throughput_mbps)
+        del values[:-self.THROUGHPUT_HISTORY_SIZE]
+        history[repo_name] = values
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = self.throughput_file.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({"repos": history}, indent=2))
+            tmp.replace(self.throughput_file)
+        except OSError as e:
+            logger.warning(f"Could not write throughput history: {e}")
 
     def _update_repo_throughput(self, repo: Repo, total_size: int, backup_time: float):
         """Update repo throughput based on observed performance."""
@@ -836,24 +921,7 @@ class Job(BaseModel):
             if throughput_mbps > 0:
                 repo.throughput_mbps = throughput_mbps
                 logger.info(f"Updated {repo.name} throughput to {throughput_mbps} Mbps")
-                self._save_config_throughput(repo.name, throughput_mbps)
-
-    def _save_config_throughput(self, repo_name: str, throughput_mbps: int):
-        """Update throughput_mbps in the config file."""
-        if not self.config_path:
-            return
-        try:
-            config_path = Path(self.config_path)
-            config = load_config_json(config_path.read_text())
-            for repo in config.get("repos", []):
-                if repo.get("name") == repo_name:
-                    repo["throughput_mbps"] = throughput_mbps
-                    break
-            tmp = config_path.with_suffix('.json.tmp')
-            tmp.write_text(json.dumps(config, indent=2))
-            tmp.replace(config_path)
-        except OSError as e:
-            logger.warning(f"Could not update config file for throughput: {e}")
+                self._record_throughput(repo.name, throughput_mbps)
 
     # --- Context manager ---
 
@@ -883,18 +951,16 @@ class Job(BaseModel):
             mount_point.mkdir(parents=True, exist_ok=True)
             if os.path.ismount(mount_point):
                 logger.warning(f"{mount_point} already mounted. Unmounting first.")
-                self._run([SUDO, UMOUNT, "-l", str(mount_point)])
-            uid = os.getuid()
-            gid = os.getgid()
+                self._run([SUDO, IO_WRAPPER, "umount", self.name])
             try:
-                self._run([SUDO, MOUNT, "-o", f"ro,uid={uid},gid={gid}", str(snapshot_path), str(mount_point)])
+                self._run([SUDO, IO_WRAPPER, "mount", self.name, snapshot_path.name])
             except subprocess.CalledProcessError as e:
                 raise MountError(f"Failed to mount {snapshot_path}: {e.stderr}") from e
             yield mount_point
         finally:
             if mount_point.exists() and os.path.ismount(mount_point):
                 try:
-                    self._run([SUDO, UMOUNT, "-l", str(mount_point)])
+                    self._run([SUDO, IO_WRAPPER, "umount", self.name])
                 except subprocess.CalledProcessError:
                     logger.warning(f"Failed to unmount {mount_point}")
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
@@ -961,6 +1027,7 @@ class Job(BaseModel):
                     setattr(self, key, val)
 
         logger.info(f"--- Starting Job: {self.name} ---")
+        self.repo_obj.throughput_mbps = self._seed_repo_throughput(self.repo_obj)
         self._check_stale_tmp()
         # Read the previous run's status BEFORE overwriting it with "started";
         # otherwise the failed-backup retry below could never trigger.

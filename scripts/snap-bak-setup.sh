@@ -1,13 +1,16 @@
 #!/bin/bash
 
-# snapbak-setup.sh
-# Automates the creation of the snapbak-svc user, sudoers permissions,
+# snap-bak-setup.sh
+# Automates the creation of the snap-bak user, sudoers permissions,
 # and systemd timer/service for the snap-bak manager.
 #
 # USAGE INSTRUCTIONS:
-# 1. Make the script executable: chmod +x snapbak-setup.sh
-# 2. Run with root privileges: sudo ./snapbak-setup.sh
+# 1. Make the script executable: chmod +x snap-bak-setup.sh
+# 2. Run with root privileges: sudo ./snap-bak-setup.sh
 # 3. After completion, perform the 'NEXT STEPS' listed in the script output.
+#
+# Idempotent: re-running "fixes" the box to match the current repo state while
+# preserving your config.json edits.
 
 set -e
 
@@ -19,20 +22,22 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # --- CONFIGURATION ---
-SERVICE_USER="snapbak-svc"
-SERVICE_GROUP="snapbak-svc"
+SERVICE_USER="snap-bak"
+SERVICE_GROUP="snap-bak"
 SNAPBAK_DIR="/opt/snap-bak"
-MOUNT_BASE="/mnt/snapbak_mounts"
+MOUNT_BASE="/bak"
 CONFIG_FILE="$SNAPBAK_DIR/config.json"
-SCRIPT_PATH="$SNAPBAK_DIR/snapbak.py"
+SCRIPT_PATH="$SNAPBAK_DIR/snap_bak.py"
+WRAPPER_PATH="$SNAPBAK_DIR/snap-bak-io"
 SERVICE_NAME="snap-bak"
+STATE_DIR="$SNAPBAK_DIR/state"
+CACHE_DIR="$SNAPBAK_DIR/cache"
 
-# Source of the python orchestrator: co-located with this setup script.
-SCRIPT_SRC="$(dirname "$(readlink -f "$0")")/snapbak.py"
+# Source files co-located with this setup script.
+SCRIPT_SRC="$(dirname "$(readlink -f "$0")")/snap_bak.py"
+WRAPPER_SRC="$(dirname "$(readlink -f "$0")")/snap-bak-io"
 
 # --- 1. CREATE USER, GROUP & DIRECTORIES ---
-# Creating the group explicitly avoids failing chown when user-private
-# groups are disabled on the system.
 if ! getent group "$SERVICE_GROUP" >/dev/null; then
     echo "[*] Creating system group: $SERVICE_GROUP"
     groupadd --system "$SERVICE_GROUP"
@@ -41,7 +46,7 @@ else
 fi
 echo "[*] Creating system user: $SERVICE_USER"
 if ! id "$SERVICE_USER" &>/dev/null; then
-    # Create a system user with a home directory for XDG_STATE_HOME. Use -g so
+    # Create a system user with a home directory for XDG state/cache. Use -g so
     # the pre-created group is assigned as the primary group; without it useradd
     # tries to create a user-private group of the same name and fails (and is
     # not idempotent).
@@ -51,22 +56,38 @@ else
     echo "[!] User $SERVICE_USER already exists. Skipping creation."
 fi
 
-# Ensure state directory exists and is owned by the service user
+# /opt/snap-bak is ROOT-owned (0755). The service user must not be able to
+# replace snap_bak.py or snap-bak-io: the wrapper is the sudo security
+# boundary, so a writable install dir would mean trivial root escalation.
 mkdir -p "$SNAPBAK_DIR"
-chown "$SERVICE_USER":"$SERVICE_GROUP" "$SNAPBAK_DIR"
-chmod 750 "$SNAPBAK_DIR"
+chown root:root "$SNAPBAK_DIR"
+chmod 0755 "$SNAPBAK_DIR"
 
-# --- 1b. INSTALL MANAGED PROGRAM ---
-# Copy the orchestrator into place so the systemd unit has something to run.
+# --- 1b. INSTALL MANAGED PROGRAM & WRAPPER ---
 if [ ! -f "$SCRIPT_SRC" ]; then
-    echo "[!] Cannot find $SCRIPT_SRC. Place snapbak.py next to this script." >&2
+    echo "[!] Cannot find $SCRIPT_SRC. Place snap_bak.py next to this script." >&2
+    exit 1
+fi
+if [ ! -f "$WRAPPER_SRC" ]; then
+    echo "[!] Cannot find $WRAPPER_SRC. Place snap-bak-io next to this script." >&2
     exit 1
 fi
 install -o root -g root -m 0644 "$SCRIPT_SRC" "$SCRIPT_PATH"
+install -o root -g root -m 0755 "$WRAPPER_SRC" "$WRAPPER_PATH"
+echo "[*] Installed $SCRIPT_PATH (root:root 0644) and $WRAPPER_PATH (root:root 0755)."
+
+# --- 1c. SERVICE-WRITABLE SUBDIRS ---
+# The service user writes lock/status/throughput under state/ and restic's
+# cache under cache/. Root owns everything else in /opt/snap-bak.
+for d in "$STATE_DIR" "$CACHE_DIR"; do
+    mkdir -p "$d"
+    chown "$SERVICE_USER":"$SERVICE_GROUP" "$d"
+    chmod 0750 "$d"
+done
 
 # --- 2. GENERATE EXAMPLE CONFIG ---
 # This is JSONC: // and /* */ comments are allowed and stripped by
-# snapbak.py (whitespace-preserving, so line numbers stay valid). Every real
+# snap_bak.py (whitespace-preserving, so line numbers stay valid). Every real
 # field is shown with a value you must edit. This file loads as-is.
 # Idempotent: an existing config is left untouched so your edits survive a
 # re-run (use --force ... or rm the file to regenerate).
@@ -79,7 +100,7 @@ else
   // Top-level settings
   //   mount_base      : where read-only snapshots get mounted before backup (string)
   //   stuck_threshold : seconds after which a 'running' lock is considered stuck (int)
-  "mount_base": "/mnt/snapbak_mounts",
+  "mount_base": "/bak",
   "stuck_threshold": 3600,
 
   "repos": [
@@ -91,12 +112,16 @@ else
       //   size_limit     : stop when repo hits this many bytes; 0 = unlimited  (int)
       //   latency_ms     : expected repo latency, scheduling hint  (int ms)
       //   throughput_mbps: expected repo throughput, scheduling hint  (int)
+      //   restic_options : extra restic CLI flags for every command against this repo.
+      //                    Snap-bak's own flags (--json, --tag, --keep-*, --prune,
+      //                    --exclude*, -r, --password-file) are ignored if set here.
       "name": "primary-cloud",
       "path": "rclone:PROVIDER:DIR",
       "password_file": "/opt/snap-bak/passwords/provider",
       "size_limit": 0,
       "latency_ms": 100,
-      "throughput_mbps": 10
+      "throughput_mbps": 10,
+      "restic_options": ["--compression=better"]
     }
   ],
 
@@ -104,7 +129,7 @@ else
     {
       // name             : unique job id  (string). Used to derive:
       //                     mount point  = <mount_base>/<name>
-      //                     restic tag   = --tag <name>
+      //                     restic tag   = --tag <name> (overridable via 'tag')
       //                     lock file    = <state>/<name>.lock
       //                     status file  = <state>/<name>_status.json
       //                     Use only [A-Za-z0-9_-]; '/' or '..' would break out
@@ -122,6 +147,8 @@ else
       // backup_window_start/end: 'HH:MM' UTC time window backups run in; omit any
       // ignore_file      : restic --exclude-file (gitignore-style, one pattern/line)
       // excludes         : list of restic --exclude patterns (gitignore-style)
+      // tag              : optional restic tag override (default: job name)
+      // restic_options   : extra restic CLI flags for this job (see repo comment)
       // timeout          : max seconds for the restic backup step  (default 7200)
       "name": "Home-Protection",
       "snapshot_dir": "/home/.snapshots",
@@ -142,7 +169,7 @@ else
 }
 SNAPBACK_EOF
     chown root:root "$CONFIG_FILE"
-    chmod 644 "$CONFIG_FILE"
+    chmod 0644 "$CONFIG_FILE"
 fi
 
 # Create password directory. Restic runs as the service user and must be able
@@ -150,13 +177,13 @@ fi
 # (files inside should be chmod 600).
 mkdir -p "$SNAPBAK_DIR/passwords"
 chown "$SERVICE_USER":"$SERVICE_GROUP" "$SNAPBAK_DIR/passwords"
-chmod 750 "$SNAPBAK_DIR/passwords"
+chmod 0750 "$SNAPBAK_DIR/passwords"
 
 # Create directory holding gitignore-style exclude files (referenced by
 # each job's "ignore_file"). Readable by the service user.
 mkdir -p "$SNAPBAK_DIR/excludes"
 chown root:"$SERVICE_GROUP" "$SNAPBAK_DIR/excludes"
-chmod 750 "$SNAPBAK_DIR/excludes"
+chmod 0750 "$SNAPBAK_DIR/excludes"
 if [ ! -f "$SNAPBAK_DIR/excludes/home.ignore" ]; then
     cat > "$SNAPBAK_DIR/excludes/home.ignore" <<'EOF'
 # gitignore-style patterns, one per line (restic --exclude-file)
@@ -165,25 +192,31 @@ if [ ! -f "$SNAPBAK_DIR/excludes/home.ignore" ]; then
 EOF
 fi
 
+# rclone config for the service user (restic -> rclone remotes). the operator copies the
+# real rclone.conf in; the dir must exist and be writable by the service user.
+mkdir -p "$SNAPBAK_DIR/.config/rclone"
+chown "$SERVICE_USER":"$SERVICE_GROUP" "$SNAPBAK_DIR/.config/rclone"
+chmod 0750 "$SNAPBAK_DIR/.config/rclone"
+
 # Create mount base directory and ensure service user owns it
 mkdir -p "$MOUNT_BASE"
 chown "$SERVICE_USER":"$SERVICE_GROUP" "$MOUNT_BASE"
-chmod 755 "$MOUNT_BASE"
+chmod 0755 "$MOUNT_BASE"
 
 # --- 3. CONFIGURE SUDOERS ---
-SUDOERS_FILE="/etc/sudoers.d/snapbak-svc"
-ISO_SNAPSHOT='[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]?[0-9][0-9]'
-echo "[*] Configuring granular sudo permissions in $SUDOERS_FILE"
+# A single static rule pointing at the root-owned wrapper. This is valid on
+# BOTH sudo-rs and sudo.ws (a trailing '*' = zero or more subsequent args,
+# the only wildcard form sudo-rs allows). Because the wrapper derives every
+# path from the root-owned config at runtime, changing mount_base or
+# snapshot_dir in config NEVER requires touching sudoers.
+SUDOERS_FILE="/etc/sudoers.d/snap-bak"
+echo "[*] Configuring sudo permissions in $SUDOERS_FILE"
 cat <<EOF > "$SUDOERS_FILE"
-# snap-bak specific permissions
-# The service user may only manage Btrfs snapshots whose basename matches the
-# format used by snapbak.py (YYYY-MM-DD_HH:MM, UTC). Due to sudoers quirks:
-#   - a literal ':' is not allowed in a command arg, so the HH:MM colon is
-#     matched by '?' (any single char, digits still enforced either side)
-#   - commas must be escaped (\,) in the mount options so they do not separate
-#     commands
-# Mount target is pinned to the mount base dir. Whole rule = one line.
-$SERVICE_USER ALL=(root) NOPASSWD:/usr/bin/btrfs subvolume snapshot -r * */${ISO_SNAPSHOT}, /usr/bin/btrfs subvolume delete */${ISO_SNAPSHOT}, /usr/bin/mount -o ro\\,uid=*\\,gid=* */${ISO_SNAPSHOT} ${MOUNT_BASE}/*, /usr/bin/umount -l ${MOUNT_BASE}/*
+# snap-bak permissions: allow the service user to run only the root-owned
+# wrapper. The wrapper validates job/snapshot names against /opt/snap-bak/
+# config.json (root-owned) and executes btrfs/mount/umount with config-derived
+# paths. No wildcard/glob rules needed here.
+$SERVICE_USER ALL=(root) NOPASSWD:$WRAPPER_PATH *
 EOF
 chmod 0440 "$SUDOERS_FILE"
 
@@ -194,18 +227,11 @@ if ! visudo -c -f "$SUDOERS_FILE"; then
     exit 1
 fi
 
-# --- 3b. RESOLVE SUDO BINARY ---
-# snapbak.py runs btrfs/mount/umount through sudo. On distros where sudo-rs
-# owns /usr/bin/sudo (Fedora/OpenSUSE family), its stricter glob handling
-# rejects the NOPASSWD rules above, whereas the C implementation (sudo.ws)
-# accepts them. Pick the C sudo explicitly and hand it to snapbak via
-# SNAPBAK_SUDO; snapbak falls back to /usr/bin/sudo for non-service use.
-if [ -x /usr/bin/sudo.ws ]; then
-    SUDO_BIN="/usr/bin/sudo.ws"
-else
-    SUDO_BIN="/usr/bin/sudo"
+# Remove any stale sudoers file from the old snapbak-svc user.
+if [ -f /etc/sudoers.d/snapbak-svc ]; then
+    echo "[!] Removing stale /etc/sudoers.d/snapbak-svc (superseded by $SUDOERS_FILE)."
+    rm -f /etc/sudoers.d/snapbak-svc
 fi
-echo "[*] Using sudo binary: $SUDO_BIN"
 
 # --- 4. CREATE SYSTEMD SERVICE ---
 echo "[*] Creating systemd service: $SERVICE_NAME.service"
@@ -220,8 +246,8 @@ Type=oneshot
 User=$SERVICE_USER
 Group=$SERVICE_GROUP
 Environment=SNAPBAK_CONFIG_FILE=$CONFIG_FILE
-Environment=XDG_STATE_HOME=$SNAPBAK_DIR
-Environment=SNAPBAK_SUDO=$SUDO_BIN
+Environment=XDG_STATE_HOME=$STATE_DIR
+Environment=XDG_CACHE_HOME=$CACHE_DIR
 ExecStart=/usr/bin/python3 $SCRIPT_PATH
 
 [Install]
@@ -253,14 +279,16 @@ echo " SETUP COMPLETE"
 echo "===================================================="
 echo " User:        $SERVICE_USER"
 echo " Config:      $CONFIG_FILE"
-echo " State Dir:   $SNAPBAK_DIR"
+echo " State Dir:   $STATE_DIR"
+echo " Cache Dir:   $CACHE_DIR"
+echo " Mount Base:  $MOUNT_BASE"
 echo " Service:     $SERVICE_NAME"
 echo "===================================================="
 echo " NEXT STEPS:"
 echo " 1. Edit $CONFIG_FILE to match your actual environment."
 echo " 2. Create your restic password file in $SNAPBAK_DIR/passwords/ and chmod 600 it."
-echo " 3. (For reference) $SCRIPT_PATH was installed root-owned (mode 0644), readable by $SERVICE_USER."
-echo " 4. Ensure snapshot_dir paths are writable by $SERVICE_USER (for btrfs snapshot create/delete)."
+echo " 3. Copy your rclone config to $SNAPBAK_DIR/.config/rclone/rclone.conf (chmod 600)."
+echo " 4. Ensure snapshot_dir paths exist (btrfs snapshots are created as root via the wrapper)."
 echo " 5. Ensure restic repo path is accessible by $SERVICE_USER (read/write)."
 echo " 6. Enable the timer: sudo systemctl enable --now $SERVICE_NAME"
 echo "===================================================="

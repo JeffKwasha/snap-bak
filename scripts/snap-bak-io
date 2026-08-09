@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""
+snap-bak-io: root-owned privileged helper for snap-bak.
+
+The only command snap-bak may run via sudo (NOPASSWD). It derives every
+path from the ROOT-OWNED config file, so the unprivileged service user can
+never pass arbitrary paths to btrfs/mount. Accepted operations:
+
+  snap-bak-io snapshot <job> <name>   -> btrfs subvolume snapshot -r
+  snap-bak-io delete  <job> <name>    -> btrfs subvolume delete
+  snap-bak-io mount   <job> <name>    -> mkdir + mount -o ro,uid,gid
+  snap-bak-io umount  <job>           -> umount -l
+
+This wrapper is intentionally standalone: it must NOT import scripts.snap_bak
+(the security boundary is the wrapper itself; coupling to the orchestrator
+would let a bug there widen this path). It is installed root:root 0755 by
+snap-bak-setup.sh.
+
+The sudoers rule `snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/snap-bak-io *`
+is valid on both sudo-rs and sudo.ws (a single trailing '*' = zero or more
+args), so no sudo-binary selection is needed.
+
+Config is JSONC (// and /* */ comments allowed); a minimal comment stripper
+is duplicated here to stay dependency-free.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+CONFIG_PATH = "/opt/snap-bak/config.json"
+SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}:\d{2}$")
+
+BTRFS = "/usr/bin/btrfs"
+MOUNT = "/usr/bin/mount"
+UMOUNT = "/usr/bin/umount"
+
+
+def _exit_err(msg: str, code: int = 1) -> "NoReturn":
+    print(f"snap-bak-io: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def strip_json_comments(src: str) -> str:
+    """Strip // and /* */ comments from JSON(C), preserving line positions."""
+    out = list(src)
+    i, n = 0, len(src)
+    in_string = False
+    while i < n:
+        c = src[i]
+        if in_string:
+            out[i] = c
+            if c == "\\" and i + 1 < n:
+                out[i + 1] = src[i + 1]
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+            out[i] = c
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            while i < n and src[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            out[i] = out[i + 1] = " "
+            i += 2
+            while i + 1 < n and not (src[i] == "*" and src[i + 1] == "/"):
+                out[i] = " " if src[i] != "\n" else "\n"
+                i += 1
+            if i + 1 < n:
+                out[i] = out[i + 1] = " "
+                i += 2
+            continue
+        out[i] = c
+        i += 1
+    return "".join(out)
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.loads(strip_json_comments(f.read()))
+    except OSError as e:
+        _exit_err(f"cannot read {CONFIG_PATH}: {e}")
+    except json.JSONDecodeError as e:
+        _exit_err(f"invalid JSON in {CONFIG_PATH}: {e}")
+
+
+def _find_job(config: dict, job_name: str) -> dict:
+    for job in config.get("jobs", []):
+        if job.get("name") == job_name:
+            return job
+    _exit_err(f"unknown job: {job_name}")
+    raise SystemExit(1)  # unreachable
+
+
+def _validate_name(name: str) -> str:
+    if not SNAPSHOT_RE.match(name):
+        _exit_err(f"invalid snapshot name: {name!r} (expected YYYY-MM-DD_HH:MM)")
+    return name
+
+
+def _mount_base(config: dict) -> str:
+    return config.get("mount_base", "/bak")
+
+
+def _job_path(job: dict, name: str) -> str:
+    """snapshot_dir/name, rejecting any traversal beyond snapshot_dir."""
+    base = os.path.realpath(job["snapshot_dir"])
+    target = os.path.realpath(os.path.join(job["snapshot_dir"], name))
+    if target != os.path.join(base, name) or os.path.commonpath([base, target]) != base:
+        _exit_err(f"path escapes snapshot_dir: {name}")
+    return target
+
+
+def _run(cmd: list[str]) -> None:
+    print("snap-bak-io CMD: " + " ".join(cmd), file=sys.stderr)
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        sys.exit(e.returncode)
+
+
+def main() -> None:
+    if len(sys.argv) < 3:
+        _exit_err("usage: snap-bak-io <snapshot|delete|mount|umount> <job> [name]")
+    op, job_name = sys.argv[1], sys.argv[2]
+    config = load_config()
+    job = _find_job(config, job_name)
+
+    if op == "snapshot":
+        if len(sys.argv) != 4:
+            _exit_err("snapshot requires: <job> <name>")
+        name = _validate_name(sys.argv[3])
+        target = _job_path(job, name)
+        _run([BTRFS, "subvolume", "snapshot", "-r", job["source_subvolume"], target])
+
+    elif op == "delete":
+        if len(sys.argv) != 4:
+            _exit_err("delete requires: <job> <name>")
+        name = _validate_name(sys.argv[3])
+        target = _job_path(job, name)
+        _run([BTRFS, "subvolume", "delete", target])
+
+    elif op == "mount":
+        if len(sys.argv) != 4:
+            _exit_err("mount requires: <job> <name>")
+        name = _validate_name(sys.argv[3])
+        snap_path = _job_path(job, name)
+        mount_point = os.path.join(_mount_base(config), job_name)
+        os.makedirs(mount_point, exist_ok=True)
+        uid = os.environ.get("SUDO_UID", os.getuid())
+        gid = os.environ.get("SUDO_GID", os.getgid())
+        _run([MOUNT, "-o", f"ro,uid={uid},gid={gid}", snap_path, mount_point])
+
+    elif op == "umount":
+        mount_point = os.path.join(_mount_base(config), job_name)
+        _run([UMOUNT, "-l", mount_point])
+
+    else:
+        _exit_err(f"unknown operation: {op}")
+
+
+if __name__ == "__main__":
+    main()
