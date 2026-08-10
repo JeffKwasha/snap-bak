@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,9 +17,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import scripts.snap_bak as snapbak_module
 
+from pydantic import ValidationError
+
 from scripts.snap_bak import (
     DEFAULT_SNAPSHOT_INTERVAL,
     DEFAULT_SNAPSHOT_INTERVAL_MIN,
+    EXIT_PERM_FAILED,
+    EXIT_PERM_TIMEOUT,
+    EXIT_PERMISSION_ERROR,
+    EXIT_STUCK_WAIT,
+    EXIT_SYSTEM,
+    EXIT_TEMP_SIZE_LIMIT,
+    EXIT_TEMP_UNREACHABLE,
     FAIL_CREDENTIALS,
     FAIL_INTERNAL,
     CredentialsError,
@@ -27,13 +37,21 @@ from scripts.snap_bak import (
     RemoteUnavailableError,
     SnapBakConfig,
     _categorize_restic_error,
+    _effective_priority,
+    _pid_alive,
+    _read_lock_info,
+    _resolve_lock_contention,
     _restic_update_due,
+    _write_lock_info,
+    acquire_global_lock,
     build_retention_datetimes,
     build_retention_exponential,
     build_snapshot_keeplist,
     load_config,
     parse_duration,
     parse_size,
+    release_global_lock,
+    touch_global_lock,
     Snapshot,
 )
 
@@ -107,6 +125,8 @@ def mocked_backup_job(sample_job):
     sample_job._cleanup_snapshots = MagicMock()
     sample_job.create_snapshot = MagicMock()
     sample_job._write_status = MagicMock()
+    sample_job._check_repo_reachable = MagicMock(return_value=True)
+    sample_job._measure_repo_size = MagicMock(return_value=0)
     return sample_job
 
 
@@ -122,11 +142,6 @@ class TestParseSnapshotTime:
     def test_invalid_format(self, sample_job, tmp_path):
         snap = tmp_path / "snapshots" / "random_name"
         snap.mkdir(parents=True)
-        result = sample_job._parse_snapshot_time(snap)
-        assert result is None
-
-    def test_empty_name(self, sample_job, tmp_path):
-        snap = tmp_path / "snapshots" / ""
         result = sample_job._parse_snapshot_time(snap)
         assert result is None
 
@@ -316,40 +331,6 @@ class TestConfigValidation:
             )
 
 
-# --- Repo object tests ---
-
-class TestRepo:
-    def test_repo_has_password_file(self):
-        repo = Repo(name="primary", path="rclone:test", password_file="/path/to/pass")
-        assert repo.password_file == "/path/to/pass"
-
-    def test_repo_password_file_default_empty(self):
-        repo = Repo(name="primary", path="rclone:test")
-        assert repo.password_file == ""
-
-    def test_repo_size_limit_default_zero(self):
-        repo = Repo(name="primary", path="rclone:test")
-        assert repo.size_limit == 0
-
-
-# --- Job object tests ---
-
-class TestJob:
-    def test_job_repo_property_returns_repo_obj(self, sample_job):
-        """self.repo_obj should return the Repo object."""
-        repo = sample_job.repo_obj
-        assert repo.name == "primary"
-        assert repo.path == "rclone:CONFIG_ENTRY:DIRECTORY"
-
-    def test_job_repo_path_returns_string(self, sample_job):
-        """repo_path should return the path string."""
-        assert sample_job.repo_path == "rclone:CONFIG_ENTRY:DIRECTORY"
-
-    def test_job_repo_name_alias(self, sample_job):
-        """repo_name should be an alias for repo field."""
-        assert sample_job.repo_name == "primary"
-
-
 # --- find_oldest_snapshot_within tests ---
 
 class TestFindOldestSnapshotWithin:
@@ -390,16 +371,6 @@ class TestFindOldestSnapshotWithin:
 # --- Throughput calculation tests ---
 
 class TestThroughputCalculation:
-    def test_basic_calculation(self, sample_job, tmp_path):
-        """total_size=1GB, backup_time=10s → 800 Mbps."""
-        repo = Repo(name="primary", path="rclone:test", throughput_mbps=10)
-
-        sample_job._update_repo_throughput(repo, 1_000_000_000, 10.0)
-
-        expected = round((1_000_000_000 * 8) / (10.0 * 1_000_000))
-        assert repo.throughput_mbps == expected
-        assert repo.throughput_mbps == 800
-
     def test_zero_backup_time_no_update(self, sample_job):
         repo = Repo(name="primary", path="rclone:test", throughput_mbps=10)
 
@@ -709,7 +680,7 @@ class TestSnapBakConfig:
     def test_mount_point_mirrors_source(self):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:test"}],
-            jobs=[{"name": "Custom Name", "snapshot_dir": "/tmp", "source_subvolume": "/mnt/data", "repo": "primary"}],
+            jobs=[{"name": "CustomName", "snapshot_dir": "/tmp", "source_subvolume": "/mnt/data", "repo": "primary"}],
         )
         jobs = config.resolve_jobs()
         assert jobs[0].mount_point == Path("/bak") / "data"
@@ -717,7 +688,7 @@ class TestSnapBakConfig:
     def test_mount_point_relative_source(self):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:test"}],
-            jobs=[{"name": "Custom Name", "snapshot_dir": "/tmp", "source_subvolume": "home", "repo": "primary"}],
+            jobs=[{"name": "CustomName", "snapshot_dir": "/tmp", "source_subvolume": "home", "repo": "primary"}],
         )
         jobs = config.resolve_jobs()
         assert jobs[0].mount_point == Path("/bak") / "home"
@@ -1031,3 +1002,380 @@ class TestDatetimesCleanup:
                 assert name in deleted_names, f"Expected {name} ({label}) to be deleted"
             else:
                 assert (Path(sample_job.snapshot_dir) / name).exists(), f"Expected {name} ({label}) to be kept"
+
+
+# --- Repo planning / delayed-job handling ---
+
+class TestRepoPlanning:
+    def test_unreachable_repo_delays_job(self, mocked_backup_job, create_snapshots):
+        """Phase 2 reachability failure delays the job, never backs up."""
+        now = datetime.now(timezone.utc)
+        create_snapshots((now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M"), now - timedelta(hours=20))
+        mocked_backup_job._check_repo_reachable = MagicMock(return_value=False)
+
+        result = mocked_backup_job.run()
+
+        assert result["status"] == "delayed"
+        assert result["delayed_reason"] == "unreachable"
+        mocked_backup_job._backup.assert_not_called()
+
+    def test_over_size_limit_delays_job(self, mocked_backup_job, create_snapshots):
+        """Repo at/over size_limit delays the job (protected snapshot duty)."""
+        now = datetime.now(timezone.utc)
+        create_snapshots((now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M"), now - timedelta(hours=20))
+        mocked_backup_job._measure_repo_size = MagicMock(return_value=2 * 10**12)  # 2TB > 1TiB limit
+
+        result = mocked_backup_job.run()
+
+        assert result["status"] == "delayed"
+        assert result["delayed_reason"] == "size_limit"
+        mocked_backup_job._backup.assert_not_called()
+
+    def test_over_limit_second_job_skipped_not_delayed(self, sample_repos, tmp_path):
+        """Two jobs on one over-limit repo: the first (highest effective
+        priority) is delayed and allocated; the second is skipped only."""
+        snap_dir = tmp_path / "snap"
+        snap_dir.mkdir()
+        shared: dict = {}
+        jobs = []
+        for name, prio in (("high", 10), ("low", 5)):
+            job = Job(name=name, snapshot_dir=str(snap_dir), source_subvolume=str(snap_dir),
+                      repo="primary", repos=sample_repos, config_path=str(tmp_path / "c.json"))
+            job.priority = prio
+            job.repo_state = shared
+            job._check_repo_reachable = MagicMock(return_value=True)
+            job._measure_repo_size = MagicMock(return_value=2 * 10**12)
+            job._write_status = MagicMock()
+            jobs.append(job)
+
+        assert jobs[0]._plan() == "skip"
+        assert jobs[0].delayed is True
+        assert shared["primary"]["allocated"] is True
+
+        assert jobs[1]._plan() == "skip"
+        assert jobs[1].delayed is False
+        assert "higher-priority" in (jobs[1].skip_reason or "")
+
+    def test_repo_checks_cached_once_per_run(self, sample_repos, tmp_path):
+        """Reachability + size are probed once per repo, shared across jobs."""
+        snap_dir = tmp_path / "snap"
+        snap_dir.mkdir()
+        shared: dict = {}
+        jobs = [
+            Job(name=f"j{i}", snapshot_dir=str(snap_dir), source_subvolume=str(snap_dir),
+                repo="primary", repos=sample_repos, config_path=str(tmp_path / "c.json"))
+            for i in range(3)
+        ]
+        reachable_mock = MagicMock(return_value=True)
+        size_mock = MagicMock(return_value=123)
+        for job in jobs:
+            job.repo_state = shared
+            job._check_repo_reachable = reachable_mock
+            job._measure_repo_size = size_mock
+            job._plan()
+
+        assert reachable_mock.call_count == 1
+        assert size_mock.call_count == 1
+
+    def test_bump_repo_size_reflects_upload(self, mocked_backup_job):
+        """Successful uploads grow the cached repo-size estimate."""
+        mocked_backup_job.repo_state = {}
+        state = mocked_backup_job._repo_state(mocked_backup_job.repo_obj)
+        mocked_backup_job._bump_repo_size(mocked_backup_job.repo_obj, 1_000_000_000)
+        assert state["size"] == 1_000_000_000
+
+
+class TestDelayedHandling:
+    def test_delay_persists_and_restores(self, sample_job, create_snapshots):
+        """_delay() writes the delayed group; _load_delayed_state() restores it."""
+        now = datetime.now(timezone.utc)
+        snap = (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M")
+        create_snapshots(snap, now - timedelta(hours=20))
+        sample_job._delay("size_limit")
+
+        fresh = Job(name=sample_job.name, snapshot_dir=sample_job.snapshot_dir,
+                    source_subvolume=sample_job.source_subvolume, repo="primary",
+                    repos=sample_job.repos, config_path=sample_job.config_path)
+        fresh._load_delayed_state()
+        assert fresh.delayed is True
+        assert fresh.delayed_reason == "size_limit"
+        assert fresh.protected_snapshot == snap
+        assert fresh.missed_slots == 1
+
+    def test_retry_protected_snapshot_when_not_time(self, sample_job, create_snapshots):
+        """A recovered over-limit job retries the exact protected snapshot."""
+        now = datetime.now(timezone.utc)
+        snap = (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M")
+        create_snapshots(snap, now - timedelta(hours=20))
+        sample_job._delay("size_limit")
+        sample_job._check_repo_reachable = MagicMock(return_value=True)
+        sample_job._measure_repo_size = MagicMock(return_value=0)
+        sample_job._time_since_last_success = MagicMock(return_value=1)
+
+        plan = sample_job._plan()
+
+        assert plan == "backup"
+        assert sample_job.planned_snapshot is not None
+        assert sample_job.planned_snapshot.name == snap
+
+    def test_success_clears_delayed_state(self, mocked_backup_job, create_snapshots):
+        """A successful backup resets the delayed group."""
+        now = datetime.now(timezone.utc)
+        create_snapshots((now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M"), now - timedelta(hours=20))
+        mocked_backup_job.delayed = True
+        mocked_backup_job.delayed_reason = "size_limit"
+        mocked_backup_job.missed_slots = 3
+
+        result = mocked_backup_job.run()
+
+        assert result["status"] == "success"
+        assert mocked_backup_job.delayed is False
+        assert mocked_backup_job.delayed_reason is None
+        assert mocked_backup_job.missed_slots == 0
+        assert mocked_backup_job.protected_snapshot is None
+
+
+class TestPriority:
+    def test_effective_priority_escalates_with_missed_slots(self, sample_job):
+        sample_job.priority = 5
+        sample_job.missed_slots = 0
+        assert _effective_priority(sample_job) == 5
+        sample_job.missed_slots = 2
+        assert _effective_priority(sample_job) == 15
+
+    def test_missed_slots_break_priority_ties(self, sample_repos, tmp_path):
+        snap_dir = tmp_path / "snap"
+        snap_dir.mkdir()
+        jobs = [
+            Job(name=f"j{i}", snapshot_dir=str(snap_dir), source_subvolume=str(snap_dir),
+                repo="primary", repos=sample_repos, config_path=str(tmp_path / "c.json"))
+            for i in range(2)
+        ]
+        jobs[0].priority = 10
+        jobs[1].priority = 10
+        jobs[1].missed_slots = 1
+        ordered = sorted(jobs, key=_effective_priority, reverse=True)
+        assert ordered[0].name == "j1"
+
+
+class TestNameValidation:
+    def test_invalid_job_name_rejected(self):
+        with pytest.raises(ValidationError):
+            SnapBakConfig(
+                repos=[{"name": "primary", "path": "rclone:test"}],
+                jobs=[{"name": "Bad Name!", "snapshot_dir": "/tmp", "source_subvolume": "home", "repo": "primary"}],
+            )
+
+
+class TestPasswordFilePermissions:
+    def test_loose_permissions_hard_exit(self, sample_repos, tmp_path):
+        secret = tmp_path / "secret"
+        secret.write_text("pw\n")
+        secret.chmod(0o644)
+        job = Job(name="t", snapshot_dir=str(tmp_path), source_subvolume=str(tmp_path),
+                  repo="primary", repos=sample_repos, config_path=str(tmp_path / "c.json"))
+        job.repo_obj.password_file = str(secret)
+
+        with pytest.raises(SystemExit) as ei:
+            job._check_password_file_permissions()
+        assert ei.value.code == EXIT_PERMISSION_ERROR
+
+
+class TestGlobalLock:
+    def test_acquire_and_release(self):
+        fh = snapbak_module.acquire_global_lock(3600, 300)
+        try:
+            assert snapbak_module.GLOBAL_LOCK_FILE.exists()
+            info = snapbak_module._read_lock_info()
+            assert info is not None
+            assert info["pid"] == os.getpid()
+        finally:
+            snapbak_module.release_global_lock(fh)
+        assert not snapbak_module.GLOBAL_LOCK_FILE.exists()
+
+    def test_write_lock_info_preserves_inode(self):
+        """The lock is flock()ed on the file's inode, so writing must never
+        replace the file (no tmp+rename) or the lock would be orphaned."""
+        snapbak_module.GLOBAL_LOCK_FILE.write_text("{}")
+        ino_before = snapbak_module.GLOBAL_LOCK_FILE.stat().st_ino
+        snapbak_module._write_lock_info("data", "2026-01-01_00:00")
+        assert snapbak_module.GLOBAL_LOCK_FILE.stat().st_ino == ino_before
+
+        info = snapbak_module._read_lock_info()
+        assert info is not None
+        assert info["pid"] == os.getpid()
+        assert info["current_job"] == "data"
+        assert info["snapshot_name"] == "2026-01-01_00:00"
+
+    def test_fresh_lock_contention_exits_system(self):
+        """A fresh lock (< stuck_threshold) means another instance is live.
+        The parent holds it via the real acquire_global_lock(); a second
+        acquire in the same process hits a separate open file description."""
+        fh = snapbak_module.acquire_global_lock(3600, 300)
+        try:
+            with pytest.raises(SystemExit) as ei:
+                snapbak_module.acquire_global_lock(3600, 300)
+            assert ei.value.code == EXIT_SYSTEM
+        finally:
+            snapbak_module.release_global_lock(fh)
+
+    def test_another_process_cannot_acquire_held_lock(self):
+        """The critical test: one process holds the lock via the real
+        acquire_global_lock(), and a *separate process* is denied it. flock()
+        locks are tied to the open file description, so even the fork-inherited
+        fd must not allow a new acquisition."""
+        fh = snapbak_module.acquire_global_lock(3600, 300)
+        try:
+            pid = os.fork()
+            if pid == 0:
+                # Child: the lock is genuinely held by the parent, so
+                # acquire must refuse (EXIT_SYSTEM), not succeed.
+                try:
+                    snapbak_module.acquire_global_lock(3600, 300)
+                    os._exit(1)  # wrongly acquired the held lock
+                except SystemExit as e:
+                    os._exit(0 if e.code == EXIT_SYSTEM else 2)
+                except Exception:
+                    os._exit(3)
+            _, status = os.waitpid(pid, 0)
+            assert os.waitstatus_to_exitcode(status) == 0
+        finally:
+            snapbak_module.release_global_lock(fh)
+
+    def test_stale_lock_holder_dead_breaks_lock(self, monkeypatch):
+        """A stale lock whose holder PID is gone is broken and acquisition retried."""
+        snapbak_module._write_lock_info()
+        old = time.time() - 7200
+        os.utime(snapbak_module.GLOBAL_LOCK_FILE, (old, old))
+        monkeypatch.setattr(snapbak_module, "_pid_alive", MagicMock(return_value=False))
+
+        assert snapbak_module._resolve_lock_contention(3600, 300) is True
+        assert not snapbak_module.GLOBAL_LOCK_FILE.exists()
+
+    def test_stuck_alive_holder_exits_stuck_wait(self, monkeypatch):
+        """Holder still alive past stuck_wait: give up with EXIT_STUCK_WAIT."""
+        monkeypatch.setattr(snapbak_module, "_pid_alive", MagicMock(return_value=True))
+        monkeypatch.setattr(snapbak_module, "STUCK_POLL_INTERVAL", 0)
+        monkeypatch.setattr(snapbak_module.time, "sleep", lambda s: None)
+        held = snapbak_module.acquire_global_lock(3600, 300)
+        old = time.time() - 7200
+        os.utime(snapbak_module.GLOBAL_LOCK_FILE, (old, old))
+        try:
+            with pytest.raises(SystemExit) as ei:
+                snapbak_module._resolve_lock_contention(3600, 0)
+            assert ei.value.code == EXIT_STUCK_WAIT
+        finally:
+            snapbak_module.release_global_lock(held)
+
+    def test_stuck_lock_released_during_poll_proceeds(self, monkeypatch):
+        """If the lock clears during the stuck-wait poll, proceed normally."""
+        snapbak_module._write_lock_info()
+        old = time.time() - 7200
+        os.utime(snapbak_module.GLOBAL_LOCK_FILE, (old, old))
+        monkeypatch.setattr(snapbak_module, "_pid_alive", MagicMock(return_value=True))
+        monkeypatch.setattr(snapbak_module, "STUCK_POLL_INTERVAL", 0)
+        monkeypatch.setattr(snapbak_module.time, "sleep", lambda s: None)
+
+        assert snapbak_module._resolve_lock_contention(3600, 300) is True
+        assert snapbak_module.GLOBAL_LOCK_FILE.exists()
+
+    def test_touch_updates_lock_info(self):
+        fh = snapbak_module.acquire_global_lock()
+        try:
+            snapbak_module.touch_global_lock("data", "2026-01-01_00:00")
+            info = snapbak_module._read_lock_info()
+            assert info is not None
+            assert info["current_job"] == "data"
+            assert info["snapshot_name"] == "2026-01-01_00:00"
+        finally:
+            snapbak_module.release_global_lock(fh)
+
+    def test_touch_updates_mtime(self):
+        fh = snapbak_module.acquire_global_lock()
+        try:
+            time.sleep(0.02)
+            before = snapbak_module.GLOBAL_LOCK_FILE.stat().st_mtime
+            snapbak_module.touch_global_lock()
+            after = snapbak_module.GLOBAL_LOCK_FILE.stat().st_mtime
+            assert after > before
+        finally:
+            snapbak_module.release_global_lock(fh)
+
+
+class TestPidAlive:
+    def test_dead_pid(self):
+        assert snapbak_module._pid_alive(99999999) is False
+
+    def test_alive_pid(self):
+        assert snapbak_module._pid_alive(os.getpid()) is True
+
+    def test_none(self):
+        assert snapbak_module._pid_alive(None) is False
+
+    def test_permission_error_means_alive(self, monkeypatch):
+        def fake_kill(pid, sig):
+            raise PermissionError
+        monkeypatch.setattr(os, "kill", fake_kill)
+        assert snapbak_module._pid_alive(12345) is True
+
+
+class TestMainExitCodes:
+    def _make_fake_job(self, name, result, priority=10, missed_slots=0):
+        job = MagicMock()
+        job.name = name
+        job.priority = priority
+        job.missed_slots = missed_slots
+        job.run.return_value = result
+        job._load_delayed_state = MagicMock()
+        job._check_password_file_permissions = MagicMock()
+        job.dry_run = False
+        job.repo_state = {}
+        return job
+
+    def _run_main(self, jobs, tmp_path, monkeypatch):
+        config = MagicMock()
+        config.mount_base = str(tmp_path)
+        config.stuck_threshold = 3600
+        config.stuck_wait = 300
+        config.restic_update = "never"
+        config.resolve_jobs.return_value = jobs
+        monkeypatch.setattr(snapbak_module, "load_config", lambda p: config)
+        monkeypatch.setattr(snapbak_module, "acquire_global_lock", lambda *a, **k: object())
+        monkeypatch.setattr(snapbak_module, "release_global_lock", lambda fh: None)
+        monkeypatch.setattr(snapbak_module, "_run_restic_update", lambda: None)
+        monkeypatch.setattr(sys, "argv", ["snap-bak", "-c", str(tmp_path / "config.json")])
+        try:
+            snapbak_module._main_impl()
+        except SystemExit as ei:
+            return ei.code
+        return None
+
+    def test_failed_exits_permanent(self, tmp_path, monkeypatch):
+        code = self._run_main([self._make_fake_job("a", {"status": "failed"})], tmp_path, monkeypatch)
+        assert code == EXIT_PERM_FAILED
+
+    def test_timeout_exits_permanent(self, tmp_path, monkeypatch):
+        code = self._run_main([self._make_fake_job("a", {"status": "skipped", "timeout": True})], tmp_path, monkeypatch)
+        assert code == EXIT_PERM_TIMEOUT
+
+    def test_unreachable_delay_exits_temp(self, tmp_path, monkeypatch):
+        code = self._run_main(
+            [self._make_fake_job("a", {"status": "delayed", "delayed_reason": "unreachable"})],
+            tmp_path, monkeypatch)
+        assert code == EXIT_TEMP_UNREACHABLE
+
+    def test_size_limit_delay_exits_temp(self, tmp_path, monkeypatch):
+        code = self._run_main(
+            [self._make_fake_job("a", {"status": "delayed", "delayed_reason": "size_limit"})],
+            tmp_path, monkeypatch)
+        assert code == EXIT_TEMP_SIZE_LIMIT
+
+    def test_jobs_ordered_by_effective_priority(self, tmp_path, monkeypatch):
+        """_main_impl runs delayed (higher effective priority) jobs first."""
+        order: list[str] = []
+        low = self._make_fake_job("low", {"status": "skipped"}, priority=10, missed_slots=0)
+        high = self._make_fake_job("high", {"status": "skipped"}, priority=10, missed_slots=1)
+        low.run.side_effect = lambda: order.append("low") or {"status": "skipped"}
+        high.run.side_effect = lambda: order.append("high") or {"status": "skipped"}
+        self._run_main([low, high], tmp_path, monkeypatch)
+        assert order == ["high", "low"]

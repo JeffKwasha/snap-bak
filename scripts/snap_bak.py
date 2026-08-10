@@ -52,6 +52,10 @@ DEFAULT_BACKUP_INTERVAL = 3600  # 1 hour
 DEFAULT_SNAPSHOT_INTERVAL = 3600  # 1 hour
 DEFAULT_SNAPSHOT_INTERVAL_MIN = 900  # 15 minutes (minimum)
 DEFAULT_SNAPSHOT_AGE_MIN = 12 * 3600  # 12 hours (minimum snapshot age for backup safety)
+DEFAULT_STUCK_WAIT = 300  # total seconds to keep re-checking a stuck lock
+STUCK_POLL_INTERVAL = 60  # seconds between stuck-lock re-checks
+REPO_CHECK_TIMEOUT = 30   # restic cat config timeout (repo reachability)
+REPO_STATS_TIMEOUT = 300  # restic stats timeout (repo size measurement)
 # Sudo invocation for privileged (btrfs/mount) operations. snap-bak calls a
 # root-owned wrapper (installed by snap-bak-setup.sh) rather than running
 # btrfs/mount/umount directly. The wrapper derives every path from the
@@ -280,7 +284,12 @@ def _categorize_restic_error(e: subprocess.CalledProcessError) -> BackupError:
 # --- Global lock ---
 
 def _write_lock_info(job_name: str | None = None, snapshot_name: str | None = None):
-    """Write current job info to the lock file as JSON."""
+    """Write current job info to the lock file as JSON, IN PLACE.
+
+    The lock is held by flock() on the file's inode. Writing must never replace
+    the inode (no tmp + rename): replacing the file would orphan the flock and
+    let a second instance acquire a fresh lock on the new inode.
+    """
     info = {
         "pid": os.getpid(),
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -288,9 +297,19 @@ def _write_lock_info(job_name: str | None = None, snapshot_name: str | None = No
         "snapshot_name": snapshot_name,
         "backup_started_at": datetime.now(timezone.utc).isoformat() if job_name else None,
     }
-    tmp = GLOBAL_LOCK_FILE.with_suffix(".lock.tmp")
-    tmp.write_text(json.dumps(info, indent=2))
-    tmp.replace(GLOBAL_LOCK_FILE)
+    try:
+        try:
+            fh = open(GLOBAL_LOCK_FILE, "r+")
+        except FileNotFoundError:
+            fh = open(GLOBAL_LOCK_FILE, "w")
+        with fh:
+            fh.seek(0)
+            fh.truncate()
+            fh.write(json.dumps(info, indent=2))
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError:
+        pass  # best-effort heartbeat; lock integrity is unaffected
 
 
 def _read_lock_info() -> dict | None:
@@ -301,52 +320,98 @@ def _read_lock_info() -> dict | None:
         return None
 
 
-def acquire_global_lock(stuck_threshold: int = DEFAULT_STUCK_THRESHOLD) -> object:
+def _pid_alive(pid: int | None) -> bool:
+    """True if the process with the given pid still exists."""
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, OverflowError):
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+    except OSError:
+        return False
+
+
+def _resolve_lock_contention(stuck_threshold: int, stuck_wait: int) -> bool:
+    """Resolve lock contention per SPEC. Returns True to retry acquiring."""
+    try:
+        age = time.time() - GLOBAL_LOCK_FILE.stat().st_mtime
+    except OSError:
+        age = 0
+    lock_info = _read_lock_info()
+    pid = lock_info.get("pid") if lock_info else None
+
+    if age <= stuck_threshold:
+        # Too fresh to be stale: another instance is genuinely running.
+        if lock_info:
+            logger.info(
+                f"Another snap-bak instance is running "
+                f"(PID {pid}, job: {lock_info.get('current_job')}, "
+                f"lock age: {age:.0f}s). Exiting."
+            )
+        else:
+            logger.info(f"Another snap-bak instance is running (lock age: {age:.0f}s). Exiting.")
+        sys.exit(EXIT_SYSTEM)
+
+    # Lock is older than stuck_threshold — check whether the holder is stuck.
+    if _pid_alive(pid):
+        logger.error(
+            f"Previous snap-bak instance appears stuck "
+            f"(PID {pid}, job: {lock_info.get('current_job') if lock_info else None}, "
+            f"lock age: {age:.0f}s > {stuck_threshold}s). "
+            f"Re-checking every {STUCK_POLL_INTERVAL}s for up to {stuck_wait}s..."
+        )
+        deadline = time.time() + stuck_wait
+        while time.time() < deadline:
+            time.sleep(STUCK_POLL_INTERVAL)
+            probe = open(GLOBAL_LOCK_FILE, "a+")
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                probe.close()
+                logger.info("Stuck lock released; proceeding.")
+                return True
+            except IOError:
+                probe.close()
+        logger.error(
+            f"STUCK WAIT EXCEEDED: lock not released within {stuck_wait}s. Giving up."
+        )
+        sys.exit(EXIT_STUCK_WAIT)
+
+    logger.warning(
+        f"Breaking stale lock (age: {age:.0f}s > {stuck_threshold}s, "
+        f"pid={pid or 'unknown'})."
+    )
+    try:
+        GLOBAL_LOCK_FILE.unlink()
+    except OSError:
+        pass
+    return True
+
+
+def acquire_global_lock(stuck_threshold: int = DEFAULT_STUCK_THRESHOLD,
+                        stuck_wait: int = DEFAULT_STUCK_WAIT) -> object:
     """Acquire the global lock to prevent multiple snap-bak instances.
 
-    Writes PID and job info to the lock file as JSON and touches it as a heartbeat.
-    If another instance is running, checks the lock file mtime to
-    detect stuck processes.
+    Opens the lock file WITHOUT truncation ('a+'), takes an exclusive
+    non-blocking flock on the inode, and writes lock info in place (never
+    replacing the file, which would orphan the flock). On contention:
+      - lock fresh (< stuck_threshold)      -> EXIT_SYSTEM (50)
+      - lock stale, holder alive            -> poll up to stuck_wait, then EXIT_STUCK_WAIT (51)
+      - lock stale, holder gone             -> break the lock and continue
     """
-    lock_fh = open(GLOBAL_LOCK_FILE, 'w')
-    try:
-        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except IOError:
-        lock_fh.close()
+    while True:
+        lock_fh = open(GLOBAL_LOCK_FILE, "a+")
         try:
-            mtime = GLOBAL_LOCK_FILE.stat().st_mtime
-            age = time.time() - mtime
-            lock_info = _read_lock_info()
-            if age > stuck_threshold:
-                if lock_info:
-                    logger.error(
-                        f"Previous snap-bak instance appears stuck "
-                        f"(PID {lock_info.get('pid')}, job: {lock_info.get('current_job')}, "
-                        f"snapshot: {lock_info.get('snapshot_name')}, "
-                        f"lock age: {age:.0f}s > {stuck_threshold}s). "
-                        f"Another instance cannot start."
-                    )
-                else:
-                    logger.error(
-                        f"Previous snap-bak instance appears stuck "
-                        f"(lock age: {age:.0f}s > {stuck_threshold}s). "
-                        f"Another instance cannot start."
-                    )
-            else:
-                if lock_info:
-                    logger.info(
-                        f"Another snap-bak instance is running "
-                        f"(PID {lock_info.get('pid')}, job: {lock_info.get('current_job')}, "
-                        f"lock age: {age:.0f}s). Exiting."
-                    )
-                else:
-                    logger.info(
-                        f"Another snap-bak instance is running "
-                        f"(lock age: {age:.0f}s). Exiting."
-                    )
-        except OSError:
-            logger.info("Another snap-bak instance is running. Exiting.")
-        sys.exit(0)
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except IOError:
+            lock_fh.close()
+            if _resolve_lock_contention(stuck_threshold, stuck_wait):
+                continue
+        else:
+            break
 
     _write_lock_info()
     logger.info("Global lock acquired.")
@@ -366,7 +431,10 @@ def touch_global_lock(job_name: str | None = None, snapshot_name: str | None = N
     if job_name or snapshot_name:
         _write_lock_info(job_name, snapshot_name)
     else:
-        GLOBAL_LOCK_FILE.touch()
+        try:
+            GLOBAL_LOCK_FILE.touch()
+        except OSError:
+            pass
 
 
 # --- Repo model ---
@@ -424,11 +492,32 @@ class Job(BaseModel):
     dry_run: bool = False
     config_path: str | None = None
 
+    # Phase 2 planning / delayed-job state (not from config)
+    delayed: bool = False
+    delayed_reason: str | None = None
+    protected_snapshot: str | None = None
+    missed_slots: int = 0
+    backup_planned: bool = False
+    planned_snapshot: Path | None = None
+    repo_state: dict | None = None
+    skip_reason: str | None = None
+
     @field_validator('snapshot_dir')
     @classmethod
     def snapshot_dir_must_exist(cls, v):
         if not Path(v).exists():
             raise ValueError(f'snapshot_dir does not exist: {v}')
+        return v
+
+    @field_validator('name', 'tag')
+    @classmethod
+    def name_must_be_safe(cls, v):
+        """name/tag must be filesystem-safe: they drive <state>/<name>_status.json
+        and the restic tag."""
+        if v is None:
+            return v
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", v):
+            raise ValueError(f"{v!r} must match [A-Za-z0-9_-]")
         return v
 
     @property
@@ -482,7 +571,7 @@ class Job(BaseModel):
         if not valid:
             raise ValueError(
                 f"No snapshots with valid naming format in {self.snapshot_dir}. "
-                f"Expected ISO 8601 (YYYY-MM-DDTHH:MM:SS) or YYYYMMDD_HHMMSS."
+                f"Expected YYYY-MM-DD_HH:MM."
             )
         return sorted(valid, key=lambda x: x[1])[-1][0]
 
@@ -626,12 +715,17 @@ class Job(BaseModel):
         if self.dry_run:
             return
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        data = {
+        data: dict = {
             "job": self.name,
             "status": status,
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d_%H:%M"),
             "message": message,
         }
+        # Delayed group: carries the delayed-job state across runs (SPEC §Status File).
+        data["delayed"] = bool(self.delayed)
+        data["delayed_reason"] = self.delayed_reason
+        data["protected_snapshot"] = self.protected_snapshot
+        data["missed_slots"] = self.missed_slots
         if snapshot_name:
             data["snapshot_name"] = snapshot_name
         if snapshot_time:
@@ -664,24 +758,25 @@ class Job(BaseModel):
     # --- Security ---
 
     def _check_password_file_permissions(self):
-        """Warn if password file is readable/writable by OTHER (untrusted users).
+        """Exit EXIT_PERMISSION_ERROR if a password file is readable/writable
+        by group or other.
 
-        Group access is intentionally allowed: the file is owned by the
-        service account (read) with the admin group granted write so the
-        administrator can rotate credentials. Only 'other' (any user who is
-        neither the owner nor in the group) access is a real leak.
+        The password file is a restic credential: any access beyond the owning
+        service user is a leak and must be fixed before backups proceed.
         """
         repo = self.repo_obj
         if not repo.password_file:
             return
         try:
-            stat = os.stat(repo.password_file)
-            mode = stat.st_mode
-            if mode & 0o007:
-                logger.warning(
-                    f"Password file {repo.password_file} is accessible by OTHER "
-                    f"(mode {oct(mode & 0o777)}). Restrict with: chmod o-rwx {repo.password_file}"
+            mode = os.stat(repo.password_file).st_mode
+            if mode & 0o077:
+                logger.error(
+                    f"Password file {repo.password_file} is accessible by group/other "
+                    f"(mode {oct(mode & 0o777)}). Fix with: chmod 600 {repo.password_file}"
                 )
+                sys.exit(EXIT_PERMISSION_ERROR)
+        except FileNotFoundError:
+            logger.warning(f"Password file {repo.password_file} does not exist")
         except OSError as e:
             logger.warning(f"Cannot stat password file {repo.password_file}: {e}")
 
@@ -724,6 +819,173 @@ class Job(BaseModel):
         else:
             # Overnight window (e.g., 22:00 to 06:00)
             return current_minutes >= start_minutes or current_minutes < end_minutes
+
+    # --- Repo checks (Phase 2) ---
+
+    def _probe_cmd(self, subcommand: str, repo: Repo) -> list[str]:
+        """Minimal restic command for read-only repo probes (cat/stats).
+
+        Only -r and --password-file are safe for every subcommand; repo/job
+        restic_options (e.g. --compression=better) are backup-oriented and
+        would make 'restic cat config' / 'restic stats' fail.
+        """
+        cmd = ["restic", "-r", repo.path, subcommand]
+        if repo.password_file:
+            cmd.extend(["--password-file", repo.password_file])
+        return cmd
+
+    def _check_repo_reachable(self, repo: Repo) -> bool:
+        """Probe repo reachability with 'restic cat config' (30s timeout)."""
+        try:
+            self._run(self._probe_cmd("cat", repo) + ["config"], timeout=REPO_CHECK_TIMEOUT)
+            return True
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.error(f"Repo {repo.name} unreachable: {e}")
+            return False
+
+    def _measure_repo_size(self, repo: Repo) -> int:
+        """Measure raw repo size in bytes ('restic stats --mode raw-data')."""
+        try:
+            result = self._run(
+                self._probe_cmd("stats", repo) + ["--mode", "raw-data", "--json"],
+                timeout=REPO_STATS_TIMEOUT,
+            )
+            line = result.stdout.strip().splitlines()[-1]
+            return int(json.loads(line).get("total_size", 0))
+        except Exception as e:
+            logger.warning(f"Could not measure repo {repo.name} size ({e}); assuming 0")
+            return 0
+
+    def _repo_state(self, repo: Repo) -> dict:
+        """Per-run repo check cache: reachability + size, computed once per repo."""
+        if self.repo_state is None:
+            self.repo_state = {}
+        state = self.repo_state.setdefault(
+            repo.name, {"reachable": None, "size": None, "allocated": False}
+        )
+        if state["reachable"] is None:
+            state["reachable"] = self._check_repo_reachable(repo)
+            state["size"] = self._measure_repo_size(repo) if state["reachable"] else None
+        return state
+
+    def _bump_repo_size(self, repo: Repo, used_bytes: int):
+        """Reflect freshly-uploaded bytes in the cached repo size estimate.
+
+        SPEC Phase 3 step 6: "subtract actual backup size used from
+        repo_available_space". We cache used size (available = size_limit - size),
+        so uploads grow the cached size by the bytes written.
+        """
+        if self.repo_state is None:
+            return
+        state = self.repo_state.get(repo.name)
+        if state and state.get("size") is not None:
+            state["size"] = state["size"] + used_bytes
+
+    # --- Phase 2 planning / delayed-job handling ---
+
+    def _candidate_snapshot(self) -> Path | None:
+        """The snapshot a normal backup would pick (oldest within interval, else latest)."""
+        snap = self._find_oldest_snapshot_within(self.backup_interval)
+        if snap is None:
+            try:
+                snap = self._get_latest_snapshot()
+            except (ValueError, OSError):
+                snap = None
+        return snap
+
+    def _select_snapshot_for_backup(self) -> Path | None:
+        return self._candidate_snapshot()
+
+    def _time_for_backup(self) -> bool:
+        """True when backup_interval has elapsed since the last success."""
+        t = self._time_since_last_success()
+        if t is None:
+            return True
+        return t >= self.backup_interval
+
+    def _delay(self, reason: str):
+        """Mark this job as delayed (SPEC §Delayed Job Handling)."""
+        if not self.delayed:
+            cand = self._candidate_snapshot()
+            self.protected_snapshot = cand.name if cand else None
+        self.delayed = True
+        self.delayed_reason = reason
+        self.missed_slots += 1
+        self.backup_planned = False
+        self._write_status(
+            "delayed",
+            f"{reason}: {self.protected_snapshot or 'no snapshot'}",
+            snapshot_name=self.protected_snapshot,
+        )
+
+    def _load_delayed_state(self):
+        """Load persisted delayed/missed_slots state from the status file."""
+        data = self._get_last_status()
+        if not data:
+            return
+        try:
+            self.missed_slots = int(data.get("missed_slots") or 0)
+        except (TypeError, ValueError):
+            self.missed_slots = 0
+        if data.get("status") == "delayed":
+            self.delayed = True
+            self.delayed_reason = data.get("delayed_reason")
+            self.protected_snapshot = data.get("protected_snapshot")
+
+    def _plan(self) -> str:
+        """Phase 2 planning. Returns 'backup' or 'skip'.
+
+        Sets backup_planned/planned_snapshot and the delayed group. Repo
+        reachability and size checks are fresh per run, cached in repo_state.
+        """
+        repo = self.repo_obj
+        state = self._repo_state(repo)
+        was_delayed = self.delayed
+
+        # 1. Repo reachability (once per repo per run).
+        if state.get("reachable") is False:
+            self._delay("unreachable")
+            return "skip"
+
+        # 2. Repo size limit. When a repo is over its limit, the highest-
+        #    effective-priority job using it is the one marked delayed (it
+        #    carries the protected snapshot / retry duty); the remaining jobs
+        #    are skipped (not delayed) and accumulate missed_slots.
+        if repo.size_limit > 0 and (state.get("size") or 0) >= repo.size_limit:
+            if state.get("allocated"):
+                self.missed_slots += 1
+                self.backup_planned = False
+                self.skip_reason = "repo over size_limit (higher-priority job running)"
+                return "skip"
+            state["allocated"] = True
+            self._delay("size_limit")
+            return "skip"
+
+        # 3. Backup window + time-for-backup planning.
+        if not self._is_within_backup_window():
+            self.backup_planned = False
+            self.skip_reason = "outside backup window"
+            return "skip"
+
+        if self._time_for_backup():
+            if was_delayed:
+                self.missed_slots += 1
+            self.delayed = False
+            self.delayed_reason = None
+            self.protected_snapshot = None
+            self.backup_planned = True
+            self.planned_snapshot = None
+            return "backup"
+
+        if was_delayed and self.protected_snapshot:
+            # Not time yet — retry the exact protected snapshot.
+            self.backup_planned = True
+            self.planned_snapshot = Path(self.snapshot_dir) / self.protected_snapshot
+            return "backup"
+
+        self.backup_planned = False
+        self.skip_reason = "not time for backup"
+        return "skip"
 
     # --- Command execution ---
 
@@ -857,6 +1119,10 @@ class Job(BaseModel):
     def _forget_and_prune(self, repo: Repo | None = None):
         """Apply retention policy via forget + prune."""
         if not self.backup_retention:
+            logger.warning(
+                f"Job {self.name}: backup_retention is empty — no restic "
+                f"forget/prune will run; remote snapshots are kept forever."
+            )
             return
         cmd = self._build_restic_cmd("forget", repo)
         cmd.extend(["--tag", self.tag_arg])
@@ -870,7 +1136,11 @@ class Job(BaseModel):
 
         Supports exponential and datetimes (calendar-based) retention.
         The protected snapshot (currently being backed up) is never deleted.
+        Never deletes in dry-run mode.
         """
+        if self.dry_run:
+            logger.info(f"Job {self.name}: dry-run — skipping snapshot cleanup")
+            return
         cfg = self.snapshot_retention
         if not cfg or cfg.get("fn") not in RETENTION_FN:
             return
@@ -967,8 +1237,9 @@ class Job(BaseModel):
         mtime to stuck-process detection.
         """
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        self.status_file.touch()
-        logger.info(f"Job {self.name}: status file touched")
+        if not self.dry_run:
+            self.status_file.touch()
+            logger.info(f"Job {self.name}: status file touched")
 
         mount_point = self.mount_point
         try:
@@ -1007,6 +1278,14 @@ class Job(BaseModel):
         backup_time = time.time() - backup_start
 
         self._update_repo_throughput(selected_repo, total_size, backup_time)
+
+        # On success the delayed group resets (SPEC §Delayed Job Handling) and
+        # the uploaded bytes are reflected in the cached repo size estimate.
+        self.delayed = False
+        self.delayed_reason = None
+        self.protected_snapshot = None
+        self.missed_slots = 0
+        self._bump_repo_size(selected_repo, total_size)
 
         snap_time = self._parse_snapshot_time(snapshot_path)
         message = (
@@ -1048,17 +1327,21 @@ class Job(BaseModel):
         self.repo_obj.throughput_mbps = self._seed_repo_throughput(self.repo_obj)
         self._check_stale_tmp()
         # Read the previous run's status BEFORE overwriting it with "started";
-        # otherwise the failed-backup retry below could never trigger.
+        # otherwise the failed-backup retry / delayed-state load below could
+        # never trigger.
+        self._load_delayed_state()
         last_status = self._get_last_status()
         self._write_status("started", "Backup initiated")
 
-        # 0. Create a snapshot on schedule — independent of backup success, so
-        #    fresh installs self-start and long backups don't stall cadence.
+        # Phase 4 (executed first for cadence): create a snapshot on schedule,
+        # independent of backup success, so fresh installs self-start and long
+        # backups don't stall cadence. The 12h minimum age guarantees this new
+        # snapshot is never selected for a backup in this same run.
         if self.snapshot_due:
             self.create_snapshot()
 
         try:
-            # 1. Check for failed backup from previous run
+            # 1. Retry a failed backup from a previous run (same snapshot).
             if last_status and last_status.get("status") == "failed":
                 failed_snapshot_name = last_status.get("snapshot_name")
                 if failed_snapshot_name:
@@ -1073,37 +1356,26 @@ class Job(BaseModel):
                 self._write_status("skipped", "Previous backup failed (no snapshot info)")
                 return {"job": self.name, "status": "skipped"}
 
-            # 2. Check if it's time to backup
-            time_since = self._time_since_last_success()
-            if time_since is not None and time_since < self.backup_interval:
-                logger.info(f"Job {self.name}: {time_since:.0f}s since last backup "
-                            f"(interval: {self.backup_interval}s). Skipping backup, running cleanup.")
-                self._cleanup_snapshots()
-                self._write_status("skipped", "Not time for backup yet")
+            # 2. Phase 2 planning (window, time, repo checks, delay recovery).
+            plan = self._plan()
+
+            if plan == "skip":
+                if self.delayed:
+                    # Delayed jobs already wrote their status in _delay(); the
+                    # persisted state from a prior run needs no rewrite.
+                    return {"job": self.name, "status": "delayed",
+                            "delayed_reason": self.delayed_reason}
+                self._write_status("skipped", (self.skip_reason or "not time for backup").capitalize())
                 return {"job": self.name, "status": "skipped"}
 
-            # 3. Check if within backup window
-            if not self._is_within_backup_window():
-                logger.info(f"Job {self.name}: outside backup window "
-                            f"({self.backup_window_start}-{self.backup_window_end}). Skipping backup.")
-                self._cleanup_snapshots()
-                self._write_status("skipped", "Outside backup window")
-                return {"job": self.name, "status": "skipped"}
-
-            # 4. Time to backup — find oldest snapshot within interval
-            snapshot_path = self._find_oldest_snapshot_within(self.backup_interval)
+            # 3. Phase 3 execution — select snapshot, then back up.
+            snapshot_path = self.planned_snapshot or self._select_snapshot_for_backup()
             if snapshot_path is None:
-                # Fall back to latest snapshot if none within interval
-                try:
-                    snapshot_path = self._get_latest_snapshot()
-                except (ValueError, OSError) as e:
-                    logger.warning(f"Job {self.name}: cannot find snapshot: {e}")
-                    self._write_status("skipped", f"No snapshot found: {e}")
-                    return {"job": self.name, "status": "skipped"}
+                self._write_status("skipped", "No snapshot found")
+                return {"job": self.name, "status": "skipped"}
 
-            # Refuse to back up snapshots younger than the minimum age. This is
-            # a graceful skip, not a failure: the snapshot will be picked up on
-            # a later run (e.g. the fresh-install case where we just created it).
+            # Safety rule: never back up a snapshot newer than 12 hours old.
+            # A graceful skip, not a failure — picked up on a later run.
             if self._snapshot_too_young(snapshot_path):
                 logger.info(f"Job {self.name}: snapshot {snapshot_path.name} is younger than "
                             f"{DEFAULT_SNAPSHOT_AGE_MIN}s; deferring to a later run.")
@@ -1112,6 +1384,12 @@ class Job(BaseModel):
                     f"Snapshot {snapshot_path.name} younger than {DEFAULT_SNAPSHOT_AGE_MIN}s",
                 )
                 return {"job": self.name, "status": "skipped"}
+
+            # If the window closed between planning and execution, the slot is
+            # missed (EXIT_PERM_TIMEOUT) rather than forced through.
+            if not self._is_within_backup_window():
+                self._write_status("skipped", "Backup window closed before backup could run")
+                return {"job": self.name, "status": "skipped", "timeout": True}
 
             return self._backup_snapshot(snapshot_path)
         finally:
@@ -1128,18 +1406,20 @@ class SnapBakConfig(BaseModel):
     jobs: list[Job]
     mount_base: str = "/bak"
     stuck_threshold: int = Field(default=DEFAULT_STUCK_THRESHOLD, ge=1)
+    stuck_wait: int = Field(default=DEFAULT_STUCK_WAIT, ge=1)
     restic_update: str = "never"
 
     def __init__(self, **data):
-        known_keys = {'repos', 'jobs', 'mount_base', 'stuck_threshold', 'restic_update'}
+        known_keys = {'repos', 'jobs', 'mount_base', 'stuck_threshold',
+                      'stuck_wait', 'restic_update'}
         unknown = set(data.keys()) - known_keys
         if unknown:
             warnings.warn(f"Unknown config keys: {unknown}")
         super().__init__(**data)
 
-    @field_validator('stuck_threshold', mode='before')
+    @field_validator('stuck_threshold', 'stuck_wait', mode='before')
     @classmethod
-    def _parse_stuck_threshold(cls, v):
+    def _parse_stuck(cls, v):
         return parse_duration(v)
 
     @field_validator('restic_update')
@@ -1242,6 +1522,15 @@ def _run_restic_update() -> None:
         )
 
 
+def _effective_priority(job: Job) -> int:
+    """Priority with delay escalation: priority × (missed_slots + 1).
+
+    A delayed job's effective priority rises each missed slot, so the same job
+    keeps winning the allocation when its repo is over the size limit.
+    """
+    return job.priority * (job.missed_slots + 1)
+
+
 def _main_impl():
     parser = argparse.ArgumentParser(
         description="Btrfs Snapshot -> Restic Backup Orchestrator",
@@ -1290,24 +1579,49 @@ def _main_impl():
         logger.error(f"Mount base {mount_base} does not exist")
         sys.exit(EXIT_MOUNT_ERROR)
 
-    # Check password file permissions before lock (just warnings)
+    # Phase 1: restic cache dir. Restic recreates it, so a missing dir is a
+    # warning, not a fatal config error.
+    cache_dir = os.environ.get("RESTIC_CACHE_DIR", "/opt/snap-bak/cache")
+    if not os.path.isdir(cache_dir):
+        logger.warning(f"Restic cache dir {cache_dir} does not exist (restic will create it)")
+
+    # Phase 1: password file permissions are a hard gate (exit 4).
     for job in jobs:
         job._check_password_file_permissions()
 
     # Acquire global lock to prevent multiple snap-bak instances
-    lock_fh = acquire_global_lock(config.stuck_threshold)
+    lock_fh = acquire_global_lock(config.stuck_threshold, config.stuck_wait)
     try:
-        results = []
+        # Load persisted delayed/missed_slots state for effective-priority
+        # ordering, and share one per-run repo-state cache across jobs.
         for job in jobs:
+            job._load_delayed_state()
+        repo_state: dict = {}
+        for job in jobs:
+            job.repo_state = repo_state
+
+        # Priority system: effective_priority = priority × (missed_slots + 1).
+        ordered = sorted(jobs, key=_effective_priority, reverse=True)
+
+        results = []
+        for job in ordered:
             job.dry_run = args.dry_run
             result = job.run()
             results.append(result)
             # Update heartbeat to show we're still alive
             touch_global_lock()
 
-        failed = [r for r in results if r.get("status") == "failed"]
-        if failed:
-            sys.exit(EXIT_ERROR)
+        # Exit codes for monitoring: permanent failures beat temporary delays.
+        statuses = [r.get("status") for r in results]
+        if "failed" in statuses:
+            sys.exit(EXIT_PERM_FAILED)
+        if any(r.get("timeout") for r in results):
+            sys.exit(EXIT_PERM_TIMEOUT)
+        if any(r.get("status") == "delayed" and r.get("delayed_reason") == "unreachable"
+               for r in results):
+            sys.exit(EXIT_TEMP_UNREACHABLE)
+        if any(r.get("status") == "delayed" for r in results):
+            sys.exit(EXIT_TEMP_SIZE_LIMIT)
         # restic_update='after': update only when a backup actually completed
         # this run (never on skipped/dry-run/failed runs).
         if _restic_update_due(results, config.restic_update):

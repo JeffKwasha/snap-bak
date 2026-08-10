@@ -18,7 +18,7 @@ Validation → Planning → Execution
 Backup from OLD snapshots (≥12 hours old). A future goal is to pick snapshots to minimize churn - avoid backing up a snapshot in the middle of active changes.
 If a backup is delayed, the source snapshot is protected simply by being referenced in the status file.
 A systemd timer invocation is one run. All size checks and state are fresh at start, cached during the run.
-Simple process flow, one code path - DRY
+Simplicity is a requirement: backups are critical infrastructure, and complex systems fail unpredictably. The flow must stay a single, simple code path (KISS/DRY).
 
 ### Features
 
@@ -36,7 +36,9 @@ Check global conditions once per run. If invalid, log error and exit.
 ```
 - Config/status file(s) exist, valid syntax
 - required files and directories exist with correct owner/group/permissions
-- directories exist: Snapshot, Mount, status, restic cache
+- directories exist: Snapshot, Mount, status (restic cache is only warned about —
+  restic recreates it, so a missing cache dir is not fatal)
+- password files are not accessible by group/other (hard gate, exit 4)
 - Global Lock (prevent concurrent exec)
 ```
 
@@ -90,6 +92,18 @@ For each job with backup_planned:
      - Do NOT replan remaining jobs
      - Do NOT retry this job in this run
 ```
+
+A `failed` status persists the failing snapshot name; the next run retries that
+exact snapshot before planning (same source data, same mount, same repo). This
+failed-backup retry is separate from the delayed-job machinery: the two are
+mutually exclusive statuses, so a delayed job never takes the failed-retry path
+and vice versa. If the snapshot is gone (deleted by retention), the job skips
+gracefully instead of failing.
+
+> **Execution ordering**: although planning is described as Phase 2, a scheduled
+> snapshot is created at the very start of the run (Phase 4). This is safe
+> because the 12-hour minimum-age rule guarantees the new snapshot is never
+> backed up in the same run (see Snapshot Safety Rule).
 
 ### Phase 4: Create Snapshots (btrfs)
 
@@ -216,10 +230,10 @@ integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 | `tag` | string | job name | `[A-Za-z0-9_-]` | Restic tag override |
 | `restic_options` | list | `[]` | — | Extra restic CLI flags for this job |
 
-The orchestrator also populates runtime fields that are never read from config:
-`repos`, `mount_base`, `dry_run`, `config_path`; plus the Phase 2 planning state
-`delayed`, `protected_snapshot`, `missed_slots`, `planned_snapshot`,
-`backup_planned`.
+The planning state fields that appear in the status file — `delayed`,
+`delayed_reason`, `protected_snapshot`, `missed_slots` — are part of the
+program's interface: they are persisted in the status file and never read from
+config.
 
 `restic_options` on both Repo and Job are appended verbatim to restic
 command lines (repo options first, then job options). Flags snap-bak manages
@@ -313,15 +327,15 @@ A job is delayed when:
 
 ### Delay State
 
-```python
-def delay(self, snapshot_name: str, reason: str):
-    """Mark this job as delayed."""
-    self.delayed = True
-    self.delayed_reason = reason
-    self.protected_snapshot = snapshot_name
-    self.missed_slots += 1
-    self._write_status("delayed", f"{reason}: {snapshot_name}",
-                       snapshot_name=snapshot_name)
+Delaying a job: mark it delayed with a reason, protect the source snapshot,
+increment `missed_slots`, and record a `delayed` status naming the snapshot.
+
+```
+delay(snapshot, reason):
+    mark job delayed (reason)
+    protect snapshot
+    missed_slots += 1
+    write status "delayed", snapshot = snapshot
 ```
 
 ### Delayed Recovery Flow
@@ -329,26 +343,20 @@ def delay(self, snapshot_name: str, reason: str):
 On next run, during planning phase:
 
 ```
-was_delayed = self.delayed
+was_delayed = job was delayed last run
 
-if self._time_for_backup():
-    # Time for new backup — delayed state is stale
-    if was_delayed:
-        self.missed_slots += 1
-    self.delayed = False
-    self.protected_snapshot = None
-    # Select snapshot normally (OLD one)
-    self.backup_planned = True
+if time for a new backup:
+    if was_delayed: missed_slots += 1
+    clear delayed state (delayed=false, protected_snapshot=null)
+    select an OLD snapshot normally
+    plan backup
 
-elif was_delayed and self.protected_snapshot:
-    # Not time yet — retry the delayed backup
-    # Use exact same snapshot (same source data, same mount, same repo)
-    self.planned_snapshot = Path(self.snapshot_dir) / self.protected_snapshot
-    self.backup_planned = True
+else if was_delayed and protected_snapshot still exists:
+    plan backup of the exact same protected snapshot
+    (same source data, same mount, same repo)
 
 else:
-    # Not time, not delayed — skip
-    self.backup_planned = False
+    plan skip (no backup this run)
 ```
 
 ### Protected Snapshot Lifecycle
@@ -413,10 +421,6 @@ B runs first (400), then C (200), then A (100).
 
 **Never backup a snapshot newer than 12 hours old.**
 
-```python
-assert (datetime.now(timezone.utc) - snapshot_time).total_seconds() >= 12 * 3600
-```
-
 A snapshot younger than 12 hours is skipped (never failed), so a snapshot just
 created by the scheduler is only uploaded after it has had time to be noticed
 and reviewed.
@@ -446,19 +450,19 @@ Prevents multiple snap-bak instances from running simultaneously.
 
 ### Implementation
 
-- Lock file: `/opt/snap-bak/state/snap-bak.lock`
-- Uses `fcntl.flock(LOCK_EX | LOCK_NB)`
-- Lock file contains JSON with PID, job info, timestamps
-- Stuck detection: if lock age > `stuck_threshold` (default 3600s):
-  - If the locked PID no longer exists: break the lock, warn, continue
-  - If the locked PID exists: re-check periodically (every 60s) until the lock
-    clears or `stuck_wait` seconds total have elapsed
-  - If the lock releases (old process exits): continue normally
-  - If `stuck_wait` is exceeded: log STUCK WAIT EXCEEDED and exit `EXIT_STUCK_WAIT` (51)
+- Lock file: `<state>/snap-bak.lock`, an advisory `flock` (`LOCK_EX|LOCK_NB`).
+  Records the holder PID and timestamps for stuck detection.
+- `stuck_threshold` (config, default 3600s): lock age beyond which the holder
+  is considered stuck.
+- `stuck_wait` (config, default 300s): total time to keep re-checking a stuck
+  lock before giving up.
+- Stuck handling: if the holder PID no longer exists, break the lock and
+  continue. If it still exists, poll (fixed 60s interval) until the lock clears
+  or `stuck_wait` elapses; if `stuck_wait` is exceeded, exit `EXIT_STUCK_WAIT` (51).
 
-The global lock is the only lock. There is deliberately no per-job lock: it
-would duplicate the global lock's job (preventing concurrent instances) for no
-additional protection, so it was removed for simplicity.
+The global lock is the only lock — there is deliberately **no per-job lock**.
+Concurrent snap-bak instances are prevented solely by the global lock; a
+per-job lock would add complexity without additional protection.
 
 ---
 
@@ -604,7 +608,6 @@ come only from root-owned config.
 
 - pytest (tmp_path / monkeypatch fixtures; `SNAPBAK_STATE_DIR` redirected in
   `conftest.py` so no state leaks into the real system)
-- 111 tests, all passing
 
 ### Test Categories
 
@@ -615,8 +618,6 @@ come only from root-owned config.
 - Build snapshot keeplist
 - Datetimes cleanup integration
 - Pydantic validation
-- Repo model properties
-- Job model properties
 - Snapshot selection
 - Repo throughput learning
 - Restic option filtering / reserved-flag rejection
