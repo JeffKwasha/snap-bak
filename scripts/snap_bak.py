@@ -28,6 +28,7 @@ import json
 import json5
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -73,6 +74,62 @@ def load_config_json(text: str) -> dict:
     switch to strict JSON would only mean removing this one call.
     """
     return json5.loads(text)
+
+
+# --- Human-readable quantities ---
+# Duration/size config fields accept a bare int (seconds/bytes) or a
+# human-readable string such as '90m', '2h', '1w' or '200GB'. Parsing is
+# lenient about whitespace and case; unknown units raise so config typos are
+# caught loudly rather than silently misread.
+
+_DURATION_UNITS = {
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+    "w": 604800,
+}
+
+_SIZE_UNITS = {
+    "b": 1,
+    "k": 1024, "kb": 1024, "kib": 1024,
+    "m": 1024**2, "mb": 1024**2, "mib": 1024**2,
+    "g": 1024**3, "gb": 1024**3, "gib": 1024**3,
+    "t": 1024**4, "tb": 1024**4, "tib": 1024**4,
+    "p": 1024**5, "pb": 1024**5, "pib": 1024**5,
+}
+
+
+def _parse_quantity(value, units: dict, what: str) -> int:
+    """Accept an int or a '<number><unit>' string; return the base-unit int."""
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"{what} must be an integer or a human-readable value")
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"{what} must be an integer or a human-readable value")
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([a-z]*)\s*", value, re.IGNORECASE)
+    if not m:
+        raise ValueError(
+            f"{what}: cannot parse {value!r} "
+            f"(expected int or e.g. '90m', '2h', '200GB')"
+        )
+    unit = m.group(2).lower()
+    if unit == "":
+        return int(float(m.group(1)))
+    if unit not in units:
+        raise ValueError(f"{what}: unknown unit {unit!r} in {value!r}")
+    return int(float(m.group(1)) * units[unit])
+
+
+def parse_duration(value) -> int:
+    """Parse a duration: bare int seconds or e.g. '90m', '2h', '1w'."""
+    return _parse_quantity(value, _DURATION_UNITS, "duration")
+
+
+def parse_size(value) -> int:
+    """Parse a size: bare int bytes or e.g. '200GB', '1.5TiB'."""
+    return _parse_quantity(value, _SIZE_UNITS, "size")
 
 
 # --- Error codes ---
@@ -324,6 +381,11 @@ class Repo(BaseModel):
     throughput_mbps: int = Field(default=1, ge=0)
     restic_options: list = Field(default_factory=list)
 
+    @field_validator('size_limit', mode='before')
+    @classmethod
+    def _parse_size_limit(cls, v):
+        return parse_size(v)
+
 
 # --- Job model ---
 
@@ -348,6 +410,11 @@ class Job(BaseModel):
     timeout: int = Field(default=DEFAULT_TIMEOUT, ge=1)
     tag: str | None = None
     restic_options: list = Field(default_factory=list)
+
+    @field_validator('snapshot_interval', 'backup_interval', 'timeout', mode='before')
+    @classmethod
+    def _parse_interval(cls, v):
+        return parse_duration(v)
 
     # Runtime fields (not from config)
     repos: list = Field(default_factory=list, exclude=True)
@@ -462,7 +529,10 @@ class Job(BaseModel):
             if data.get("status") == "success":
                 ts = data["timestamp"]
                 if "T" in ts:
-                    return datetime.fromisoformat(ts)
+                    last = datetime.fromisoformat(ts)
+                    if last.tzinfo is None:
+                        last = last.replace(tzinfo=timezone.utc)
+                    return last
                 return datetime.strptime(ts, "%Y-%m-%d_%H:%M").replace(tzinfo=timezone.utc)
         except (json.JSONDecodeError, KeyError, ValueError):
             pass
@@ -626,7 +696,8 @@ class Job(BaseModel):
         """Check if current time is within the backup window.
 
         Supports overnight windows (e.g., start="22:00", end="06:00"
-        means 22:00-23:59 and 00:00-06:00).
+        means 22:00-23:59 and 00:00-06:00). Times are compared in the
+        server's local timezone.
 
         If no window is configured, returns True (backups always allowed).
         """
@@ -640,7 +711,7 @@ class Job(BaseModel):
             logger.warning(f"Job {self.name}: invalid backup window format, ignoring")
             return True
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now()
         current_minutes = now.hour * 60 + now.minute
         start_minutes = start_h * 60 + start_m
         end_minutes = end_h * 60 + end_m
@@ -1063,6 +1134,11 @@ class SnapBakConfig(BaseModel):
         if unknown:
             warnings.warn(f"Unknown config keys: {unknown}")
         super().__init__(**data)
+
+    @field_validator('stuck_threshold', mode='before')
+    @classmethod
+    def _parse_stuck_threshold(cls, v):
+        return parse_duration(v)
 
     @field_validator('restic_update')
     @classmethod

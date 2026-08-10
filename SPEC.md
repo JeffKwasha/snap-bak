@@ -10,7 +10,7 @@ Frequent snapshots instantly protect against accidents while older (known good) 
 
 - snap-bak is the exclusive authority for snapshot and backup management.
 - Only snapshots matching snap-bak's expected format and directory are managed; all others are ignored.
-- All datetimes in snap-bak are GMT/UTC.
+- All datetimes in snap-bak are GMT/UTC, except the `backup_window_start`/`backup_window_end` times, which are interpreted in the server's local timezone.
 
 ### Design Principles
 
@@ -201,7 +201,8 @@ Override: `-c/--config` flag or `SNAPBAK_CONFIG_FILE` env var
   "repos": [Repo],
   "jobs": [Job],
   "mount_base": "/bak",
-  "stuck_wait": 300,            // how long to sleep between checking global lock
+  "stuck_threshold": "1h",        // int seconds or human-readable duration
+  "stuck_wait": 300,              // how long to sleep between checking global lock
   "restic_update": "never"
 }
 ```
@@ -219,7 +220,7 @@ update before knowing whether any backup will happen.
   "name": "undefined",
   "path": "",
   "password_file": "/home/user/.restic_password",
-  "size_limit": 0,
+  "size_limit": "200GB",
   "latency_ms": 100,
   "throughput_mbps": 1,
   "restic_options": ["--compression=better"]
@@ -231,7 +232,7 @@ update before knowing whether any backup will happen.
 | `name` | string | required | Unique repo identifier |
 | `path` | string | required | Restic repo path (e.g., `rclone:CONFIG_ENTRY:DIRECTORY`) |
 | `password_file` | string | "" | Path to restic password file |
-| `size_limit` | int | 0 | Max repo size in bytes (0 = unlimited) |
+| `size_limit` | int/string | 0 | Max repo size (0 = unlimited). Int bytes or e.g. `"200GB"` |
 | `latency_ms` | int | 100 | Estimated latency for ETA calculation |
 | `throughput_mbps` | int | 1 | Estimated throughput for ETA calculation (seeding hint) |
 | `restic_options` | list | `[]` | Extra restic CLI flags for every command against this repo |
@@ -245,15 +246,15 @@ update before knowing whether any backup will happen.
   "source_subvolume": "srv/web",
   "repo": "primary",
   "priority": 100,
-  "snapshot_interval": 3600,
+  "snapshot_interval": "2h",
   "backup_retention": {"daily": 6, "monthly": 4, "yearly": 2},
   "snapshot_retention": {"fn": "exponential", "config": {"n": 5}},
-  "backup_interval": 3600,
+  "backup_interval": "1w",
   "backup_window_start": "22:00",
   "backup_window_end": "06:00",
   "ignore_file": "/opt/snap-bak/excludes/data.ignore",
   "excludes": ["*.tmp", "*.cache", ".DS_Store"],
-  "timeout": 7200,
+  "timeout": "24h",
   "tag": "data",
   "restic_options": []
 }
@@ -266,15 +267,15 @@ update before knowing whether any backup will happen.
 | `source_subvolume` | string | required | — | Btrfs subvolume to snapshot; mount point = `<mount_base>/<last component>` |
 | `repo` | string | required | must reference repo.name | Repo to backup to |
 | `priority` | int | `100` | `ge=1` | Job priority (higher = more important) |
-| `snapshot_interval` | int | `3600` | `ge=900` | Seconds between snapshot creation |
+| `snapshot_interval` | int/string | `3600` | `ge=900` | Seconds between snapshots, or e.g. `"2h"` |
 | `backup_retention` | dict | `{}` | — | Restic retention policy (e.g., `{"daily": 6}`) |
 | `snapshot_retention` | dict | `{"fn":"exponential","config":{"n":5}}` | — | Local snapshot retention strategy |
-| `backup_interval` | int | `3600` | `ge=1` | Seconds between backups |
-| `backup_window_start` | string | `null` | `HH:MM` format | Backup window start (optional) |
+| `backup_interval` | int/string | `3600` | `ge=1` | Seconds between backups, or e.g. `"1w"` |
+| `backup_window_start` | string | `null` | `HH:MM` format | Backup window start (optional); interpreted in the server's LOCAL timezone |
 | `backup_window_end` | string | `null` | `HH:MM` format | Backup window end (optional) |
 | `ignore_file` | string | `""` | — | Restic exclude-from file |
 | `excludes` | list | `[]` | — | Restic exclude patterns |
-| `timeout` | int | `86400` | `ge=1` | Subprocess timeout in seconds |
+| `timeout` | int/string | `86400` | `ge=1` | Subprocess timeout: seconds or e.g. `"24h"` |
 | `tag` | string | job name | `[A-Za-z0-9_-]` | Restic tag override |
 | `restic_options` | list | `[]` | — | Extra restic CLI flags for this job |
 
@@ -301,6 +302,11 @@ class Repo(BaseModel):
     latency_ms: int = Field(default=100, ge=0)
     throughput_mbps: int = Field(default=1, ge=0)
     restic_options: list = Field(default_factory=list)
+
+    @field_validator('size_limit', mode='before')
+    @classmethod
+    def _parse_size_limit(cls, v):
+        return parse_size(v)  # int bytes or e.g. '200GB'
 ```
 
 ### Job
@@ -326,6 +332,11 @@ class Job(BaseModel):
     timeout: int = Field(default=86400, ge=1)
     tag: str | None = None
     restic_options: list = Field(default_factory=list)
+
+    @field_validator('snapshot_interval', 'backup_interval', 'timeout', mode='before')
+    @classmethod
+    def _parse_interval(cls, v):
+        return parse_duration(v)  # int seconds or e.g. '2h', '1w'
 
     # Runtime fields (not from config)
     repos: list = Field(default_factory=list, exclude=True)
@@ -353,7 +364,16 @@ class SnapBakConfig(BaseModel):
     stuck_threshold: int = Field(default=3600, ge=1)
     restic_update: str = "never"  # 'after' | 'never'
     stuck_wait: int = Field(default=300, ge=1)
+
+    @field_validator('stuck_threshold', mode='before')
+    @classmethod
+    def _parse_stuck_threshold(cls, v):
+        return parse_duration(v)  # int seconds or e.g. '1h'
 ```
+
+Duration/size strings are parsed by `parse_duration` / `parse_size`
+(units `s m h d w` and `b k/kb/kib m/mb/mib g/gb/gib t/tb/tib p/pb/pib`,
+binary multiples). Bare integers pass through unchanged.
 
 ---
 

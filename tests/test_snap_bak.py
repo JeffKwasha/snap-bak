@@ -32,6 +32,8 @@ from scripts.snap_bak import (
     build_retention_exponential,
     build_snapshot_keeplist,
     load_config,
+    parse_duration,
+    parse_size,
     Snapshot,
 )
 
@@ -746,6 +748,70 @@ class TestResticUpdateGate:
 
     def test_not_due_when_empty(self):
         assert not _restic_update_due([], "after")
+
+
+class TestHumanReadableQuantities:
+    """Duration/size fields accept ints or strings like '2h', '1w', '200GB'."""
+
+    def test_parse_duration_units(self):
+        assert parse_duration("90m") == 5400
+        assert parse_duration("2h") == 7200
+        assert parse_duration("1w") == 604800
+        assert parse_duration("1d") == 86400
+        assert parse_duration("2H") == 7200
+        assert parse_duration(" 2 h ") == 7200
+
+    def test_parse_duration_int_passthrough(self):
+        assert parse_duration(7200) == 7200
+
+    def test_parse_size_units(self):
+        assert parse_size("200GB") == 200 * 1024**3
+        assert parse_size("1.5TiB") == int(1.5 * 1024**4)
+        assert parse_size("2gib") == 2 * 1024**3
+        assert parse_size("500") == 500
+
+    def test_parse_errors(self):
+        with pytest.raises(Exception):
+            parse_duration("2x")
+        with pytest.raises(Exception):
+            parse_duration("abc")
+        with pytest.raises(Exception):
+            parse_size("many")
+        with pytest.raises(Exception):
+            parse_size(None)
+
+    def test_config_accepts_human_readable(self, tmp_path):
+        config = SnapBakConfig(
+            repos=[{"name": "primary", "path": "rclone:test", "size_limit": "200GB"}],
+            jobs=[{
+                "name": "test",
+                "snapshot_dir": str(tmp_path),
+                "source_subvolume": "data",
+                "repo": "primary",
+                "snapshot_interval": "2h",
+                "backup_interval": "1w",
+                "timeout": "90m",
+            }],
+            stuck_threshold="1h",
+        )
+        assert config.repos[0].size_limit == 200 * 1024**3
+        assert config.jobs[0].snapshot_interval == 7200
+        assert config.jobs[0].backup_interval == 604800
+        assert config.jobs[0].timeout == 5400
+        assert config.stuck_threshold == 3600
+
+    def test_config_rejects_unknown_unit(self, tmp_path):
+        with pytest.raises(Exception):
+            SnapBakConfig(
+                repos=[{"name": "primary", "path": "rclone:test"}],
+                jobs=[{
+                    "name": "test",
+                    "snapshot_dir": str(tmp_path),
+                    "source_subvolume": "data",
+                    "repo": "primary",
+                    "backup_interval": "1fortnight",
+                }],
+            )
 
 
 # --- load_config tests ---

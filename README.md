@@ -57,7 +57,7 @@ What `scripts/snap-bak-setup.sh` does:
 7. Writes `snap-bak.service` (oneshot) and `snap-bak.timer` (hourly).
 
 The timer runs hourly; restic uploads happen per-job only when
-`backup_interval` has elapsed (so weekly backups = `backup_interval: 604800`).
+`backup_interval` has elapsed (so weekly backups = `backup_interval: "1w"`).
 
 The setup script is **idempotent** — re-running it is safe: it skips the user,
 group, and existing `config.json` (so your edits are preserved), refreshes the
@@ -161,6 +161,12 @@ wrapper `snap-bak-io` (a single code path for JSONC handling). The default
 config written by `snap-bak-setup.sh` includes inline comments describing
 every field.
 
+Duration and size fields (`stuck_threshold`, `size_limit`,
+`snapshot_interval`, `backup_interval`, `timeout`) accept either a bare
+integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
+`"1w"`, `"200GB"`, `"1.5TiB"`. Units: durations `s m h d w`; sizes
+`b k/kb/kib m/mb/mib g/gb/gib t/tb/tib p/pb/pib` (binary multiples).
+
 Edit `config/config.json`:
 
 ```json
@@ -170,14 +176,14 @@ Edit `config/config.json`:
       "name": "primary",
       "path": "rclone:CONFIG_ENTRY:DIRECTORY",
       "password_file": "/opt/snap-bak/passwords/primary",
-      "size_limit": 1099511627776,
+      "size_limit": "200GB",
       "latency_ms": 50,
       "throughput_mbps": 10,
       "restic_options": ["--compression=better"]
     }
   ],
   "mount_base": "/bak",
-  "stuck_threshold": 3600,
+  "stuck_threshold": "1h",
   "restic_update": "never",
   "jobs": [
     {
@@ -186,15 +192,15 @@ Edit `config/config.json`:
       "source_subvolume": "/mnt/data",
       "repo": "primary",
       "priority": 100,
-      "snapshot_interval": 3600,
+      "snapshot_interval": "2h",
       "backup_retention": {"daily": 6, "monthly": 4, "yearly": 2},
       "snapshot_retention": {"fn": "exponential", "config": {"n": 5}},
-      "backup_interval": 3600,
+      "backup_interval": "1w",
       "backup_window_start": "22:00",
       "backup_window_end": "06:00",
       "ignore_file": "/opt/snap-bak/excludes/data.ignore",
       "excludes": ["*.tmp", "*.cache", ".DS_Store"],
-      "timeout": 86400
+      "timeout": "24h"
     }
   ]
 }
@@ -206,7 +212,7 @@ Edit `config/config.json`:
 |-------|-------------|---------|
 | `repos` | Array of restic repository definitions (required) | — |
 | `mount_base` | Base directory for mounting snapshots | `/bak` |
-| `stuck_threshold` | Seconds before a lock is considered stale | `3600` |
+| `stuck_threshold` | Stale-lock threshold: int seconds or e.g. `"1h"` | `3600` |
 | `restic_update` | When to update restic: `after` \| `never` | `never` |
 
 ### Repo settings
@@ -216,7 +222,7 @@ Edit `config/config.json`:
 | `name` | Unique repo identifier (required) | — |
 | `path` | Restic repository path (required) | — |
 | `password_file` | Path to one-line text file containing the restic password | `""` |
-| `size_limit` | Max backup size in bytes; `0` = unlimited | `0` |
+| `size_limit` | Max backup size: int bytes or e.g. `"200GB"`; `0` = unlimited | `0` |
 | `latency_ms` | Estimated latency in milliseconds (metadata) | `100` |
 | `throughput_mbps` | Estimated throughput in Mbps (seeding hint) | `1` |
 | `restic_options` | Extra restic CLI flags for every command against this repo | `[]` |
@@ -225,20 +231,20 @@ Edit `config/config.json`:
 
 | Field | Type | Description | Default |
 |-------|------|-------------|---------|
-| `name` | string | Job display name (required). Free-form; does NOT control the mount point | — |
+| `name` | string | Job id (required); must be filesystem-safe (`[A-Za-z0-9_-]`, no `/` or `..`). Does NOT control the mount point | — |
 | `snapshot_dir` | string | Directory containing Btrfs snapshots (required) | — |
 | `source_subvolume` | string | Btrfs subvolume to snapshot (required) | — |
 | `repo` | string | Name of repo to use (must match `repos[].name`) | — |
 | `priority` | int | Job priority (higher = more important) | `100` |
-| `snapshot_interval` | int | Seconds between snapshots (min 900) | `3600` |
+| `snapshot_interval` | int/str | Seconds between snapshots (min 900) or e.g. `"2h"` | `3600` |
 | `backup_retention` | dict | Restic forget/keep policy (e.g., `{"daily": 6}`) | `{}` |
 | `snapshot_retention` | dict | Local snapshot retention strategy | `{"fn":"exponential","config":{"n":5}}` |
-| `backup_interval` | int | Minimum seconds between backups | `3600` |
+| `backup_interval` | int/str | Minimum seconds between backups or e.g. `"1w"` | `3600` |
 | `backup_window_start` | string | Start of allowed backup window (HH:MM) | `null` |
 | `backup_window_end` | string | End of allowed backup window (HH:MM, exclusive) | `null` |
 | `ignore_file` | string | Path to file with exclude patterns | `""` |
 | `excludes` | list | List of glob patterns to exclude | `[]` |
-| `timeout` | int | Command timeout in seconds | `86400` |
+| `timeout` | int/str | Command timeout: seconds or e.g. `"24h"` | `86400` |
 | `tag` | string | Restic tag override for this job's backups/forget | job name |
 | `restic_options` | list | Extra restic CLI flags for this job | `[]` |
 

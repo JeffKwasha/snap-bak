@@ -139,7 +139,8 @@ else
 {
   // Top-level settings
   //   mount_base      : where read-only snapshots get mounted before backup (string)
-  //   stuck_threshold : seconds after which a 'running' lock is considered stuck (int)
+  //   stuck_threshold : seconds after which a 'running' lock is considered stuck
+  //                     (int seconds or e.g. '1h')
   //   restic_update   : when to update restic via the root wrapper. 'after' =
   //                     update restic only after a run in which a backup actually
   //                     completed (never on skipped/dry-run runs — updating a
@@ -157,7 +158,8 @@ else
       //   name           : unique repo id referenced by a job's 'repo'  (string)
       //   path           : restic location; local path or 'rclone:REMOTE:DIR'  (string)
       //   password_file  : file containing the restic repo password  (string)
-      //   size_limit     : stop when repo hits this many bytes; 0 = unlimited  (int)
+      //   size_limit     : stop when repo hits this many bytes; accepts int bytes
+      //                     or e.g. '200GB'; 0 = unlimited  (int|string)
       //   latency_ms     : expected repo latency, scheduling hint  (int ms)
       //   throughput_mbps: expected repo throughput, scheduling hint  (int)
       //   restic_options : extra restic CLI flags for every command against this repo.
@@ -184,18 +186,19 @@ else
       // source_subvolume : btrfs subvolume to snapshot  (string)
       // repo             : repo id from the repos list  (string)
       // priority         : scheduling order, higher = earlier  (int >= 1)
-      // snapshot_interval: seconds between snapshots, min 900  (seconds)
+      // snapshot_interval: interval between snapshots, min 900s
+      //                     (int seconds or e.g. '2h')
       // snapshot_retention: how long to keep LOCAL snapshots;
       //                     fn = exponential|datetimes; see SPEC.md for config
       // backup_retention : restic forget/prune keep-policy;
       //                     keys: last, hourly, daily, weekly, monthly, yearly
-      // backup_interval  : seconds between restic uploads; 604800 = weekly  (seconds)
-      // backup_window_start/end: 'HH:MM' UTC time window backups run in; omit any
+      // backup_interval  : interval between restic uploads  (int seconds or e.g. '1w')
+      // backup_window_start/end: 'HH:MM' LOCAL time window backups run in; omit any
       // ignore_file      : restic --exclude-file (gitignore-style, one pattern/line)
       // excludes         : list of restic --exclude patterns (gitignore-style)
       // tag              : optional restic tag override (default: job name)
       // restic_options   : extra restic CLI flags for this job (see repo comment)
-      // timeout          : max seconds for the restic backup step  (default 7200)
+      // timeout          : max time for the restic backup step  (int seconds or e.g. '24h')
       "name": "Home-Protection",
       "snapshot_dir": "/home/.snapshots",
       "source_subvolume": "home",
