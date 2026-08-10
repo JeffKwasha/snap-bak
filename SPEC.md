@@ -54,7 +54,7 @@ For each job:
 
    2. Check repo available space (restic stats --mode raw-data --json)
       - Fresh per run, once per repo, cached during run
-      - Store in repo_available_space
+      - Track the repo's available space for the rest of the run
       - If size_limit > 0 and repo size >= size_limit: mark job delayed (reason="size_limit")
 
    3. Check backup_window and time_for_backup (interval since last success)
@@ -81,13 +81,13 @@ For each job:
 For each job with planned backup. Never uses today's new snapshot.
 
 ```
-For each job with backup_planned:
+For each job that planned a backup:
   1. Assert snapshot is ≥12 hours old (safety check)
   2. Mount OLD snapshot read-only
   3. Preflight (restic dry-run: check connectivity, estimate size)
   4. Backup to restic (retry on failure until the next backup slot)
   5. Forget + prune (apply retention policy)
-   6. On success: subtract actual backup size used from repo_available_space; clear delayed state, reset missed_slots=0
+   6. On success: subtract actual backup size used from the repo's available space; clear delayed state, reset missed_slots=0
   7. On failure: log error, record status, continue to next job
      - Do NOT replan remaining jobs
      - Do NOT retry this job in this run
@@ -469,36 +469,33 @@ per-job lock would add complexity without additional protection.
 ## State & Runtime Directories
 
 ```
-/opt/snap-bak           # root-owned: program, wrapper, config
-  snap_bak.py           # orchestrator (root:root 0644)
-  snap-bak-io           # sudo wrapper (root:root 0755)
-  config.json           # root-owned, validated by the wrapper
+<install>                # root-owned: program, wrapper, config
+  snap_bak.py            # orchestrator (root:root 0644)
+  snap-bak-io            # sudo wrapper (root:root 0755)
+  config.json            # root-owned, validated by the wrapper
 
-/opt/snap-bak/state     # owned by snap-bak: runtime state
-  snap-bak.lock         # Global lock file
-  throughput.json       # Per-repo transfer-rate history (capped at 10/repo)
-  <job_name>_status.json  # Per-job status
+<install>/state          # owned by snap-bak: runtime state
+  snap-bak.lock          # Global lock file
+  throughput.json        # Per-repo transfer-rate history
+  <job_name>_status.json # Per-job status
 
-/opt/snap-bak/excludes  # ignore_file location (root:snap-bak)
-/opt/snap-bak/passwords # per-repo restic password files (owned by snap-bak)
-/opt/snap-bak/cache     # restic cache (RESTIC_CACHE_DIR)
+<install>/excludes       # ignore_file location (root:snap-bak)
+<install>/passwords      # per-repo restic password files (owned by snap-bak)
+<install>/cache          # restic cache (RESTIC_CACHE_DIR)
 ```
 
-The `restic` and `rclone` binaries are optional (restic may be installed at
-`/usr/local/bin/restic`; rclone only if a repo uses an `rclone:` path). No
-`.local` or `.config` directories are used; all paths are hardcoded under
-`/opt/snap-bak`.
+All paths are relative to the install directory (`<install>`, production
+`/opt/snap-bak`). The `restic` and `rclone` binaries are optional (rclone only
+if a repo uses an `rclone:` path). No `.local` or `.config` directories are
+used.
 
 ---
 
 ## Throughput History
 
-Observed transfer rates are recorded per repo in `throughput.json` (JSON
-`{"repos": {"<name>": [mbps, ...]}}`, newest-first), capped at 10 entries per
-repo. New rates seed from the median of existing entries (falling back to the
-repo's configured `throughput_mbps`). The config file itself is never
-rewritten. If the state directory is unwritable, the rate is logged and the
-run continues.
+Transfer rate statistics are kept per repo to provide stable backup time
+estimates. If the state directory is unwritable, the rate is logged and the run
+continues.
 
 ---
 
@@ -635,7 +632,9 @@ uv run pytest -q
 
 ---
 
-## Dependencies
+## Supported Platform & Dependencies
+
+snap-bak supports:
 
 - Python ≥ 3.10
 - pydantic >= 2.0 (config models)
