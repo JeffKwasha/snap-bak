@@ -3,33 +3,27 @@
 ## Overview
 
 snap-bak is a simple btrfs snapshot → restic backup orchestrator.
-It creates snapshots, and performs restic backups to efficiently manage retention with the goal being efficiency.
-Snapshots are frequent with short retention, backups are infrequent leverage week old snapshots to avoid churn, and retain for years.
-Both schedules are configurable, but backups are never made from live filesystems or the most recent snapshot.
+It creates snapshots, and performs restic backups to efficiently manage retention.
+Frequent snapshots instantly protect against accidents while older (known good) snapshots are used for weekly backups to minimize churn and extend retention.
 
 ### Constraints
 
 - snap-bak is the exclusive authority for snapshot and backup management.
-- Users SHALL NOT use any other automated snapshot management tool.
-- Users SHALL NOT run two copies of snap-bak concurrently.
-- Only snapshots matching snap-bak's expected format are managed; all others are ignored.
+- Only snapshots matching snap-bak's expected format and directory are managed; all others are ignored.
 - All datetimes in snap-bak are GMT/UTC.
 
 ### Design Principles
 
-1. **Planning separates from action**: Validation → Planning → Execution. No replanning after execution begins.
-2. **Never backup new snapshots**: Backups always use OLD snapshots (≥1 hour old). New snapshots are for future backups. This prevents persisting bad data.
-3. **Protected snapshots**: When a backup is delayed, the source snapshot is protected simply by being referenced in the status file. No special deletion logic needed.
-4. **One run = one process**: A systemd timer invocation is one run. All size checks and state are fresh at start, cached during the run.
-5. **No complex state machines**: Delayed is a flag, not a separate code path. It affects the planning decision, not the execution flow.
+Validation → Planning → Execution
+Backup from OLD snapshots (≥12 hours old). A future goal is to pick snapshots to minimize churn - avoid backing up a snapshot in the middle of active changes.
+If a backup is delayed, the source snapshot is protected simply by being referenced in the status file.
+A systemd timer invocation is one run. All size checks and state are fresh at start, cached during the run.
+Simple process flow, one code path - DRY
 
-### Protection Strategy
+### Features
 
-- Snapshots are young (hours to weeks old)
-- Offsite backups are always slightly older
-- Snapshots scheduled as a source for backup are protected
-- Backups can be configured for a time window (1am - 8am)
-- Backup size and speed are tracked to attempt to sidestep out-of-space or out-of-timewindow failures. (however a running backup will not be stopped)
+- Backups limited to a daily time window ex: 1am - 8am
+- Backup size and speed are tracked to attempt to sidestep out-of-space or running past timewindow. (however a running backup will not be stopped)
 
 ---
 
@@ -40,11 +34,10 @@ Both schedules are configurable, but backups are never made from live filesystem
 Check global conditions once per run. If invalid, log error and exit.
 
 ```
-- Config/status file(s) exist, valid syntax (pydantic)
-- Password files exist with correct permissions (warn if group/other readable)
-- Snapshot directories exist (validated by pydantic field_validator)
-- Mount base directory exists (snapshots are mounted at a static path for backup)
-- Lock acquisition (global lock prevents multiple instances)
+- Config/status file(s) exist, valid syntax
+- required files and directories exist with correct owner/group/permissions
+- directories exist: Snapshot, Mount, status, restic cache
+- Global Lock (prevent concurrent exec)
 ```
 
 ### Phase 2: Plan & Prepare (implicit)
@@ -87,7 +80,7 @@ For each job with planned backup. Never uses today's new snapshot.
 
 ```
 For each job with backup_planned:
-  1. Assert snapshot is ≥1 hour old (safety check)
+  1. Assert snapshot is ≥12 hours old (safety check)
   2. Mount OLD snapshot read-only
   3. Preflight (restic dry-run: check connectivity, estimate size)
   4. Backup to restic (retry on failure until the next backup slot)
@@ -100,7 +93,7 @@ For each job with backup_planned:
 
 ### Phase 4: Create Snapshots (btrfs)
 
-Create new btrfs snapshot of `source_subvolume` at `{snapshot_dir}/{name}` for each job, using the format `YYYY-MM-DD_HH:MM`.
+Create new btrfs snapshot of `source_subvolume` at `{snapshot_dir}/{name}` for each job
 Only one snapshot per `snapshot_interval` seconds per job.
 
 ### Phase 5: Cleanup Local Snapshots (btrfs)
@@ -187,9 +180,9 @@ def cleanup_snapshots(self:Job) -> int:
 ### Safety Constraint: Snapshot Age Assertion
 
 ```python
-assert (datetime.now(timezone.utc) - snapshot.time) > timedelta(hours=1), \
+assert (datetime.now(timezone.utc) - snapshot.time) > timedelta(hours=12), \
     f"Snapshot {snapshot_name} is too new ({snapshot_time}). " \
-    f"Backups must use snapshots >1 hour old."
+    f"Backups must use snapshots >12 hours old."
 ```
 
 ---
@@ -203,15 +196,21 @@ Override: `-c/--config` flag or `SNAPBAK_CONFIG_FILE` env var
 
 ### Config Schema
 
-```json
+```jsonc
 {
   "repos": [Repo],
   "jobs": [Job],
   "mount_base": "/bak",
-  "stuck_wait": 300
+  "stuck_wait": 300,            // how long to sleep between checking global lock
+  "restic_update": "never"
 }
 ```
-When we detect a previous run is still running, we wait stuck_wait and keep checking.
+`restic_update` (`after|never`, default `never`) controls when the privileged
+wrapper's `update-restic` op runs. `after` = update only after a run in which a
+backup actually completed (never on skipped/dry-run runs — updating restic
+rewrites a binary carrying `cap_dac_read_search`, so it must never run without
+reason). `never` = manual only. `before` is deliberately unsupported: it would
+update before knowing whether any backup will happen.
 
 ### Repo Schema
 
@@ -262,9 +261,9 @@ When we detect a previous run is still running, we wait stuck_wait and keep chec
 
 | Field | Type | Default | Constraint | Description |
 |-------|------|---------|------------|-------------|
-| `name` | string | required | — | Unique job identifier |
+| `name` | string | required | `[A-Za-z0-9_-]` | Job id; must be filesystem-safe (`<state>/<name>_status.json`, restic tag). Does NOT set the mount point |
 | `snapshot_dir` | string | required | must exist | Path to btrfs snapshot directory |
-| `source_subvolume` | string | required | — | Btrfs subvolume to snapshot |
+| `source_subvolume` | string | required | — | Btrfs subvolume to snapshot; mount point = `<mount_base>/<last component>` |
 | `repo` | string | required | must reference repo.name | Repo to backup to |
 | `priority` | int | `100` | `ge=1` | Job priority (higher = more important) |
 | `snapshot_interval` | int | `3600` | `ge=900` | Seconds between snapshot creation |
@@ -352,14 +351,15 @@ class SnapBakConfig(BaseModel):
     jobs: list[Job]
     mount_base: str = "/bak"
     stuck_threshold: int = Field(default=3600, ge=1)
-    stuck_wait: int = Field(default=600, ge=1)
+    restic_update: str = "never"  # 'after' | 'never'
+    stuck_wait: int = Field(default=300, ge=1)
 ```
 
 ---
 
 ## Status File
 
-Per-job status stored at `~/.local/state/snap-bak/<job_name>_status.json`.
+Per-job status stored at `/opt/snap-bak/state/<job_name>_status.json`.
 
 ### Schema
 
@@ -532,10 +532,10 @@ B runs first (400), then C (200), then A (100).
 
 ### Safety Rule
 
-**Never backup a snapshot newer than 1 hour old.**
+**Never backup a snapshot newer than 12 hours old.**
 
 ```python
-assert (datetime.now(timezone.utc) - snapshot_time).total_seconds() >= 3600
+assert (datetime.now(timezone.utc) - snapshot_time).total_seconds() >= 12 * 3600
 ```
 
 ---
@@ -576,37 +576,34 @@ Prevents multiple snap-bak instances from running simultaneously.
 
 ### Implementation
 
-- Lock file: `~/.local/state/snap-bak/snap-bak.lock`
+- Lock file: snap-bak.lock
 - Uses `fcntl.flock(LOCK_EX | LOCK_NB)`
 - Lock file contains JSON with PID, job info, timestamps
-- Stuck detection: if lock age > `stuck_threshold` (default 3600s)
+- Stuck snap-bak detection: if lock age > `stuck_threshold`
   - If locked PID no longer exists: break lock, warn user, continue
-  - If locked PID exists: sleep 1 minute and re-check, up to `stuck_wait` seconds
+  - If locked PID exists: sleep stick_wait seconds and re-check
   - If lock releases (old process exits): continue normally
-  - If `stuck_wait` exceeded: log STUCK WAIT EXCEEDED error and exit
+- if stuck_threshold exceeded -> temporary failure unless (now - lock age) > 12h
 
-### Per-Job Lock
-
-Each job also has a per-job lock file for `mount_and_lock`:
-- Lock file: `~/.local/state/snap-bak/<job_name>.lock`
-- Prevents concurrent execution of the same job
+The global lock is the only lock. There is deliberately no per-job lock: it
+would duplicate the global lock's job (preventing concurrent instances) for no
+additional protection, so it was removed for simplicity.
 
 ---
-
-## State Directory
-
-Default: `~/.local/state/snap-bak/`
-
-Override: `XDG_STATE_HOME` env var
 
 ### Contents
 
 ```
-~/.local/state/snap-bak/
-  snap-bak.log          # Log file
+/opt/snap-bak           # owned by root
+  snap_bak.py
+  snap-bak-io           # owned by root - sudoers grants priviledges for snapshots, etc
+  config.json           # owned by root
+  rclone                # optional if restic uses rclone
+  restic                # owned by root
+
+/opt/snap-bak/state     # owned by snap-bak
   snap-bak.lock         # Global lock file
   throughput.json       # Per-repo transfer-rate history (capped at 10/repo)
-  <job_name>.lock       # Per-job lock file
   <job_name>_status.json  # Per-job status
 ```
 
@@ -646,8 +643,6 @@ snap-bak [OPTIONS]
 |----------|-------------|
 | `SNAPBAK_CONFIG_FILE` | Config file path |
 | `SNAPBAK_JOB` | Job name to run |
-| `XDG_STATE_HOME` | State directory base |
-| `XDG_CACHE_HOME` | Restic cache base |
 | `SNAPBAK_SUDO` | Sudo binary used to invoke the wrapper |
 | `SNAPBAK_IO_WRAPPER` | Path to the root-owned wrapper |
 
@@ -660,23 +655,76 @@ an unprivileged service user and delegates these to a **root-owned wrapper**
 (`snap-bak-io`), reachable via a single static sudoers rule:
 
 ```
-snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/snap-bak-io *
+snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/snap-bak-io
 ```
 
-This rule is valid on both sudo-rs and sudo.ws (a trailing `*` is the only
-wildcard form sudo-rs permits). The wrapper:
+A bare command name (no arguments listed) matches any arguments, per
+sudoers(5). This is valid on both sudo-rs and sudo.ws; a trailing `*` is
+deliberately NOT used because sudo-rs mishandles it. The wrapper:
 
-- Accepts only `snapshot|delete|mount|umount <job> [snapshot]`.
+- Accepts only `snapshot|delete|mount|umount <job> [snapshot]` and
+  `update-restic`.
 - Validates `<job>` against the root-owned `/opt/snap-bak/config.json`.
 - Validates `[snapshot]` against `^\d{4}-\d{2}-\d{2}_\d{2}:\d{2}$`.
 - Confines every path under the job's `snapshot_dir` / `mount_base`
   (via `os.path.realpath` traversal guard).
-- Executes `btrfs`, `mount`, `umount` with config-derived paths; mount
-  applies the caller's uid/gid (`SUDO_UID`/`SUDO_GID`) so restic can read all
-  files without ACL changes.
+- Executes `btrfs`, `mount`, `umount` with config-derived paths.
+- Mounts snapshots read-only at `<mount_base>/<source_subvolume last
+  component>` using `mount -o bind,ro` (btrfs has no uid/gid mount options).
+  The mount point always mirrors the real filesystem path (e.g.
+  `/mnt/data` -> `<mount_base>/data`) and stays stable across
+  backups (restic change-tracking keys on the source path); it is never
+  configurable. `<name>` is only a display id and does not affect the mount
+  point.
+- `update-restic` validates that the restic binary is a root-owned regular
+  file in a root-owned, non-writable directory (rejecting symlinks and
+  group/other-writable paths), runs `restic self-update` (GPG-verified), and
+  re-applies `setcap cap_dac_read_search=+ep` — restic reads root-owned
+  snapshots via this capability. Exit codes: `0` ok, `2` self-update failed
+  (existing binary retained, setcap applied), `3` binary missing/unusable,
+  `4` setcap failed.
 
 Because the wrapper derives paths from config at runtime, changing
 `mount_base` or `snapshot_dir` never requires editing sudoers.
+
+The `restic_update` policy (`after|never`, default `never`) controls when the
+orchestrator invokes `update-restic`. `after` runs it only after a run in
+which a backup actually completed (never when every job was skipped, dry-run,
+or failed) — updating restic rewrites a `cap_dac_read_search`-carrying binary,
+so it must not run for no reason. `never` leaves updates to the administrator.
+
+---
+
+## Security Requirements
+
+Invariants snap-bak must never breach:
+
+1. **Least privilege.** Only `snap-bak-io` performs privileged operations.
+   snap-bak is granted none of them; sudo permits only the wrapper.
+2. **Root-owned files.** `snap-bak-io`, `config.json`, and
+   `/usr/local/bin/restic` are root-owned, not writable by group/other — the
+   wrapper is the root boundary, config is its trusted input, and restic
+   carries `cap_dac_read_search`. Writable by snap-bak ⇒ trivial root
+   escalation.
+3. **Trust boundary.** `snap-bak-io` is trusted, snap-bak is not. The wrapper
+   validates every argument against root-owned config; privileged ops never
+   trust snap-bak-supplied paths/arguments.
+4. **Update trust delegated to restic.** `restic self-update` verifies the
+   download against the PGP key embedded in the binary and the GPG-signed
+   `SHA256SUMS`. snap-bak adds no signature checks and must not bypass
+   restic's. — [stable releases](https://restic.readthedocs.io/en/stable/020_installation.html#stable-releases)
+5. **restic execution restricted.** The binary (with `cap_dac_read_search=+ep`)
+   is executable only by root and snap-bak. — [file capabilities](https://restic.readthedocs.io/en/stable/080_examples.html#using-file-capabilities)
+
+**NOTE:** anyone able to run the restic binary with `cap_dac_read_search=+ep`
+can read files bypassing permissions. Only `snap-bak-io` may run it, and it
+sets restic's source/destination itself — without trusted control over
+restic's arguments, snap-bak could "back up" secret files to Mallory.
+
+**TODO:** snap-bak currently runs restic directly, building source/repo args
+from config (snap_bak.py). Requirement 5's "wrapper sets destination itself"
+is not yet implemented — restic must be invoked via `snap-bak-io` so its args
+come only from root-owned config.
 
 ---
 
@@ -684,8 +732,8 @@ Because the wrapper derives paths from config at runtime, changing
 
 ### Framework
 
-- pytest with pyfakefs (filesystem mocking)
-- 67 tests, all passing
+- pytest with tmp_path / monkeypatch fixtures
+- run via `uv run python -m pytest tests/`
 
 ### Test Categories
 

@@ -37,6 +37,21 @@ CACHE_DIR="$SNAPBAK_DIR/cache"
 SCRIPT_SRC="$(dirname "$(readlink -f "$0")")/snap_bak.py"
 WRAPPER_SRC="$(dirname "$(readlink -f "$0")")/snap-bak-io"
 
+# --- 0. PYTHON DEPENDENCIES (for system python3) ---
+# The service runs /usr/bin/python3 and the wrapper runs 'env python3', so
+# both share the system interpreter and both need pydantic + json5 importable
+# (json5 parses the JSONC config in snap_bak.py AND in the root wrapper).
+echo "[*] Checking Python dependencies (pydantic, python-dateutil, json5)..."
+if ! python3 -c "import pydantic, dateutil, json5" &>/dev/null; then
+    echo "[*] Installing Python dependencies with pip3..."
+    python3 -m pip install --quiet pydantic python-dateutil json5
+fi
+if ! python3 -c "import pydantic, dateutil, json5" &>/dev/null; then
+    echo "[!] Failed to install Python dependencies. Install them manually:" >&2
+    echo "    python3 -m pip install pydantic python-dateutil json5" >&2
+    exit 1
+fi
+
 # --- 1. CREATE USER, GROUP & DIRECTORIES ---
 if ! getent group "$SERVICE_GROUP" >/dev/null; then
     echo "[*] Creating system group: $SERVICE_GROUP"
@@ -46,11 +61,12 @@ else
 fi
 echo "[*] Creating system user: $SERVICE_USER"
 if ! id "$SERVICE_USER" &>/dev/null; then
-    # Create a system user with a home directory for XDG state/cache. Use -g so
-    # the pre-created group is assigned as the primary group; without it useradd
-    # tries to create a user-private group of the same name and fails (and is
-    # not idempotent).
-    useradd --system --create-home --home-dir "$SNAPBAK_DIR" \
+    # The account exists purely for permissions/separation, so no home
+    # directory is created (no /etc/skel copy: no .face, dotfiles, .local).
+    # The dir is created root-owned below. Use -g so the pre-created group is
+    # assigned as the primary group; without it useradd tries to create a
+    # user-private group of the same name and fails (and is not idempotent).
+    useradd --system --home-dir "$SNAPBAK_DIR" \
         --shell /usr/sbin/nologin -g "$SERVICE_GROUP" "$SERVICE_USER"
 else
     echo "[!] User $SERVICE_USER already exists. Skipping creation."
@@ -76,6 +92,30 @@ install -o root -g root -m 0644 "$SCRIPT_SRC" "$SCRIPT_PATH"
 install -o root -g root -m 0755 "$WRAPPER_SRC" "$WRAPPER_PATH"
 echo "[*] Installed $SCRIPT_PATH (root:root 0644) and $WRAPPER_PATH (root:root 0755)."
 
+# --- 1d. VERIFY/UPDDATE RESTIC (setcap + self-update via the wrapper) ---
+# The wrapper is the single code path for restic trust + setcap (see its
+# 'update-restic' op). Running it here (a) ensures the setcap we rely on is in
+# place and (b) never duplicates that logic. Fails hard if restic is missing,
+# since the whole point of the wrapper is to make a trusted binary capable of
+# reading root-owned files.
+if [ ! -f /usr/local/bin/restic ]; then
+    echo "[!] /usr/local/bin/restic not found. Install restic, then re-run this script (or: $WRAPPER_PATH update-restic)." >&2
+    exit 1
+fi
+echo "[*] Running $WRAPPER_PATH update-restic (validates restic, self-update, setcap)..."
+"$WRAPPER_PATH" update-restic
+rc=$?
+# rc 0 = updated/current + setcap applied; rc 2 = self-update failed but the
+# existing binary is retained, trusted and setcap applied. Both are acceptable.
+# Any other rc means the binary is missing/untrusted -> fail the install.
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+    echo "[!] restic validation/update failed (rc=$rc). Fix restic, then re-run this script (or: $WRAPPER_PATH update-restic)." >&2
+    exit 1
+fi
+if [ "$rc" -eq 2 ]; then
+    echo "[!] restic self-update failed (network?), but existing restic is retained and setcap applied."
+fi
+
 # --- 1c. SERVICE-WRITABLE SUBDIRS ---
 # The service user writes lock/status/throughput under state/ and restic's
 # cache under cache/. Root owns everything else in /opt/snap-bak.
@@ -100,8 +140,16 @@ else
   // Top-level settings
   //   mount_base      : where read-only snapshots get mounted before backup (string)
   //   stuck_threshold : seconds after which a 'running' lock is considered stuck (int)
+  //   restic_update   : when to update restic via the root wrapper. 'after' =
+  //                     update restic only after a run in which a backup actually
+  //                     completed (never on skipped/dry-run runs — updating a
+  //                     setcap-carrying binary must not happen for no reason);
+  //                     'never' = only when you run the wrapper by hand. 'before'
+  //                     is not allowed: it would update before knowing whether
+  //                     any backup will happen.
   "mount_base": "/bak",
   "stuck_threshold": 3600,
+  "restic_update": "never",
 
   "repos": [
     {
@@ -127,13 +175,11 @@ else
 
   "jobs": [
     {
-      // name             : unique job id  (string). Used to derive:
-      //                     mount point  = <mount_base>/<name>
-      //                     restic tag   = --tag <name> (overridable via 'tag')
-      //                     lock file    = <state>/<name>.lock
-      //                     status file  = <state>/<name>_status.json
-      //                     Use only [A-Za-z0-9_-]; '/' or '..' would break out
-      //                     of the mount base and spoil the tag/state filenames.
+      // name             : unique job id  (string). Must stay filesystem-safe
+      //                     ([A-Za-z0-9_-], no '/' or '..') because it is used
+      //                     for <state>/<name>_status.json and the restic tag.
+      //                     It does NOT control the mount point: that is always
+      //                     <mount_base>/<last component of source_subvolume>.
       // snapshot_dir     : existing dir where btrfs snapshots go; must exist  (string)
       // source_subvolume : btrfs subvolume to snapshot  (string)
       // repo             : repo id from the repos list  (string)
@@ -204,19 +250,20 @@ chown "$SERVICE_USER":"$SERVICE_GROUP" "$MOUNT_BASE"
 chmod 0755 "$MOUNT_BASE"
 
 # --- 3. CONFIGURE SUDOERS ---
-# A single static rule pointing at the root-owned wrapper. This is valid on
-# BOTH sudo-rs and sudo.ws (a trailing '*' = zero or more subsequent args,
-# the only wildcard form sudo-rs allows). Because the wrapper derives every
-# path from the root-owned config at runtime, changing mount_base or
-# snapshot_dir in config NEVER requires touching sudoers.
+# A single static rule pointing at the root-owned wrapper. A bare command name
+# matches any arguments (see sudoers(5)), which is valid on both sudo-rs and
+# sudo.ws. A trailing '*' is deliberately NOT used because sudo-rs mishandles
+# it. Because the wrapper derives every path from the root-owned config at
+# runtime, changing mount_base or snapshot_dir in config NEVER requires
+# touching sudoers.
 SUDOERS_FILE="/etc/sudoers.d/snap-bak"
 echo "[*] Configuring sudo permissions in $SUDOERS_FILE"
 cat <<EOF > "$SUDOERS_FILE"
 # snap-bak permissions: allow the service user to run only the root-owned
 # wrapper. The wrapper validates job/snapshot names against /opt/snap-bak/
 # config.json (root-owned) and executes btrfs/mount/umount with config-derived
-# paths. No wildcard/glob rules needed here.
-$SERVICE_USER ALL=(root) NOPASSWD:$WRAPPER_PATH *
+# paths. A bare command name (no args listed) matches any arguments.
+$SERVICE_USER ALL=(root) NOPASSWD:$WRAPPER_PATH
 EOF
 chmod 0440 "$SUDOERS_FILE"
 
@@ -225,12 +272,6 @@ if ! visudo -c -f "$SUDOERS_FILE"; then
     echo "[!] sudoers validation failed; removing invalid $SUDOERS_FILE." >&2
     rm -f "$SUDOERS_FILE"
     exit 1
-fi
-
-# Remove any stale sudoers file from the old snapbak-svc user.
-if [ -f /etc/sudoers.d/snapbak-svc ]; then
-    echo "[!] Removing stale /etc/sudoers.d/snapbak-svc (superseded by $SUDOERS_FILE)."
-    rm -f /etc/sudoers.d/snapbak-svc
 fi
 
 # --- 4. CREATE SYSTEMD SERVICE ---

@@ -27,6 +27,7 @@ from scripts.snap_bak import (
     RemoteUnavailableError,
     SnapBakConfig,
     _categorize_restic_error,
+    _restic_update_due,
     build_retention_datetimes,
     build_retention_exponential,
     build_snapshot_keeplist,
@@ -85,7 +86,7 @@ def create_snapshots(sample_job):
 
 @contextmanager
 def _mock_mount(*args, **kwargs):
-    """Context manager replacing Job.mount_and_lock in run() tests."""
+    """Context manager replacing Job.mount in run() tests."""
     yield Path("/tmp/fake_mount")
 
 
@@ -96,7 +97,7 @@ def mocked_backup_job(sample_job):
     create_snapshot/_write_status are mocked too: individual tests override
     their side_effect/return_value as needed.
     """
-    sample_job.mount_and_lock = _mock_mount
+    sample_job.mount = _mock_mount
     sample_job._preflight = MagicMock(return_value=1_000_000_000)
     sample_job._backup = MagicMock(return_value="restic_snap_id")
     sample_job._forget_and_prune = MagicMock()
@@ -530,9 +531,9 @@ class TestSnapshotSchedule:
         assert result["status"] == "skipped"
 
     def test_creates_snapshot_when_none_exist_and_continues(self, mocked_backup_job):
-        """A brand-new (eligible) snapshot lets the run continue to backup."""
+        """A snapshot old enough to back up lets the run continue to backup."""
         created = Path(mocked_backup_job.snapshot_dir) / (
-            datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%d_%H:%M")
+            datetime.now(timezone.utc) - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M")
 
         def _fake_create():
             created.mkdir(exist_ok=True)
@@ -547,10 +548,10 @@ class TestSnapshotSchedule:
         assert success_call.kwargs["restic_snapshot_id"] == "restic_snap_id"
 
     def test_does_not_create_when_snapshot_within_interval(self, mocked_backup_job, create_snapshots):
-        """Snapshot younger than snapshot_interval -> no new snapshot."""
-        recent = datetime.now(timezone.utc) - timedelta(minutes=90)
+        """Snapshot younger than snapshot_interval (but old enough to back up) -> no new snapshot."""
+        recent = datetime.now(timezone.utc) - timedelta(hours=13)
         create_snapshots(recent.strftime("%Y-%m-%d_%H:%M"), recent)
-        mocked_backup_job.snapshot_interval = 7200
+        mocked_backup_job.snapshot_interval = 24 * 3600
 
         result = mocked_backup_job.run()
 
@@ -590,7 +591,7 @@ class TestFailureCategories:
     def test_failed_backup_records_category(self, mocked_backup_job, create_snapshots):
         """A categorized failure is persisted on the failed status."""
         now = datetime.now(timezone.utc)
-        create_snapshots((now - timedelta(hours=2)).strftime("%Y-%m-%d_%H:%M"), now - timedelta(hours=2))
+        create_snapshots((now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M"), now - timedelta(hours=20))
         mocked_backup_job._backup = MagicMock(side_effect=CredentialsError("wrong password"))
 
         result = mocked_backup_job.run()
@@ -604,7 +605,7 @@ class TestFailureCategories:
     def test_unknown_failure_defaults_to_internal(self, mocked_backup_job, create_snapshots):
         """Exceptions without a category default to FAIL_INTERNAL."""
         now = datetime.now(timezone.utc)
-        create_snapshots((now - timedelta(hours=2)).strftime("%Y-%m-%d_%H:%M"), now - timedelta(hours=2))
+        create_snapshots((now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M"), now - timedelta(hours=20))
         mocked_backup_job._backup = MagicMock(side_effect=RuntimeError("mystery"))
 
         result = mocked_backup_job.run()
@@ -675,6 +676,76 @@ class TestSnapBakConfig:
             jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
         )
         assert config.stuck_threshold == 3600
+
+    def test_restic_update_default(self):
+        config = SnapBakConfig(
+            repos=[{"name": "primary", "path": "rclone:test"}],
+            jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
+        )
+        assert config.restic_update == "never"
+
+    def test_restic_update_valid_values(self):
+        for v in ("after", "never"):
+            config = SnapBakConfig(
+                repos=[{"name": "primary", "path": "rclone:test"}],
+                jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
+                restic_update=v,
+            )
+            assert config.restic_update == v
+
+    def test_restic_update_invalid_rejected(self):
+        # 'before' is rejected: updating restic rewrites a setcap binary, so it
+        # may never run before knowing whether a backup will happen.
+        for v in ("before", "sometimes"):
+            with pytest.raises(Exception):
+                SnapBakConfig(
+                    repos=[{"name": "primary", "path": "rclone:test"}],
+                    jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
+                    restic_update=v,
+                )
+
+    def test_mount_point_mirrors_source(self):
+        config = SnapBakConfig(
+            repos=[{"name": "primary", "path": "rclone:test"}],
+            jobs=[{"name": "Custom Name", "snapshot_dir": "/tmp", "source_subvolume": "/mnt/data", "repo": "primary"}],
+        )
+        jobs = config.resolve_jobs()
+        assert jobs[0].mount_point == Path("/bak") / "data"
+
+    def test_mount_point_relative_source(self):
+        config = SnapBakConfig(
+            repos=[{"name": "primary", "path": "rclone:test"}],
+            jobs=[{"name": "Custom Name", "snapshot_dir": "/tmp", "source_subvolume": "home", "repo": "primary"}],
+        )
+        jobs = config.resolve_jobs()
+        assert jobs[0].mount_point == Path("/bak") / "home"
+
+
+class TestResticUpdateGate:
+    """restic updates must never run unless a backup actually happened."""
+
+    def test_not_due_when_never(self):
+        assert not _restic_update_due([{"status": "success"}], "never")
+
+    def test_due_only_after_success(self):
+        assert _restic_update_due([{"status": "success"}], "after")
+
+    def test_not_due_when_only_skipped(self):
+        assert not _restic_update_due(
+            [{"status": "skipped"}, {"status": "skipped"}], "after"
+        )
+
+    def test_due_when_any_real_backup_succeeded(self):
+        # A dry-run job next to a real success still had a backup happen.
+        assert _restic_update_due(
+            [{"status": "dry_run"}, {"status": "success"}], "after"
+        )
+
+    def test_not_due_when_only_dry_run(self):
+        assert not _restic_update_due([{"status": "dry_run"}], "after")
+
+    def test_not_due_when_empty(self):
+        assert not _restic_update_due([], "after")
 
 
 # --- load_config tests ---

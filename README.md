@@ -50,9 +50,10 @@ What `scripts/snap-bak-setup.sh` does:
 4. Writes an annotated example config to `/opt/snap-bak/config.json`.
 5. Creates service-writable `state/`, `cache/`, `passwords/` and
    `.config/rclone/`; root:snap-bak `excludes/`.
-6. Creates the mount base `/bak` and installs a single static sudoers rule —
-   `snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/snap-bak-io *` — valid on both
-   sudo-rs and sudo.ws.
+ 6. Creates the mount base `/bak` and installs a single static sudoers rule —
+    `snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/snap-bak-io` (bare command
+    name = any arguments, per sudoers(5)) — valid on both sudo-rs and
+    sudo.ws.
 7. Writes `snap-bak.service` (oneshot) and `snap-bak.timer` (hourly).
 
 The timer runs hourly; restic uploads happen per-job only when
@@ -95,7 +96,8 @@ is kept in the remote repo. Runs `restic forget --prune` after each backup.
 
 ### How they overlap
 
-Snapshots are young (minutes to hours old). Backups are always slightly older.
+Snapshots are young (minutes to hours old). Backups use snapshots ≥12h old, so
+offsite copies are always of older, known-good data.
 After a successful backup, snapshots older than the backup time are deleted
 (data is now offsite). Younger snapshots remain for quick local restore.
 
@@ -110,20 +112,33 @@ mount/umount) are delegated to a **root-owned wrapper** that is the only thing
 sudoers lets the service user run.
 
 ### How it Works
-1.  **Static sudoers rule**: `snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/snap-bak-io *`
-    — a single trailing `*` wildcard, the only form both sudo-rs and sudo.ws
-    accept. Changing `mount_base` or `snapshot_dir` in config NEVER requires
-    touching sudoers, because the wrapper derives every path from the
-    root-owned config at runtime.
+1.  **Static sudoers rule**: `snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/snap-bak-io`
+    — a bare command name matches any arguments (see sudoers(5)), valid on
+    both sudo-rs and sudo.ws. A trailing `*` is deliberately NOT used because
+    sudo-rs mishandles it. Changing `mount_base` or `snapshot_dir` in config
+    NEVER requires touching sudoers, because the wrapper derives every path
+    from the root-owned config at runtime.
 2.  **The wrapper** (`snap-bak-io`, root-owned 0755) accepts only
-    `snapshot|delete|mount|umount <job> [snapshot]`, validates the job against
-    `/opt/snap-bak/config.json` and the snapshot name against
-    `YYYY-MM-DD_HH:MM`, and confines all paths under the configured
-    `snapshot_dir` / `mount_base` (realpath traversal guard).
-3.  **Mount with uid/gid mapping** — snapshots are mounted read-only using the
-    calling user's uid/gid (from `SUDO_UID`/`SUDO_GID`) so restic can read all
-    files without ACL complications.
-4.  **Minimal Surface Area**: The restic process runs as the unprivileged
+    `snapshot|delete|mount|umount <job> [snapshot]` and `update-restic`,
+    validates the job against `/opt/snap-bak/config.json` and the snapshot
+    name against `YYYY-MM-DD_HH:MM`, and confines all paths under the
+    configured `snapshot_dir` / `mount_base` (realpath traversal guard).
+3.  **Stable read-only bind mounts** — snapshots are bound at
+    `<mount_base>/<source basename>` (e.g. `/mnt/data` →
+    `/mnt/bak/data`) read-only via `mount -o bind,ro`. The mount point
+    stays stable across backups, which restic's change tracking requires
+    (a changing source path would force full-copy backups).
+4.  **`cap_dac_read_search` on restic** — snapshots are root-owned, so restic
+    (running as the unprivileged `snap-bak` user) reads them via the
+    `cap_dac_read_search` capability applied to the restic binary. This is
+    managed entirely by the wrapper's `update-restic` op, which validates the
+    binary is root-owned and un-writable by others, runs `restic self-update`
+    (dropping any stale caps), and re-applies the capability. A config
+    `restic_update` policy (`after|never`) controls when updates run — and it
+    is deliberately restricted: updating restic rewrites a
+    `cap_dac_read_search`-carrying binary, so snap-bak only does it after a
+    run in which a backup actually completed, never for skipped/dry-run runs.
+5.  **Minimal Surface Area**: The restic process runs as the unprivileged
     `snap-bak` user. `/opt/snap-bak` is root-owned; only `state/`, `cache/`,
     `passwords/`, `.config/rclone/` are writable by the service user, so a
     compromised backup tool cannot replace the wrapper (which would be trivial
@@ -141,9 +156,10 @@ sudoers lets the service user run.
 ## Configuration
 
 The config file is JSONC: standard JSON plus `//` and `/* */` comments and
-trailing commas (comments are stripped by `snap-bak` before parsing). The
-default config written by `snap-bak-setup.sh` includes inline comments
-describing every field.
+trailing commas. It is parsed with json5 by both `snap_bak.py` and the root
+wrapper `snap-bak-io` (a single code path for JSONC handling). The default
+config written by `snap-bak-setup.sh` includes inline comments describing
+every field.
 
 Edit `config/config.json`:
 
@@ -162,11 +178,12 @@ Edit `config/config.json`:
   ],
   "mount_base": "/bak",
   "stuck_threshold": 3600,
+  "restic_update": "never",
   "jobs": [
     {
       "name": "data",
       "snapshot_dir": "/mnt/data/.snapshots",
-      "source_subvolume": "data",
+      "source_subvolume": "/mnt/data",
       "repo": "primary",
       "priority": 100,
       "snapshot_interval": 3600,
@@ -190,6 +207,7 @@ Edit `config/config.json`:
 | `repos` | Array of restic repository definitions (required) | — |
 | `mount_base` | Base directory for mounting snapshots | `/bak` |
 | `stuck_threshold` | Seconds before a lock is considered stale | `3600` |
+| `restic_update` | When to update restic: `after` \| `never` | `never` |
 
 ### Repo settings
 
@@ -207,7 +225,7 @@ Edit `config/config.json`:
 
 | Field | Type | Description | Default |
 |-------|------|-------------|---------|
-| `name` | string | Job name (required). Also derives local paths/tags (see below) | — |
+| `name` | string | Job display name (required). Free-form; does NOT control the mount point | — |
 | `snapshot_dir` | string | Directory containing Btrfs snapshots (required) | — |
 | `source_subvolume` | string | Btrfs subvolume to snapshot (required) | — |
 | `repo` | string | Name of repo to use (must match `repos[].name`) | — |
@@ -243,14 +261,28 @@ controls restic's offsite backup retention (how many backup versions to keep
 in the remote repo). `snapshot_retention` controls local Btrfs snapshot
 cleanup (how many snapshots to keep on disk).
 
-**Note on `name`:** the job name is used to derive several paths and labels, so
-it must be filesystem- and tag-safe. Use only `[A-Za-z0-9_-]` (no `/`, no `..`).
+**Note on `name` vs the mount point:** the job `name` must be filesystem-safe
+(`[A-Za-z0-9_-]`, no `/` or `..`) because it drives `<state>/<name>_status.json`
+and the restic tag — but it does NOT control the mount point. The mount point
+is always `<mount_base>/<last path component of source_subvolume>` (e.g.
+`/mnt/data` → `/mnt/bak/data`), mirroring the real filesystem path. It
+is not configurable. A stable mount point matters: restic change-tracking keys
+on the source path, so a changing mount point would force full-copy backups.
 
-- Mount point: `<mount_base>/<name>` — the read-only snapshot is mounted here
-  before backup
+- Mount point: `<mount_base>/<source basename>` — the read-only snapshot is
+  bound here before backup (`mount -o bind,ro`)
 - restic tag: `--tag <name>` on every backup/forget (overridable via `tag`)
-- Lock file: `<state_dir>/<name>.lock`
 - Status file: `<state_dir>/<name>_status.json`
+
+**Note on `restic_update`:** updating restic is a privileged operation handled
+by the wrapper's `update-restic` op, which validates the binary is root-owned
+and un-writable by others, runs `restic self-update`, then re-applies
+`cap_dac_read_search` (restic self-update replaces the binary and drops
+capabilities). Updating restic rewrites a binary that can read any file, so
+snap-bak only does it (`after`) after a run in which a backup actually
+completed — never for skipped, dry-run, or failed runs. `never` leaves updates
+to you. Run it by hand anytime with
+`sudo /opt/snap-bak/snap-bak-io update-restic`.
 
 ## Snapshot and Backup Flow
 
@@ -287,7 +319,7 @@ A backup is created when **all** of the following are met:
 When a backup is triggered:
 - The **oldest snapshot within the last `backup_interval`** is selected for backup.
 - If no snapshot falls within the interval, the latest snapshot is used as a fallback.
-- Snapshots younger than the minimum age (1 hour) are never backed up: the run
+- Snapshots younger than the minimum age (12 hours) are never backed up: the run
   records `skipped` and defers to a later cycle, so a snapshot just created by
   the scheduler is only uploaded after it has aged (e.g. on a fresh install).
 - The snapshot is mounted read-only, preflight-checked, then backed up to the
@@ -417,7 +449,6 @@ $XDG_STATE_HOME/snap-bak/
 ├── snap-bak.lock             # Global lock + current job info (JSON)
 ├── snap-bak.log              # Log file
 ├── throughput.json           # Per-repo transfer-rate history (capped)
-├── {job_name}.lock           # Per-job lock
 ├── {job_name}_status.json    # Per-job status (success/failed/skipped)
 └── {job_name}_status.json.tmp # Atomic write temp file
 ```

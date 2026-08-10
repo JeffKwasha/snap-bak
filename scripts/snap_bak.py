@@ -25,6 +25,7 @@ Protection strategy:
 import argparse
 import fcntl
 import json
+import json5
 import logging
 import os
 import subprocess
@@ -49,71 +50,29 @@ DEFAULT_TIMEOUT = 86400  # 24 hours
 DEFAULT_BACKUP_INTERVAL = 3600  # 1 hour
 DEFAULT_SNAPSHOT_INTERVAL = 3600  # 1 hour
 DEFAULT_SNAPSHOT_INTERVAL_MIN = 900  # 15 minutes (minimum)
-DEFAULT_SNAPSHOT_AGE_MIN = 3600  # 1 hour (minimum snapshot age for backup safety)
+DEFAULT_SNAPSHOT_AGE_MIN = 12 * 3600  # 12 hours (minimum snapshot age for backup safety)
 # Sudo invocation for privileged (btrfs/mount) operations. snap-bak calls a
 # root-owned wrapper (installed by snap-bak-setup.sh) rather than running
 # btrfs/mount/umount directly. The wrapper derives every path from the
 # root-owned config and validates the job/snapshot name, so a single static
-# sudoers rule (NOPASSWD:/opt/snap-bak/snap-bak-io *) works on both sudo-rs
-# and sudo.ws. Default /usr/bin/sudo; overridable via SNAPBAK_SUDO for tests.
+# sudoers rule (NOPASSWD:/opt/snap-bak/snap-bak-io) works on both sudo-rs and
+# sudo.ws: a bare command name matches any arguments (see sudoers(5)), and '*'
+# is deliberately avoided because sudo-rs mishandles it. Default /usr/bin/sudo;
+# overridable via SNAPBAK_SUDO for tests.
 SUDO = os.environ.get("SNAPBAK_SUDO", "/usr/bin/sudo")
 IO_WRAPPER = os.environ.get("SNAPBAK_IO_WRAPPER", "/opt/snap-bak/snap-bak-io")
 
 RETRY_DELAY = 5  # seconds between retry attempts
 
 
-def strip_json_comments(src: str) -> str:
-    """Strip // and /* */ comments from JSON(C), preserving line/column positions.
-
-    Comments are replaced with whitespace (newlines are kept) so that JSON
-    error offsets still point at the original text. String literals are left
-    untouched, so values like "rclone://host:*/dir" are never treated as
-    comments. This mirrors the behaviour of the npm 'strip-json-comments'
-    package (which is not available on PyPI).
-    """
-    out = list(src)
-    i, n = 0, len(src)
-    in_string = False
-    while i < n:
-        c = src[i]
-        if in_string:
-            out[i] = c
-            if c == "\\" and i + 1 < n:
-                out[i + 1] = src[i + 1]
-                i += 2
-                continue
-            if c == '"':
-                in_string = False
-            i += 1
-            continue
-        if c == '"':
-            in_string = True
-            out[i] = c
-            i += 1
-            continue
-        if c == "/" and i + 1 < n and src[i + 1] == "/":
-            while i < n and src[i] != "\n":
-                out[i] = " "
-                i += 1
-            continue
-        if c == "/" and i + 1 < n and src[i + 1] == "*":
-            out[i] = out[i + 1] = " "
-            i += 2
-            while i + 1 < n and not (src[i] == "*" and src[i + 1] == "/"):
-                out[i] = " " if src[i] != "\n" else "\n"
-                i += 1
-            if i + 1 < n:
-                out[i] = out[i + 1] = " "
-                i += 2
-            continue
-        out[i] = c
-        i += 1
-    return "".join(out)
-
-
 def load_config_json(text: str) -> dict:
-    """Parse a config string that may contain // and /* */ comments."""
-    return json.loads(strip_json_comments(text))
+    """Parse a config string that may contain // and /* */ comments (JSONC).
+
+    Uses json5, which natively accepts comments while still requiring quoted
+    keys and standard JSON literals for values pydantic expects. A future
+    switch to strict JSON would only mean removing this one call.
+    """
+    return json5.loads(text)
 
 
 # --- Error codes ---
@@ -220,10 +179,6 @@ _stream_handler = logging.StreamHandler(sys.stderr)
 _stream_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
 logging.basicConfig(level=logging.INFO, handlers=[_stream_handler])
 logger = logging.getLogger(__name__)
-
-
-class LockError(Exception):
-    """Raised when a job lock cannot be acquired."""
 
 
 class StuckInstanceError(Exception):
@@ -427,11 +382,15 @@ class Job(BaseModel):
 
     @property
     def mount_point(self) -> Path:
-        return Path(self.mount_base) / self.name
+        """Stable read-only mount point for this job's snapshot.
 
-    @property
-    def lock_file(self) -> Path:
-        return STATE_DIR / f"{self.name}.lock"
+        The mount point mirrors the real filesystem path: the final path
+        component of source_subvolume (e.g. /mnt/data -> data, so
+        <mount_base>/data). It is always derived this way and is NOT
+        configurable. restic's change tracking keys on this path, so it must
+        be stable across backups.
+        """
+        return Path(self.mount_base) / Path(self.source_subvolume).name
 
     @property
     def status_file(self) -> Path:
@@ -926,25 +885,17 @@ class Job(BaseModel):
     # --- Context manager ---
 
     @contextmanager
-    def mount_and_lock(self, snapshot_path: Path):
-        """Acquire per-job lock, mount snapshot, yield mount point, cleanup.
+    def mount(self, snapshot_path: Path):
+        """Mount the snapshot read-only, yield mount point, unmount on exit.
 
-        The lock file is also used as a status indicator. When the lock is
-        acquired, the status file is touched to record the start time.
-        Other processes can check the lock file to detect running jobs
-        and read the status file mtime to detect stuck processes.
+        The global lock (acquired once per run in _main_impl) already prevents
+        concurrent snap-bak instances, so no per-job lock is needed here. The
+        status file is touched to record when the job started and expose its
+        mtime to stuck-process detection.
         """
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        lock_fh = open(self.lock_file, 'w')
-        try:
-            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except IOError:
-            lock_fh.close()
-            raise LockError(f"Job {self.name}: another instance is running")
-
-        # Touch the status file to record when this job started
         self.status_file.touch()
-        logger.info(f"Job {self.name}: lock acquired, status file touched")
+        logger.info(f"Job {self.name}: status file touched")
 
         mount_point = self.mount_point
         try:
@@ -963,9 +914,6 @@ class Job(BaseModel):
                     self._run([SUDO, IO_WRAPPER, "umount", self.name])
                 except subprocess.CalledProcessError:
                     logger.warning(f"Failed to unmount {mount_point}")
-            fcntl.flock(lock_fh, fcntl.LOCK_UN)
-            lock_fh.close()
-            self.lock_file.unlink(missing_ok=True)
 
     # --- Main entry point ---
 
@@ -1000,15 +948,12 @@ class Job(BaseModel):
         return {"job": self.name, "status": "success"}
 
     def _backup_snapshot(self, snapshot_path: Path, retry: bool = False) -> dict:
-        """Mount a snapshot and run the backup flow with lock + failure handling."""
+        """Mount a snapshot and run the backup flow with failure handling."""
         snapshot_name = snapshot_path.name
         try:
             touch_global_lock(self.name, snapshot_name)
-            with self.mount_and_lock(snapshot_path) as mount_point:
+            with self.mount(snapshot_path) as mount_point:
                 return self._run_backup(mount_point, snapshot_path, snapshot_name, retry=retry)
-        except LockError:
-            self._write_status("skipped", "Another instance is running")
-            return {"job": self.name, "status": "skipped"}
         except Exception as e:
             category = getattr(e, "category", FAIL_INTERNAL)
             msg = str(e)
@@ -1110,13 +1055,23 @@ class SnapBakConfig(BaseModel):
     jobs: list[Job]
     mount_base: str = "/bak"
     stuck_threshold: int = Field(default=DEFAULT_STUCK_THRESHOLD, ge=1)
+    restic_update: str = "never"
 
     def __init__(self, **data):
-        known_keys = {'repos', 'jobs', 'mount_base', 'stuck_threshold'}
+        known_keys = {'repos', 'jobs', 'mount_base', 'stuck_threshold', 'restic_update'}
         unknown = set(data.keys()) - known_keys
         if unknown:
             warnings.warn(f"Unknown config keys: {unknown}")
         super().__init__(**data)
+
+    @field_validator('restic_update')
+    @classmethod
+    def validate_restic_update(cls, v):
+        if v not in ("after", "never"):
+            raise ValueError(
+                f"restic_update must be one of 'after', 'never'; got {v!r}"
+            )
+        return v
 
     @model_validator(mode='after')
     def validate_repos_and_jobs(self):
@@ -1163,6 +1118,50 @@ def main():
         # No failure in a backup orchestrator should be silent.
         logger.critical(f"FATAL: snap-bak crashed: {e}", exc_info=True)
         sys.exit(EXIT_ERROR)
+
+
+def _restic_update_due(results: list[dict], restic_update: str) -> bool:
+    """True when the privileged restic update should run after this run.
+
+    Updating restic rewrites a binary carrying cap_dac_read_search — the
+    read-anything capability — so it must only run when a backup actually
+    completed this run, and never on dry-runs, skipped jobs, or failures.
+    """
+    if restic_update != "after":
+        return False
+    return any(r.get("status") == "success" for r in results)
+
+
+def _run_restic_update() -> None:
+    """Run the privileged 'update-restic' wrapper op after a successful backup.
+
+    Updating restic rewrites a binary that carries cap_dac_read_search — the
+    read-anything capability — so it must only run when a backup actually
+    happened this run (the caller guarantees this). A failure never aborts the
+    run: the existing binary remains usable (rc 0 = updated, rc 2 = self-update
+    failed but old binary retained + setcap applied).
+    """
+    cmd = [SUDO, IO_WRAPPER, "update-restic"]
+    logger.info(f"running {' '.join(cmd)}")
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("restic update timed out; continuing with existing restic")
+        return
+    if result.returncode == 0:
+        logger.info("restic update: OK (binary up to date, setcap applied)")
+    elif result.returncode == 2:
+        logger.warning(
+            "restic self-update failed but existing restic is retained and usable; "
+            f"continuing ({result.stderr.strip() or 'see wrapper log'})"
+        )
+    else:
+        logger.error(
+            f"restic update failed (rc={result.returncode}): "
+            f"{result.stderr.strip() or 'see wrapper log'}"
+        )
 
 
 def _main_impl():
@@ -1231,6 +1230,10 @@ def _main_impl():
         failed = [r for r in results if r.get("status") == "failed"]
         if failed:
             sys.exit(EXIT_ERROR)
+        # restic_update='after': update only when a backup actually completed
+        # this run (never on skipped/dry-run/failed runs).
+        if _restic_update_due(results, config.restic_update):
+            _run_restic_update()
     finally:
         release_global_lock(lock_fh)
 
