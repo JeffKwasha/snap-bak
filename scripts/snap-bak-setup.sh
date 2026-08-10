@@ -290,8 +290,7 @@ Type=oneshot
 User=$SERVICE_USER
 Group=$SERVICE_GROUP
 Environment=SNAPBAK_CONFIG_FILE=$CONFIG_FILE
-Environment=XDG_STATE_HOME=$STATE_DIR
-Environment=XDG_CACHE_HOME=$CACHE_DIR
+Environment=RESTIC_CACHE_DIR=$CACHE_DIR
 ExecStart=/usr/bin/python3 $SCRIPT_PATH
 
 [Install]

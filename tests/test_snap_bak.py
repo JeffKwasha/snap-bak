@@ -44,7 +44,7 @@ from scripts.snap_bak import (
 def isolated_state(tmp_path, monkeypatch):
     """Give every test its own STATE_DIR / GLOBAL_LOCK_FILE.
 
-    Without this, run() writes status/lock files into the real ~/.local/state
+    Without this, run() writes status/lock files into the real /opt/snap-bak
     and tests leak state into each other.
     """
     state = tmp_path / "state"

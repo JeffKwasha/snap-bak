@@ -213,11 +213,13 @@ RETENTION_FN = {
 
 
 def _get_state_dir() -> Path:
-    """Get XDG state directory for snap-bak."""
-    state_home = os.environ.get("XDG_STATE_HOME")
-    if state_home:
-        return Path(state_home) / "snap-bak"
-    return Path.home() / ".local" / "state" / "snap-bak"
+    """Get the state directory for snap-bak.
+
+    Everything lives under /opt/snap-bak, so the state directory is hardcoded
+    there (no XDG/.local). Overridable via SNAPBAK_STATE_DIR for tests and
+    ad-hoc runs.
+    """
+    return Path(os.environ.get("SNAPBAK_STATE_DIR", "/opt/snap-bak/state"))
 
 
 STATE_DIR = _get_state_dir()

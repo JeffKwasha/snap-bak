@@ -10,11 +10,10 @@ to daily use.
 
 ## Requirements
 
-- **Linux with Btrfs** — used for read-only snapshots and subvolume mount
+- **Btrfs** — snapshots and subvolume mount
 - **Python ≥ 3.10**
-- **restic** (in `$PATH`) — the backup engine; must be exec'd by the service user
-- **`btrfs-progs` / `btrfs`** — `btrfs subvolume snapshot|delete` via sudo
-- **`pydantic >= 2`** and **`python-dateutil >= 2`** — runtime Python deps
+- **restic**
+- **pydantic python-dateutil json5**
 - **optional:** `rclone` — for `rclone:REMOTE:DIR` repos
 - **optional:** systemd (Linux) — for the timer-driven service
 
@@ -150,7 +149,7 @@ sudoers lets the service user run.
 - **Failed backup recovery** — automatic retry with same snapshot
 - **Backup windows** — restrict to off-peak hours
 - **Configurable retry** — per-job restic retry count
-- **XDG-compliant paths** — state in `$XDG_STATE_HOME/snap-bak/`
+- **Hardcoded paths** — state in `/opt/snap-bak/state/`
 - **Crash recovery** — lock file with JSON job info
 
 ## Configuration
@@ -196,8 +195,8 @@ Edit `config/config.json`:
       "backup_retention": {"daily": 6, "monthly": 4, "yearly": 2},
       "snapshot_retention": {"fn": "exponential", "config": {"n": 5}},
       "backup_interval": "1w",
-      "backup_window_start": "22:00",
-      "backup_window_end": "06:00",
+      "backup_window_start": "01:00",
+      "backup_window_end": "07:00",
       "ignore_file": "/opt/snap-bak/excludes/data.ignore",
       "excludes": ["*.tmp", "*.cache", ".DS_Store"],
       "timeout": "24h"
@@ -440,24 +439,24 @@ snap-bak --config /path/to/config.json
 |----------|-------------|---------|
 | `SNAPBAK_CONFIG_FILE` | Path to config JSON file | `config/config.json` |
 | `SNAPBAK_JOB` | Run a specific job by name | (all jobs) |
-| `XDG_STATE_HOME` | Base directory for state files | `~/.local/state` |
-| `XDG_CACHE_HOME` | Base directory for the restic cache | `~/.cache` |
+| `SNAPBAK_STATE_DIR` | State directory override (default: `/opt/snap-bak/state`) | `/opt/snap-bak/state` |
+| `RESTIC_CACHE_DIR` | Restic cache directory | `/opt/snap-bak/cache` |
 | `SNAPBAK_SUDO` | Sudo binary used to invoke the wrapper | `sudo` |
 | `SNAPBAK_IO_WRAPPER` | Path to the root-owned wrapper | `/opt/snap-bak/snap-bak-io` |
 
 ## State Files
 
-All state files live under `$XDG_STATE_HOME/snap-bak/` (defaults to
-`~/.local/state/snap-bak/`):
+All state files live under `/opt/snap-bak/state/`:
 
 ```
-$XDG_STATE_HOME/snap-bak/
+/opt/snap-bak/state/
 ├── snap-bak.lock             # Global lock + current job info (JSON)
-├── snap-bak.log              # Log file
 ├── throughput.json           # Per-repo transfer-rate history (capped)
 ├── {job_name}_status.json    # Per-job status (success/failed/skipped)
 └── {job_name}_status.json.tmp # Atomic write temp file
 ```
+
+(Logs go to stderr — captured by the systemd journal. A file log is opt-in via `--log-file`.)
 
 ### Lock file crash recovery
 

@@ -98,92 +98,21 @@ Only one snapshot per `snapshot_interval` seconds per job.
 
 ### Phase 5: Cleanup Local Snapshots (btrfs)
 
-Retention
-choice of how timeslots are distributed is choosing a function and its parameters
-current support:
+Retention is a choice of how timeslot boundaries are distributed — picking a
+function and its parameters. Two strategies are supported:
 
-snapshot_retention = {
-    "fn": "exponential",
-    "config": {
-        "n": 9
-    }
-}
-OR
-snapshot_retention = {
-    "fn": "datetimes",
-    "config": {
-        "hourly": 8,
-        "daily": 7,
-        "weekly": 4,
-        "monthly": 3,
-    }
-}
-
-
-```python
-RETENTION_FN = {
-    "exponential": build_retention_exponential,
-    "datetimes": build_retention_datetimes,
-}
-
-def build_retention_datetimes(hourly:int = 0, daily:int = 0, weekly:int = 0, monthly:int = 0, yearly:int = 0) -> list[datetime]:
-    # Alternative strategy: create a flat list of retention boundaries for normal (hierarchical) retention.
-    # Can be passed as `retentions` to build_snapshot_keeplist instead of using exponential tiers.
-    now = datetime.now(timezone.utc)
-    hours = [ now - relativedelta(hours=i) for i in range(0, hourly) ]
-    days  = [ now - relativedelta(hours=hourly, days=i) for i in range(0, daily) ]
-    weeks = [ now - relativedelta(hours=hourly, days=daily, weeks=i) for i in range(0, weekly) ]
-    months= [ now - relativedelta(hours=hourly, days=daily, weeks=weekly, months=i) for i in range(0, monthly) ]
-    years = [ now - relativedelta(hours=hourly, days=daily, weeks=weekly, months=monthly, years=i) for i in range(0, yearly) ]
-    return list(set(hours + days + weeks + months + years))
-
-def build_retention_exponential(n:int = 1) -> list[datetime]:
-    now = datetime.now(timezone.utc)
-    return [ now - relativedelta(hours=2**i) for i in range(0, n) ]
-
-
-def build_snapshot_keeplist(snapshots: list[Snapshot], retentions: list[datetime]) -> set[Path]:
-    # For each retention boundary (oldest to newest), keeps the oldest snapshot
-    # that is still newer than that boundary.
-    keeps = set()
-    for boundary in sorted(retentions):
-        candidates = [s for s in snapshots if s.time >= boundary]
-        if candidates:
-            oldest = min(candidates, key=lambda s: s.time)
-            keeps.add(oldest.path)
-    return keeps
-
-class Snapshot(NamedTuple):
-    path: Path
-    time: datetime
-
-def cleanup_snapshots(self:Job) -> int:
-    if ARGS.dry_run:
-        return 0
-        
-    cfg = self.snapshot_retention
-    fn = RETENTION_FN[cfg["fn"]]
-    retentions = fn(**cfg.get("config", {}))
-
-    subs = [p for p in Path(self.snapshot_dir).iterdir() if p.is_dir() and re.match(r'^\d{8}_\d{6}$', p.stem)]
-    valid = [Snapshot(p, self._parse_snapshot_time(p)) for p in subs if self._parse_snapshot_time(p) is not None]
-    keeps = build_snapshot_keeplist(valid, retentions)
-
-    to_delete = [s for s in valid if s.path not in keeps]
-    for s in to_delete:
-        snapshot_delete(s.path)
-
-    LOG(f"deleted: {len(to_delete)}")
-    return len(to_delete)
+```
+snapshot_retention = {"fn": "exponential", "config": {"n": 9}}        # boundaries at 2^(i-1) h: 1h, 2h, 4h, 8h, ...
+snapshot_retention = {"fn": "datetimes",  "config": {"hourly": 8, "daily": 7, "weekly": 4, "monthly": 3}}
 ```
 
-### Safety Constraint: Snapshot Age Assertion
+Algorithm (shared by both strategies):
 
-```python
-assert (datetime.now(timezone.utc) - snapshot.time) > timedelta(hours=12), \
-    f"Snapshot {snapshot_name} is too new ({snapshot_time}). " \
-    f"Backups must use snapshots >12 hours old."
-```
+- Generate retention boundaries (oldest to newest) from the chosen function.
+- For each boundary, keep the **oldest snapshot still newer than that boundary**.
+- Delete every snapshot not on the keep-list.
+- The snapshot currently being backed up (the protected snapshot) is always kept.
+- Only snapshots under `snapshot_dir` matching the naming format are considered; all others are ignored.
 
 ---
 
@@ -193,6 +122,7 @@ assert (datetime.now(timezone.utc) - snapshot.time) > timedelta(hours=12), \
 
 Default: `config/config.json` (repo-relative)
 Override: `-c/--config` flag or `SNAPBAK_CONFIG_FILE` env var
+Production: `SNAPBAK_CONFIG_FILE=/opt/snap-bak/config.json` (set by the systemd service)
 
 ### Config Schema
 
@@ -202,10 +132,11 @@ Override: `-c/--config` flag or `SNAPBAK_CONFIG_FILE` env var
   "jobs": [Job],
   "mount_base": "/bak",
   "stuck_threshold": "1h",        // int seconds or human-readable duration
-  "stuck_wait": 300,              // how long to sleep between checking global lock
+  "stuck_wait": 300,              // total seconds to keep re-checking a stuck lock
   "restic_update": "never"
 }
 ```
+
 `restic_update` (`after|never`, default `never`) controls when the privileged
 wrapper's `update-restic` op runs. `after` = update only after a run in which a
 backup actually completed (never on skipped/dry-run runs — updating restic
@@ -213,13 +144,19 @@ rewrites a binary carrying `cap_dac_read_search`, so it must never run without
 reason). `never` = manual only. `before` is deliberately unsupported: it would
 update before knowing whether any backup will happen.
 
+Duration and size fields (`stuck_threshold`, `stuck_wait`, `size_limit`,
+`snapshot_interval`, `backup_interval`, `timeout`) accept either a bare
+integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
+`"1w"`, `"200GB"`, `"1.5TiB"`. Units: durations `s m h d w`; sizes
+`b k/kb/kib m/mb/mib g/gb/gib t/tb/tib p/pb/pib` (binary multiples).
+
 ### Repo Schema
 
 ```json
 {
-  "name": "undefined",
-  "path": "",
-  "password_file": "/home/user/.restic_password",
+  "name": "primary",
+  "path": "rclone:CONFIG_ENTRY:DIRECTORY",
+  "password_file": "/opt/snap-bak/passwords/primary",
   "size_limit": "200GB",
   "latency_ms": 100,
   "throughput_mbps": 1,
@@ -231,7 +168,7 @@ update before knowing whether any backup will happen.
 |-------|------|---------|-------------|
 | `name` | string | required | Unique repo identifier |
 | `path` | string | required | Restic repo path (e.g., `rclone:CONFIG_ENTRY:DIRECTORY`) |
-| `password_file` | string | "" | Path to restic password file |
+| `password_file` | string | "" | Path to restic password file (per-repo, under `/opt/snap-bak/passwords/`) |
 | `size_limit` | int/string | 0 | Max repo size (0 = unlimited). Int bytes or e.g. `"200GB"` |
 | `latency_ms` | int | 100 | Estimated latency for ETA calculation |
 | `throughput_mbps` | int | 1 | Estimated throughput for ETA calculation (seeding hint) |
@@ -279,101 +216,16 @@ update before knowing whether any backup will happen.
 | `tag` | string | job name | `[A-Za-z0-9_-]` | Restic tag override |
 | `restic_options` | list | `[]` | — | Extra restic CLI flags for this job |
 
+The orchestrator also populates runtime fields that are never read from config:
+`repos`, `mount_base`, `dry_run`, `config_path`; plus the Phase 2 planning state
+`delayed`, `protected_snapshot`, `missed_slots`, `planned_snapshot`,
+`backup_planned`.
+
 `restic_options` on both Repo and Job are appended verbatim to restic
 command lines (repo options first, then job options). Flags snap-bak manages
 itself are filtered out with a warning if a config author sets them:
 `-r/--repo`, `--password-file`, `--json`, `--dry-run`, `--tag`, `--keep-*`,
 `--prune`, `--exclude`, `--exclude-file`.
-
----
-
-## Data Models (Pydantic)
-
-### Repo
-
-```python
-class Repo(BaseModel):
-    model_config = ConfigDict(extra='ignore')
-
-    name: str
-    path: str  # NOT Path — restic paths like 'rclone:CONFIG_ENTRY:DIRECTORY'
-    password_file: str = ""
-    size_limit: int = Field(default=0, ge=0)
-    latency_ms: int = Field(default=100, ge=0)
-    throughput_mbps: int = Field(default=1, ge=0)
-    restic_options: list = Field(default_factory=list)
-
-    @field_validator('size_limit', mode='before')
-    @classmethod
-    def _parse_size_limit(cls, v):
-        return parse_size(v)  # int bytes or e.g. '200GB'
-```
-
-### Job
-
-```python
-class Job(BaseModel):
-    model_config = ConfigDict(extra='allow')  # extra='allow' for test mocking
-
-    # Config fields
-    name: str
-    snapshot_dir: str
-    source_subvolume: str
-    repo: str
-    priority: int = Field(default=100, ge=1)
-    snapshot_interval: int = Field(default=3600, ge=900)
-    backup_retention: dict = Field(default_factory=dict)
-    snapshot_retention: dict = Field(default_factory=lambda: {"fn": "exponential", "config": {"n": 5}})
-    backup_interval: int = Field(default=3600, ge=1)
-    backup_window_start: str | None = None
-    backup_window_end: str | None = None
-    ignore_file: str = ""
-    excludes: list = Field(default_factory=list)
-    timeout: int = Field(default=86400, ge=1)
-    tag: str | None = None
-    restic_options: list = Field(default_factory=list)
-
-    @field_validator('snapshot_interval', 'backup_interval', 'timeout', mode='before')
-    @classmethod
-    def _parse_interval(cls, v):
-        return parse_duration(v)  # int seconds or e.g. '2h', '1w'
-
-    # Runtime fields (not from config)
-    repos: list = Field(default_factory=list, exclude=True)
-    mount_base: str = "/bak"
-    dry_run: bool = False
-    config_path: str | None = None
-
-    # Phase 2 runtime fields
-    delayed: bool = Field(default=False, exclude=True)
-    protected_snapshot: str | None = Field(default=None, exclude=True)
-    missed_slots: int = Field(default=0, exclude=True)
-    planned_snapshot: Path | None = Field(default=None, exclude=True)
-    backup_planned: bool = Field(default=False, exclude=True)
-```
-
-### SnapBakConfig
-
-```python
-class SnapBakConfig(BaseModel):
-    model_config = ConfigDict(extra='ignore')
-
-    repos: list[Repo]
-    jobs: list[Job]
-    mount_base: str = "/bak"
-    stuck_threshold: int = Field(default=3600, ge=1)
-    restic_update: str = "never"  # 'after' | 'never'
-    stuck_wait: int = Field(default=300, ge=1)
-
-    @field_validator('stuck_threshold', mode='before')
-    @classmethod
-    def _parse_stuck_threshold(cls, v):
-        return parse_duration(v)  # int seconds or e.g. '1h'
-```
-
-Duration/size strings are parsed by `parse_duration` / `parse_size`
-(units `s m h d w` and `b k/kb/kib m/mb/mib g/gb/gib t/tb/tib p/pb/pib`,
-binary multiples). Bare integers pass through unchanged.
 
 ---
 
@@ -386,36 +238,43 @@ Per-job status stored at `/opt/snap-bak/state/<job_name>_status.json`.
 ```json
 {
   "job": "data",
-  "status": "success|skipped|delayed|failed|dry_run",
-  "timestamp": "2026-07-26T10:30:00",
+  "status": "started|success|skipped|delayed|failed|dry_run",
+  "timestamp": "2026-07-26_10:30",
   "message": "Backup completed",
   "snapshot_name": "2026-07-25_22:00",
-  "snapshot_time": "2026-07-25 22:00",
+  "snapshot_time": "2026-07-25_22:00",
   "delayed": false,
   "delayed_reason": null,
   "protected_snapshot": null,
-  "missed_slots": 0
+  "missed_slots": 0,
+  "restic_snapshot_id": null,
+  "failure_category": null,
+  "last_error": null
 }
 ```
+
+`restic_snapshot_id` is present on success; `failure_category` and `last_error`
+are present on failure. All fields except `job`, `status`, `timestamp`, and
+`message` are optional.
+
+The `delayed` group carries the delayed-job state (see Delayed Job Handling):
+`delayed` is true while the job cannot proceed; `delayed_reason` is
+`"unreachable"` or `"size_limit"`; `protected_snapshot` names the exact
+snapshot to retry (same `YYYY-MM-DD_HH:MM` format as the snapshot naming rule);
+`missed_slots` counts missed backup slots and feeds the priority system. On
+success the group resets to `delayed=false`, `delayed_reason=null`,
+`protected_snapshot=null`, `missed_slots=0`.
 
 ### Status Values
 
 | Status | Meaning | Exit Code |
 |--------|---------|-----------|
+| `started` | Backup initiated | — |
 | `success` | Backup completed | 0 |
-| `skipped` | Not time / outside window | 0 |
+| `skipped` | Not time / outside window / snapshot too young | 0 |
 | `delayed` | Repo unreachable or over size_limit | 30-31 (temp) |
 | `failed` | Backup failed and slot expired | 41 (perm) |
 | `dry_run` | Preflight only | 0 |
-
-### Delayed Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `delayed` | bool | Whether job is currently delayed |
-| `delayed_reason` | string | `"unreachable"` or `"size_limit"` |
-| `protected_snapshot` | string | Snapshot name to retry (e.g., `"20260725_220000"`) |
-| `missed_slots` | int | How many backup slots were missed (used for priority) |
 
 ---
 
@@ -433,7 +292,7 @@ Per-job status stored at `/opt/snap-bak/state/<job_name>_status.json`.
 | 40 | EXIT_PERM_TIMEOUT | Permanent | Backup not completed in window |
 | 41 | EXIT_PERM_FAILED | Permanent | Backup failed and slot expired |
 | 50 | EXIT_SYSTEM | System | Lock acquisition failed (no stale instance to clean up) |
-| 51 | EXIT_SYSTEM | System | Stuck wait exceeded |
+| 51 | EXIT_STUCK_WAIT | System | Stuck wait exceeded |
 
 ### Temporary vs Permanent
 
@@ -558,18 +417,9 @@ B runs first (400), then C (200), then A (100).
 assert (datetime.now(timezone.utc) - snapshot_time).total_seconds() >= 12 * 3600
 ```
 
----
-
-## Cleanup
-
-### Algorithm
-
-Keeps N snapshots spaced exponentially:
-
-- Tier 1: oldest snapshot within last 1 hour
-- Tier 2: oldest snapshot within last 2 hours
-- Tier 3: oldest snapshot within last 4 hours
-- Tier N: oldest snapshot within last 2^(N-1) hours
+A snapshot younger than 12 hours is skipped (never failed), so a snapshot just
+created by the scheduler is only uploaded after it has had time to be noticed
+and reviewed.
 
 ---
 
@@ -596,14 +446,15 @@ Prevents multiple snap-bak instances from running simultaneously.
 
 ### Implementation
 
-- Lock file: snap-bak.lock
+- Lock file: `/opt/snap-bak/state/snap-bak.lock`
 - Uses `fcntl.flock(LOCK_EX | LOCK_NB)`
 - Lock file contains JSON with PID, job info, timestamps
-- Stuck snap-bak detection: if lock age > `stuck_threshold`
-  - If locked PID no longer exists: break lock, warn user, continue
-  - If locked PID exists: sleep stick_wait seconds and re-check
-  - If lock releases (old process exits): continue normally
-- if stuck_threshold exceeded -> temporary failure unless (now - lock age) > 12h
+- Stuck detection: if lock age > `stuck_threshold` (default 3600s):
+  - If the locked PID no longer exists: break the lock, warn, continue
+  - If the locked PID exists: re-check periodically (every 60s) until the lock
+    clears or `stuck_wait` seconds total have elapsed
+  - If the lock releases (old process exits): continue normally
+  - If `stuck_wait` is exceeded: log STUCK WAIT EXCEEDED and exit `EXIT_STUCK_WAIT` (51)
 
 The global lock is the only lock. There is deliberately no per-job lock: it
 would duplicate the global lock's job (preventing concurrent instances) for no
@@ -611,21 +462,28 @@ additional protection, so it was removed for simplicity.
 
 ---
 
-### Contents
+## State & Runtime Directories
 
 ```
-/opt/snap-bak           # owned by root
-  snap_bak.py
-  snap-bak-io           # owned by root - sudoers grants priviledges for snapshots, etc
-  config.json           # owned by root
-  rclone                # optional if restic uses rclone
-  restic                # owned by root
+/opt/snap-bak           # root-owned: program, wrapper, config
+  snap_bak.py           # orchestrator (root:root 0644)
+  snap-bak-io           # sudo wrapper (root:root 0755)
+  config.json           # root-owned, validated by the wrapper
 
-/opt/snap-bak/state     # owned by snap-bak
+/opt/snap-bak/state     # owned by snap-bak: runtime state
   snap-bak.lock         # Global lock file
   throughput.json       # Per-repo transfer-rate history (capped at 10/repo)
   <job_name>_status.json  # Per-job status
+
+/opt/snap-bak/excludes  # ignore_file location (root:snap-bak)
+/opt/snap-bak/passwords # per-repo restic password files (owned by snap-bak)
+/opt/snap-bak/cache     # restic cache (RESTIC_CACHE_DIR)
 ```
+
+The `restic` and `rclone` binaries are optional (restic may be installed at
+`/usr/local/bin/restic`; rclone only if a repo uses an `rclone:` path). No
+`.local` or `.config` directories are used; all paths are hardcoded under
+`/opt/snap-bak`.
 
 ---
 
@@ -656,19 +514,22 @@ snap-bak [OPTIONS]
 | `-j, --job` | Run specific job by name (default: all jobs) |
 | `-n, --dry-run` | Simulate backup (preflight only, no upload/delete) |
 | `-l, --list-jobs` | List configured jobs and exit |
+| `--log-file` | Also write logs to this file (default: stderr only; captured by systemd journal) |
 
 ### Environment Variables
 
-| Variable | Description |
-|----------|-------------|
-| `SNAPBAK_CONFIG_FILE` | Config file path |
-| `SNAPBAK_JOB` | Job name to run |
-| `SNAPBAK_SUDO` | Sudo binary used to invoke the wrapper |
-| `SNAPBAK_IO_WRAPPER` | Path to the root-owned wrapper |
+| Variable | Description | Production value |
+|----------|-------------|------------------|
+| `SNAPBAK_CONFIG_FILE` | Config file path | `/opt/snap-bak/config.json` |
+| `SNAPBAK_JOB` | Job name to run | — |
+| `SNAPBAK_SUDO` | Sudo binary used to invoke the wrapper | `sudo` |
+| `SNAPBAK_IO_WRAPPER` | Path to the root-owned wrapper | `/opt/snap-bak/snap-bak-io` |
+| `SNAPBAK_STATE_DIR` | State directory override (default: `/opt/snap-bak/state`) | `/opt/snap-bak/state` |
+| `RESTIC_CACHE_DIR` | Restic cache base | `/opt/snap-bak/cache` |
 
 ---
 
-## Privileged Operations
+## Privileged Operations & Security
 
 Btrfs snapshot create/delete and mount/umount require root. snap-bak runs as
 an unprivileged service user and delegates these to a **root-owned wrapper**
@@ -707,25 +568,14 @@ deliberately NOT used because sudo-rs mishandles it. The wrapper:
 Because the wrapper derives paths from config at runtime, changing
 `mount_base` or `snapshot_dir` never requires editing sudoers.
 
-The `restic_update` policy (`after|never`, default `never`) controls when the
-orchestrator invokes `update-restic`. `after` runs it only after a run in
-which a backup actually completed (never when every job was skipped, dry-run,
-or failed) — updating restic rewrites a `cap_dac_read_search`-carrying binary,
-so it must not run for no reason. `never` leaves updates to the administrator.
-
----
-
-## Security Requirements
-
 Invariants snap-bak must never breach:
 
 1. **Least privilege.** Only `snap-bak-io` performs privileged operations.
    snap-bak is granted none of them; sudo permits only the wrapper.
-2. **Root-owned files.** `snap-bak-io`, `config.json`, and
-   `/usr/local/bin/restic` are root-owned, not writable by group/other — the
-   wrapper is the root boundary, config is its trusted input, and restic
-   carries `cap_dac_read_search`. Writable by snap-bak ⇒ trivial root
-   escalation.
+2. **Root-owned files.** `snap-bak-io`, `config.json`, and the restic binary
+   are root-owned, not writable by group/other — the wrapper is the root
+   boundary, config is its trusted input, and restic carries
+   `cap_dac_read_search`. Writable by snap-bak ⇒ trivial root escalation.
 3. **Trust boundary.** `snap-bak-io` is trusted, snap-bak is not. The wrapper
    validates every argument against root-owned config; privileged ops never
    trust snap-bak-supplied paths/arguments.
@@ -752,8 +602,9 @@ come only from root-owned config.
 
 ### Framework
 
-- pytest with tmp_path / monkeypatch fixtures
-- run via `uv run python -m pytest tests/`
+- pytest (tmp_path / monkeypatch fixtures; `SNAPBAK_STATE_DIR` redirected in
+  `conftest.py` so no state leaks into the real system)
+- 111 tests, all passing
 
 ### Test Categories
 
@@ -785,8 +636,9 @@ uv run pytest -q
 
 ## Dependencies
 
-- Python 3.13+
-- python-dateutil (relativedelta for retention calculations)
+- Python ≥ 3.10
 - pydantic >= 2.0 (config models)
+- python-dateutil (relativedelta for retention calculations)
+- json5 (JSONC config parsing)
 - restic (backup tool)
 - btrfs-progs (snapshot management)
