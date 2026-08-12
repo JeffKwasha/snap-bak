@@ -721,6 +721,66 @@ class TestResticUpdateGate:
         assert not _restic_update_due([], "after")
 
 
+class TestResticCmdPolicy:
+    """restic_options/excludes apply to backup; global options only elsewhere."""
+
+    def test_backup_cmd_has_options_and_excludes(self, sample_job):
+        sample_job.repo_obj.restic_options = ["--compression=better"]
+        sample_job.restic_options = ["--one-file-system"]
+        sample_job.ignore_file = "/etc/x.ignore"
+        sample_job.excludes = ["*.tmp", "*.cache"]
+        cmd = sample_job._restic_cmd("backup")
+        assert cmd[3] == "backup"
+        assert "--compression=better" in cmd      # global option
+        assert "--one-file-system" in cmd         # backup-only option
+        assert ["--exclude-file", "/etc/x.ignore"] in [cmd[i:i + 2] for i in range(len(cmd) - 1)]
+        assert "--exclude" in cmd
+
+    def test_forget_cmd_no_backup_only_flags(self, sample_job):
+        sample_job.repo_obj.restic_options = ["--compression=better"]
+        sample_job.restic_options = ["--one-file-system"]
+        sample_job.ignore_file = "/etc/x.ignore"
+        sample_job.excludes = ["*.tmp"]
+        cmd = sample_job._restic_cmd("forget")
+        assert cmd[3] == "forget"
+        assert "--compression=better" in cmd      # global option still applies
+        assert "--one-file-system" not in cmd
+        assert "--exclude" not in cmd
+        assert "--exclude-file" not in cmd
+
+    def test_probe_cmd_global_only(self, sample_job):
+        sample_job.repo_obj.restic_options = ["--compression=better", "--option", "rclone.program=foo"]
+        cmd = sample_job._restic_cmd("cat")
+        assert cmd[3] == "cat"
+        assert "--compression=better" in cmd
+        assert "--option" in cmd
+        assert "--exclude" not in cmd
+
+    def test_forget_and_prune_command(self, sample_job):
+        """forget carries tag + keep-* + prune, but never excludes."""
+        sample_job.backup_retention = {"daily": 6, "monthly": 4}
+        sample_job.tag = "MyTag"
+        sample_job.excludes = ["*.tmp"]
+        calls = []
+        sample_job._run = lambda cmd, **kw: calls.append(cmd)
+        sample_job._forget_and_prune()
+        cmd = calls[0]
+        assert cmd[3] == "forget"
+        assert "--tag" in cmd
+        assert ["--keep-daily", "6"] in [cmd[i:i + 2] for i in range(len(cmd) - 1)]
+        assert ["--keep-monthly", "4"] in [cmd[i:i + 2] for i in range(len(cmd) - 1)]
+        assert cmd[-1] == "--prune"
+        assert "--exclude" not in cmd
+        assert "--exclude-file" not in cmd
+
+    def test_reserved_flag_dropped_with_warning(self, sample_job, caplog):
+        sample_job.restic_options = ["--tag", "bogus"]
+        with caplog.at_level("WARNING"):
+            cmd = sample_job._restic_cmd("backup")
+        assert "--tag" not in cmd
+        assert "reserved flag '--tag'" in caplog.text
+
+
 class TestHumanReadableQuantities:
     """Duration/size fields accept ints or strings like '2h', '1w', '200GB'."""
 
@@ -1168,17 +1228,35 @@ class TestNameValidation:
 
 
 class TestPasswordFilePermissions:
-    def test_loose_permissions_hard_exit(self, sample_repos, tmp_path):
+    @pytest.mark.parametrize(
+        ("mode", "wrong_gid", "expect_exit"),
+        [
+            (0o644, False, True),   # other-readable
+            (0o660, False, True),   # group-writable
+            (0o640, True, True),    # group-read but not the service group
+            (0o640, False, False),  # group-read by the service group
+            (0o600, False, False),  # owner-only
+        ],
+    )
+    def test_password_file_permissions(self, sample_repos, tmp_path, monkeypatch,
+                                       mode, wrong_gid, expect_exit):
         secret = tmp_path / "secret"
         secret.write_text("pw\n")
-        secret.chmod(0o644)
+        os.chown(secret, -1, os.getgid())
+        secret.chmod(mode)
+        if wrong_gid:
+            real_gid = os.getgid()
+            monkeypatch.setattr(snapbak_module.os, "getgid", lambda: real_gid + 1000)
         job = Job(name="t", snapshot_dir=str(tmp_path), source_subvolume=str(tmp_path),
                   repo="primary", repos=sample_repos, config_path=str(tmp_path / "c.json"))
         job.repo_obj.password_file = str(secret)
 
-        with pytest.raises(SystemExit) as ei:
+        if expect_exit:
+            with pytest.raises(SystemExit) as ei:
+                job._check_password_file_permissions()
+            assert ei.value.code == EXIT_PERMISSION_ERROR
+        else:
             job._check_password_file_permissions()
-        assert ei.value.code == EXIT_PERMISSION_ERROR
 
 
 class TestGlobalLock:

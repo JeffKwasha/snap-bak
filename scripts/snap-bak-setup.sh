@@ -35,6 +35,7 @@ CACHE_DIR="$SNAPBAK_DIR/cache"
 
 # Source files co-located with this setup script.
 SCRIPT_SRC="$(dirname "$(readlink -f "$0")")/snap_bak.py"
+RESTIC_MODULE_SRC="$(dirname "$(readlink -f "$0")")/restic.py"
 WRAPPER_SRC="$(dirname "$(readlink -f "$0")")/snap-bak-io"
 
 # --- 0. PYTHON DEPENDENCIES (for system python3) ---
@@ -73,8 +74,9 @@ else
 fi
 
 # /opt/snap-bak is ROOT-owned (0755). The service user must not be able to
-# replace snap_bak.py or snap-bak-io: the wrapper is the sudo security
-# boundary, so a writable install dir would mean trivial root escalation.
+# replace snap_bak.py, restic.py, or snap-bak-io: the wrapper is the sudo
+# security boundary, so a writable install dir would mean trivial root
+# escalation.
 mkdir -p "$SNAPBAK_DIR"
 chown root:root "$SNAPBAK_DIR"
 chmod 0755 "$SNAPBAK_DIR"
@@ -84,13 +86,18 @@ if [ ! -f "$SCRIPT_SRC" ]; then
     echo "[!] Cannot find $SCRIPT_SRC. Place snap_bak.py next to this script." >&2
     exit 1
 fi
+if [ ! -f "$RESTIC_MODULE_SRC" ]; then
+    echo "[!] Cannot find $RESTIC_MODULE_SRC. Place restic.py next to this script." >&2
+    exit 1
+fi
 if [ ! -f "$WRAPPER_SRC" ]; then
     echo "[!] Cannot find $WRAPPER_SRC. Place snap-bak-io next to this script." >&2
     exit 1
 fi
 install -o root -g root -m 0644 "$SCRIPT_SRC" "$SCRIPT_PATH"
+install -o root -g root -m 0644 "$RESTIC_MODULE_SRC" "$SNAPBAK_DIR/restic.py"
 install -o root -g root -m 0755 "$WRAPPER_SRC" "$WRAPPER_PATH"
-echo "[*] Installed $SCRIPT_PATH (root:root 0644) and $WRAPPER_PATH (root:root 0755)."
+echo "[*] Installed $SCRIPT_PATH, $SNAPBAK_DIR/restic.py (root:root 0644) and $WRAPPER_PATH (root:root 0755)."
 
 # --- 1d. VERIFY/UPDDATE RESTIC (setcap + self-update via the wrapper) ---
 # The wrapper is the single code path for restic trust + setcap (see its
@@ -222,8 +229,9 @@ SNAPBACK_EOF
 fi
 
 # Create password directory. Restic runs as the service user and must be able
-# to read the password file, so the directory is owned by the service user
-# (files inside should be chmod 600).
+# to read the password files, so they are owned by the admin and group-readable
+# by the service group (e.g. admin:snap-bak, mode 0640). The directory stays
+# owned by snap-bak; the admin creates files here via sudo.
 mkdir -p "$SNAPBAK_DIR/passwords"
 chown "$SERVICE_USER":"$SERVICE_GROUP" "$SNAPBAK_DIR/passwords"
 chmod 0750 "$SNAPBAK_DIR/passwords"
@@ -329,7 +337,10 @@ echo " Service:     $SERVICE_NAME"
 echo "===================================================="
 echo " NEXT STEPS:"
 echo " 1. Edit $CONFIG_FILE to match your actual environment."
-echo " 2. Create your restic password file in $SNAPBAK_DIR/passwords/ and chmod 600 it."
+echo " 2. Create your restic password file in $SNAPBAK_DIR/passwords/, owned by"
+echo "    you and readable by the service group:"
+echo "       sudo chown <you>:snap-bak <file>.pw && sudo chmod 640 <file>.pw"
+echo "    (or owner-only chmod 600). The gate rejects other groups/other access."
 echo " 3. Copy your rclone config to $SNAPBAK_DIR/.config/rclone/rclone.conf (chmod 600)."
 echo " 4. Ensure snapshot_dir paths exist (btrfs snapshots are created as root via the wrapper)."
 echo " 5. Ensure restic repo path is accessible by $SERVICE_USER (read/write)."

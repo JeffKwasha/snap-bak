@@ -63,7 +63,11 @@ group, and existing `config.json` (so your edits are preserved), refreshes the
 program + unit files, and re-validates sudoers.
 
 Before enabling, edit `/opt/snap-bak/config.json` to match your environment and
-create the per-repo restic password files under `/opt/snap-bak/passwords/`.
+create the per-repo restic password files under `/opt/snap-bak/passwords/` —
+owned by you and readable by the service group:
+`sudo chown <you>:snap-bak <file> && sudo chmod 640 <file>`. The gate accepts
+owner-only (0600) or owner + `snap-bak` group-read (0640); a group other than
+`snap-bak`, group write/execute, or any `other` access is rejected (exit 4).
 
 ## How It Works
 
@@ -139,9 +143,10 @@ sudoers lets the service user run.
     run in which a backup actually completed, never for skipped/dry-run runs.
 5.  **Minimal Surface Area**: The restic process runs as the unprivileged
     `snap-bak` user. `/opt/snap-bak` is root-owned; only `state/`, `cache/`,
-    `passwords/`, `.config/rclone/` are writable by the service user, so a
-    compromised backup tool cannot replace the wrapper (which would be trivial
-    root escalation).
+    `.config/rclone/` are writable by the service user, so a compromised backup
+    tool cannot replace the wrapper (which would be trivial root escalation).
+    Restic credentials under `passwords/` are owned by the admin and readable
+    only via the `snap-bak` group, never by other users.
 
 - **Per-repo password files** — each restic repo has its own password file
 - **Rate tracking** — measured backup speed is kept in state (`throughput.json`)
@@ -224,7 +229,7 @@ Edit `config/config.json`:
 | `size_limit` | Max backup size: int bytes or e.g. `"200GB"`; `0` = unlimited | `0` |
 | `latency_ms` | Estimated latency in milliseconds (metadata) | `100` |
 | `throughput_mbps` | Estimated throughput in Mbps (seeding hint) | `1` |
-| `restic_options` | Extra restic CLI flags for every command against this repo | `[]` |
+| `restic_options` | Extra restic CLI flags against this repo; global options apply to every command, backup-only options to `backup` alone | `[]` |
 
 ### Job settings
 
@@ -245,21 +250,25 @@ Edit `config/config.json`:
 | `excludes` | list | List of glob patterns to exclude | `[]` |
 | `timeout` | int/str | Command timeout: seconds or e.g. `"24h"` | `86400` |
 | `tag` | string | Restic tag override for this job's backups/forget | job name |
-| `restic_options` | list | Extra restic CLI flags for this job | `[]` |
+| `restic_options` | list | Extra restic CLI flags for this job; global options apply to every command, backup-only options to `backup` alone | `[]` |
 
 **Note on `restic_options`:** Both `repos[].restic_options` and
-`jobs[].restic_options` are appended verbatim to restic command lines. Flags
-snap-bak manages itself are **ignored with a warning** if configured here:
-`-r/--repo`, `--password-file`, `--json`, `--dry-run`, `--tag`, `--keep-*`,
-`--prune`, `--exclude`, `--exclude-file`.
+`jobs[].restic_options` are appended verbatim to restic command lines. Options
+in restic's global set (see `scripts/restic.py` `RESTIC_GLOBAL_FLAGS`) apply
+to **every** restic command; **all other options are backup-only** and apply
+to the `backup` subcommand alone. Flags snap-bak manages itself are **ignored
+with a warning** if configured here: `-r/--repo`, `--password-file`, `--json`,
+`--dry-run`, `--tag`, `--keep-*`, `--prune`, `--exclude`, `--exclude-file`.
+
+**Note on `ignore_file` and `excludes`:** Both are passed to restic as
+`--exclude-file` and `--exclude` flags respectively. They are additive —
+both apply. `ignore_file` uses `.gitignore`-style syntax. Exclude flags are
+backup-only: they are never passed to other restic commands (e.g. `forget`),
+which reject them.
 
 **Note on `tag`:** Defaults to the job name, so `--tag <name>` is applied to
 every backup and forget. Set it to change the restic tag; use
 `restic snapshots --tag <your-tag>` to filter by it.
-
-**Note on `ignore_file` and `excludes`:** Both are passed to restic as
-`--exclude-file` and `--exclude` flags respectively. They are additive —
-both apply. `ignore_file` uses `.gitignore`-style syntax.
 
 **Note on `backup_retention` vs `snapshot_retention`:** `backup_retention`
 controls restic's offsite backup retention (how many backup versions to keep

@@ -42,6 +42,16 @@ from typing import ClassVar, NamedTuple
 from dateutil.relativedelta import relativedelta
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+# Restic command building/output parsing lives in scripts/restic.py — a
+# dependency-free module safe for the root-owned snap-bak-io wrapper to reuse
+# later. Production runs this file directly (python3 /opt/snap-bak/snap_bak.py,
+# see snap-bak-setup.sh), so fall back to a top-level `restic` import for the
+# non-packaged install layout.
+try:
+    from scripts import restic
+except ImportError:  # installed standalone under /opt/snap-bak/
+    import restic
+
 # --- Constants ---
 
 DEFAULT_CONFIG = Path(__file__).parent.parent / "config" / "config.json"
@@ -758,21 +768,28 @@ class Job(BaseModel):
     # --- Security ---
 
     def _check_password_file_permissions(self):
-        """Exit EXIT_PERMISSION_ERROR if a password file is readable/writable
-        by group or other.
+        """Exit EXIT_PERMISSION_ERROR if a password file is accessible by
+        group (beyond the service group) or by other.
 
-        The password file is a restic credential: any access beyond the owning
-        service user is a leak and must be fixed before backups proceed.
+        The password file is a restic credential. It may be read by the owner
+        (typically the admin) and, optionally, by the snap-bak service group
+        (e.g. `admin:snap-bak` with mode 0640). Any access for other users, or
+        group write/execute, is a leak and must be fixed before backups
+        proceed. The service group is the process's group (snap-bak).
         """
         repo = self.repo_obj
         if not repo.password_file:
             return
         try:
-            mode = os.stat(repo.password_file).st_mode
-            if mode & 0o077:
+            st = os.stat(repo.password_file)
+            mode = st.st_mode
+            if mode & 0o007 or (mode & 0o070) not in (0o000, 0o040) or (
+                mode & 0o040 and st.st_gid != os.getgid()
+            ):
                 logger.error(
-                    f"Password file {repo.password_file} is accessible by group/other "
-                    f"(mode {oct(mode & 0o777)}). Fix with: chmod 600 {repo.password_file}"
+                    f"Password file {repo.password_file} has unsafe permissions "
+                    f"(mode {oct(mode & 0o777)}). Fix with: chown <admin>:snap-bak "
+                    f"{repo.password_file} && chmod 640 {repo.password_file}"
                 )
                 sys.exit(EXIT_PERMISSION_ERROR)
         except FileNotFoundError:
@@ -822,22 +839,10 @@ class Job(BaseModel):
 
     # --- Repo checks (Phase 2) ---
 
-    def _probe_cmd(self, subcommand: str, repo: Repo) -> list[str]:
-        """Minimal restic command for read-only repo probes (cat/stats).
-
-        Only -r and --password-file are safe for every subcommand; repo/job
-        restic_options (e.g. --compression=better) are backup-oriented and
-        would make 'restic cat config' / 'restic stats' fail.
-        """
-        cmd = ["restic", "-r", repo.path, subcommand]
-        if repo.password_file:
-            cmd.extend(["--password-file", repo.password_file])
-        return cmd
-
     def _check_repo_reachable(self, repo: Repo) -> bool:
         """Probe repo reachability with 'restic cat config' (30s timeout)."""
         try:
-            self._run(self._probe_cmd("cat", repo) + ["config"], timeout=REPO_CHECK_TIMEOUT)
+            self._run(self._restic_cmd("cat", repo) + ["config"], timeout=REPO_CHECK_TIMEOUT)
             return True
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             logger.error(f"Repo {repo.name} unreachable: {e}")
@@ -847,11 +852,11 @@ class Job(BaseModel):
         """Measure raw repo size in bytes ('restic stats --mode raw-data')."""
         try:
             result = self._run(
-                self._probe_cmd("stats", repo) + ["--mode", "raw-data", "--json"],
+                self._restic_cmd("stats", repo) + ["--mode", "raw-data", "--json"],
                 timeout=REPO_STATS_TIMEOUT,
             )
-            line = result.stdout.strip().splitlines()[-1]
-            return int(json.loads(line).get("total_size", 0))
+            summary = restic.last_json_line(result.stdout)
+            return int(summary.get("total_size", 0)) if summary else 0
         except Exception as e:
             logger.warning(f"Could not measure repo {repo.name} size ({e}); assuming 0")
             return 0
@@ -1005,48 +1010,29 @@ class Job(BaseModel):
             logger.error(f"Command failed (rc={e.returncode}): {e.cmd} | stderr: {e.stderr}")
             raise
 
-    # restic flags that snap-bak sets itself; config restic_options may not
-    # override them (they would collide and break summary parsing/retention).
-    _RESERVED_RESTIC_FLAGS = {
-        "-r", "--repo", "--password-file", "--json", "--dry-run",
-        "--tag", "--keep-last", "--keep-hourly", "--keep-daily",
-        "--keep-weekly", "--keep-monthly", "--keep-yearly", "--prune",
-        "--exclude", "--exclude-file",
-    }
+    def _restic_cmd(self, subcommand: str, repo: Repo | None = None) -> list[str]:
+        """Build a restic command for `subcommand` from config.
 
-    def _filter_restic_options(self, options: list, source: str) -> list:
-        """Drop reserved restic flags (with a warning) from config options.
-
-        Reserved flags are ones snap-bak sets itself for bookkeeping (repo
-        location, password, JSON output, tags, retention, excludes). Config
-        authors may specify any other restic flag via restic_options.
+        Delegates to restic.build() so the flag policy lives in one place:
+        global restic options apply to every subcommand; backup-only options
+        and the --exclude-file/--exclude flags apply to `backup` alone (other
+        subcommands like `forget` reject them).
         """
-        kept = []
-        for opt in options:
-            flag = opt.split("=", 1)[0] if isinstance(opt, str) else opt
-            if flag in self._RESERVED_RESTIC_FLAGS:
-                logger.warning(
-                    f"{source} restic_options contains reserved flag '{opt}' "
-                    f"which snap-bak manages; ignoring it."
-                )
-                continue
-            kept.append(opt)
-        return kept
-
-    def _build_restic_cmd(self, subcommand: str, repo: Repo | None = None) -> list[str]:
-        """Build a restic command with common arguments."""
         if repo is None:
             repo = self.repo_obj
-        cmd = ["restic", "-r", repo.path, subcommand]
-        cmd.extend(self._filter_restic_options(repo.restic_options, f"repo '{repo.name}'"))
-        cmd.extend(self._filter_restic_options(self.restic_options, f"job '{self.name}'"))
-        if repo.password_file:
-            cmd.extend(["--password-file", repo.password_file])
-        if self.ignore_file:
-            cmd.extend(["--exclude-file", self.ignore_file])
-        for pattern in self.excludes:
-            cmd.extend(["--exclude", pattern])
-        return cmd
+        options = list(repo.restic_options) + list(self.restic_options)
+        return restic.build(
+            subcommand,
+            repo_path=repo.path,
+            password_file=repo.password_file,
+            options=options,
+            exclude_file=self.ignore_file or None,
+            excludes=self.excludes,
+            warn=lambda opt: logger.warning(
+                f"restic_options contains reserved flag '{opt}' "
+                f"which snap-bak manages; ignoring it."
+            ),
+        )
 
     @property
     def tag_arg(self) -> str:
@@ -1058,7 +1044,7 @@ class Job(BaseModel):
     def _preflight(self, mount_point: Path, repo: Repo | None = None) -> int:
         """Run a restic dry-run to estimate size and check remote connectivity."""
         logger.info(f"Job {self.name}: running preflight...")
-        cmd = self._build_restic_cmd("backup", repo)
+        cmd = self._restic_cmd("backup", repo)
         cmd.extend([
             str(mount_point),
             "--tag", self.tag_arg,
@@ -1067,8 +1053,10 @@ class Job(BaseModel):
         ])
         try:
             result = self._run(cmd)
-            lines = [l for l in result.stdout.strip().split('\n') if l.strip()]
-            summary = json.loads(lines[-1])
+            summary = restic.last_json_line(result.stdout)
+            if summary is None:
+                logger.warning("Could not parse preflight output")
+                return 0
             total_size = summary.get("total_size", 0)
             total_files = summary.get("total_files", 0)
             logger.info(f"PREFLIGHT: {total_files} files, {total_size / 1e9:.2f} GB")
@@ -1089,7 +1077,7 @@ class Job(BaseModel):
         restic stderr (warnings included) is surfaced at WARNING level so it
         can never be silently lost.
         """
-        cmd = self._build_restic_cmd("backup", repo)
+        cmd = self._restic_cmd("backup", repo)
         cmd.extend([str(mount_point), "--tag", self.tag_arg, "--json"])
         try:
             result = self._run(cmd, timeout=self.timeout)
@@ -1102,18 +1090,8 @@ class Job(BaseModel):
                 logger.warning(f"restic: {line}")
         # Parse restic's own success report for the snapshot id. A zero exit with
         # no usable summary is still success per restic's contract.
-        snapshot_id = None
-        for line in reversed(result.stdout.strip().splitlines()):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                summary = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(summary, dict) and summary.get("message_type") == "summary":
-                snapshot_id = summary.get("snapshot_id")
-                break
+        summary = restic.find_summary(result.stdout)
+        snapshot_id = summary.get("snapshot_id") if summary else None
         return snapshot_id
 
     def _forget_and_prune(self, repo: Repo | None = None):
@@ -1124,7 +1102,7 @@ class Job(BaseModel):
                 f"forget/prune will run; remote snapshots are kept forever."
             )
             return
-        cmd = self._build_restic_cmd("forget", repo)
+        cmd = self._restic_cmd("forget", repo)
         cmd.extend(["--tag", self.tag_arg])
         for key, val in self.backup_retention.items():
             cmd.extend([f"--keep-{key}", str(val)])
@@ -1493,11 +1471,12 @@ def _restic_update_due(results: list[dict], restic_update: str) -> bool:
 def _run_restic_update() -> None:
     """Run the privileged 'update-restic' wrapper op after a successful backup.
 
-    Updating restic rewrites a binary that carries cap_dac_read_search — the
-    read-anything capability — so it must only run when a backup actually
-    happened this run (the caller guarantees this). A failure never aborts the
-    run: the existing binary remains usable (rc 0 = updated, rc 2 = self-update
-    failed but old binary retained + setcap applied).
+    snap-bak MUST never run `restic self-update` itself: the restic binary
+    carries cap_dac_read_search (read-anything), and the service user must not
+    be able to replace it. Only the root-owned snap-bak-io wrapper executes the
+    update, after verifying the binary is root-owned and un-writable by others.
+    A failure never aborts the run: the existing binary remains usable (rc 0 =
+    updated, rc 2 = self-update failed but old binary retained + setcap applied).
     """
     cmd = [SUDO, IO_WRAPPER, "update-restic"]
     logger.info(f"running {' '.join(cmd)}")

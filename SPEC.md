@@ -38,7 +38,9 @@ Check global conditions once per run. If invalid, log error and exit.
 - required files and directories exist with correct owner/group/permissions
 - directories exist: Snapshot, Mount, status (restic cache is only warned about —
   restic recreates it, so a missing cache dir is not fatal)
-- password files are not accessible by group/other (hard gate, exit 4)
+- password files are readable only by the owner and (optionally) the snap-bak
+  service group; never by other users or with group write/execute (hard gate,
+  exit 4)
 - Global Lock (prevent concurrent exec)
 ```
 
@@ -186,7 +188,7 @@ integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 | `size_limit` | int/string | 0 | Max repo size (0 = unlimited). Int bytes or e.g. `"200GB"` |
 | `latency_ms` | int | 100 | Estimated latency for ETA calculation |
 | `throughput_mbps` | int | 1 | Estimated throughput for ETA calculation (seeding hint) |
-| `restic_options` | list | `[]` | Extra restic CLI flags for every command against this repo |
+| `restic_options` | list | `[]` | Extra restic CLI flags against this repo; global options apply to every command, backup-only options to `backup` alone |
 
 ### Job Schema
 
@@ -228,7 +230,7 @@ integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 | `excludes` | list | `[]` | — | Restic exclude patterns |
 | `timeout` | int/string | `86400` | `ge=1` | Subprocess timeout: seconds or e.g. `"24h"` |
 | `tag` | string | job name | `[A-Za-z0-9_-]` | Restic tag override |
-| `restic_options` | list | `[]` | — | Extra restic CLI flags for this job |
+| `restic_options` | list | `[]` | — | Extra restic CLI flags for this job; global options apply to every command, backup-only options to `backup` alone |
 
 The planning state fields that appear in the status file — `delayed`,
 `delayed_reason`, `protected_snapshot`, `missed_slots` — are part of the
@@ -236,8 +238,13 @@ program's interface: they are persisted in the status file and never read from
 config.
 
 `restic_options` on both Repo and Job are appended verbatim to restic
-command lines (repo options first, then job options). Flags snap-bak manages
-itself are filtered out with a warning if a config author sets them:
+command lines (repo options first, then job options). Options in restic's
+global set (`RESTIC_GLOBAL_FLAGS` in `scripts/restic.py`, derived from
+`restic --help`) apply to every restic command; **all other options are
+backup-only** and apply to the `backup` subcommand alone. The `--exclude-file`
+and `--exclude` flags (from `ignore_file`/`excludes`) are likewise
+backup-only — other subcommands (e.g. `forget`) reject them. Flags snap-bak
+manages itself are filtered out with a warning if a config author sets them:
 `-r/--repo`, `--password-file`, `--json`, `--dry-run`, `--tag`, `--keep-*`,
 `--prune`, `--exclude`, `--exclude-file`.
 
@@ -300,7 +307,7 @@ success the group resets to `delayed=false`, `delayed_reason=null`,
 | 1 | EXIT_ERROR | General | Unexpected error |
 | 2 | EXIT_CONFIG_ERROR | Config | Config validation failed |
 | 3 | EXIT_MOUNT_ERROR | Mount | Mount base not found |
-| 4 | EXIT_PERMISSION_ERROR | Permission | Password file readable by group/other |
+| 4 | EXIT_PERMISSION_ERROR | Permission | Password file readable by a group other than snap-bak, or by other |
 | 30 | EXIT_TEMP_UNREACHABLE | Temporary | Repo unreachable (may self-rectify) |
 | 31 | EXIT_TEMP_SIZE_LIMIT | Temporary | Repo over size_limit (may self-rectify) |
 | 40 | EXIT_PERM_TIMEOUT | Permanent | Backup not completed in window |
@@ -480,7 +487,7 @@ per-job lock would add complexity without additional protection.
   <job_name>_status.json # Per-job status
 
 <install>/excludes       # ignore_file location (root:snap-bak)
-<install>/passwords      # per-repo restic password files (owned by snap-bak)
+<install>/passwords      # per-repo restic password files (owned by the admin, group snap-bak)
 <install>/cache          # restic cache (RESTIC_CACHE_DIR)
 ```
 
