@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Unit tests for snapbak.py — no remote restic, minimal IO."""
+
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -21,7 +23,6 @@ from pydantic import ValidationError
 
 from scripts.snap_bak import (
     DEFAULT_SNAPSHOT_INTERVAL,
-    DEFAULT_SNAPSHOT_INTERVAL_MIN,
     EXIT_PERM_FAILED,
     EXIT_PERM_TIMEOUT,
     EXIT_PERMISSION_ERROR,
@@ -35,28 +36,26 @@ from scripts.snap_bak import (
     Job,
     Repo,
     RemoteUnavailableError,
+    RepoLockedError,
+    FAIL_LOCKED,
     SnapBakConfig,
     _categorize_restic_error,
     _effective_priority,
-    _pid_alive,
-    _read_lock_info,
-    _resolve_lock_contention,
     _restic_update_due,
-    _write_lock_info,
-    acquire_global_lock,
+    _mounted_source,
+    restic_running,
     build_retention_datetimes,
     build_retention_exponential,
     build_snapshot_keeplist,
     load_config,
     parse_duration,
     parse_size,
-    release_global_lock,
-    touch_global_lock,
     Snapshot,
 )
 
 
 # --- Fixtures ---
+
 
 @pytest.fixture(autouse=True)
 def isolated_state(tmp_path, monkeypatch):
@@ -74,8 +73,22 @@ def isolated_state(tmp_path, monkeypatch):
 @pytest.fixture
 def sample_repos():
     return [
-        Repo(name="primary", path="rclone:CONFIG_ENTRY:DIRECTORY", password_file="/home/user/.restic_password", size_limit=1099511627776, latency_ms=50, throughput_mbps=10),
-        Repo(name="secondary", path="rclone:CONFIG_ENTRY:DIRECTORY", password_file="/home/user/.b2_password", size_limit=536870912000, latency_ms=200, throughput_mbps=5),
+        Repo(
+            name="primary",
+            path="rclone:CONFIG_ENTRY:DIRECTORY",
+            password_file="/home/user/.restic_password",
+            size_limit=1099511627776,
+            latency_ms=50,
+            throughput_mbps=10,
+        ),
+        Repo(
+            name="secondary",
+            path="rclone:CONFIG_ENTRY:DIRECTORY",
+            password_file="/home/user/.b2_password",
+            size_limit=536870912000,
+            latency_ms=200,
+            throughput_mbps=5,
+        ),
     ]
 
 
@@ -97,11 +110,29 @@ def sample_job(tmp_path, sample_repos):
 @pytest.fixture
 def create_snapshots(sample_job):
     """Factory to create snapshot directories with given timestamps."""
+
     def _create(name: str, dt: datetime):
         snap_dir = Path(sample_job.snapshot_dir) / name
         snap_dir.mkdir(exist_ok=True)
         return snap_dir
+
     return _create
+
+
+@pytest.fixture
+def long_history():
+    """400 daily snapshots ending at 'now' plus a few within the last 6h.
+
+    In-memory only (no btrfs): exercises the pure retention math. Spans >= 388d.
+    """
+    now = datetime.now(timezone.utc)
+    times = [now - timedelta(days=d) for d in range(0, 400)]
+    times += [now - timedelta(hours=h) for h in (1, 3, 6)]
+    times = sorted(set(times))
+    return [
+        Snapshot(Path(f"/bak/data/{t.strftime('%Y-%m-%d_%H:%MZ')}"), t)
+        for t in times
+    ]
 
 
 @contextmanager
@@ -120,24 +151,35 @@ def mocked_backup_job(sample_job):
     sample_job.mount = _mock_mount
     sample_job._preflight = MagicMock(return_value=1_000_000_000)
     sample_job._backup = MagicMock(return_value="restic_snap_id")
-    sample_job._forget_and_prune = MagicMock()
+    sample_job._forget_only = MagicMock()
     sample_job._update_repo_throughput = MagicMock()
     sample_job._cleanup_snapshots = MagicMock()
     sample_job.create_snapshot = MagicMock()
     sample_job._write_status = MagicMock()
     sample_job._check_repo_reachable = MagicMock(return_value=True)
     sample_job._measure_repo_size = MagicMock(return_value=0)
+    # Power-saving gate: a bare {} is the fail-open path (no pool/probe info),
+    # preserving the historic "snapshot when due" behavior in run() tests.
+    sample_job._wrapper_status = MagicMock(return_value={})
     return sample_job
 
 
 # --- Snapshot time parsing tests ---
 
+
 class TestParseSnapshotTime:
-    def test_yyyy_mm_dd_hh_mm_format(self, sample_job, tmp_path):
-        snap = tmp_path / "snapshots" / "2024-01-15_10:30"
+    def test_yyyy_mm_dd_hh_mm_utc_format(self, sample_job, tmp_path):
+        snap = tmp_path / "snapshots" / "2024-01-15_10:30Z"
         snap.mkdir(parents=True)
         result = sample_job._parse_snapshot_time(snap)
         assert result == datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
+
+    def test_legacy_no_z_name_rejected(self, sample_job, tmp_path):
+        """The 2026-08-14_02:00 crash: a bare no-Z name must not parse as a
+        valid snapshot, or the orchestrator and the sudo-exec wrapper disagree."""
+        snap = tmp_path / "snapshots" / "2026-08-14_02:00"
+        snap.mkdir(parents=True)
+        assert sample_job._parse_snapshot_time(snap) is None
 
     def test_invalid_format(self, sample_job, tmp_path):
         snap = tmp_path / "snapshots" / "random_name"
@@ -148,40 +190,17 @@ class TestParseSnapshotTime:
 
 # --- Exponential cleanup tests ---
 
+
 class TestExponentialCleanup:
-    def test_keeps_correct_snapshots(self, sample_job, create_snapshots):
-        """With snapshot_retention n=4, keep oldest in each tier."""
+    def test_youngest_local_snapshot_retained(self, sample_job, create_snapshots):
+        """_cleanup_snapshots must never delete the youngest local snapshot."""
         now = datetime.now(timezone.utc)
-        snapshot_times = {
-            "20m": now - timedelta(minutes=20),
-            "90m": now - timedelta(minutes=90),
-            "3h": now - timedelta(hours=3),
-            "7h": now - timedelta(hours=7),
-            "12h": now - timedelta(hours=12),
-            "20h": now - timedelta(hours=20),
-        }
-        snapshot_names = {}
-        for label, dt in snapshot_times.items():
-            name = dt.strftime("%Y-%m-%d_%H:%M")
-            snapshot_names[label] = name
-            create_snapshots(name, dt)
-
-        sample_job.snapshot_retention = {"fn": "exponential", "config": {"n": 4}}
-
-        deleted = []
-        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[4]) if cmd[1].endswith("snap-bak-io") else None)
-
+        create_snapshots("old", now - timedelta(hours=3))
+        create_snapshots("new", now - timedelta(minutes=20))
+        sample_job.snapshot_retention = {"fn": "exponential", "config": {"n": 1}}
+        sample_job._run = MagicMock()
         sample_job._cleanup_snapshots()
-
-        kept_names = {snapshot_names["20m"], snapshot_names["90m"], snapshot_names["3h"], snapshot_names["7h"]}
-        deleted_names = {snapshot_names["12h"], snapshot_names["20h"]}
-
-        deleted_str = set(str(d) for d in deleted)
-        for name in deleted_names:
-            assert any(name in d for d in deleted_str), f"Expected {name} to be deleted"
-
-        for name in kept_names:
-            assert (Path(sample_job.snapshot_dir) / name).exists(), f"Expected {name} to be kept"
+        assert (Path(sample_job.snapshot_dir) / "new").exists()
 
     def test_fewer_than_n_snapshots_keeps_all(self, sample_job, create_snapshots):
         """If fewer than N snapshots exist, keep all."""
@@ -194,7 +213,9 @@ class TestExponentialCleanup:
 
         sample_job._cleanup_snapshots()
 
-        btrfs_calls = [c for c in sample_job._run.call_args_list if c.args[0][1].endswith("btrfs")]
+        btrfs_calls = [
+            c for c in sample_job._run.call_args_list if c.args[0][1].endswith("btrfs")
+        ]
         assert len(btrfs_calls) == 0
 
     def test_protected_snapshot_not_deleted(self, sample_job, create_snapshots):
@@ -206,7 +227,11 @@ class TestExponentialCleanup:
 
         sample_job.snapshot_retention = {"fn": "exponential", "config": {"n": 2}}
         deleted = []
-        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[4]) if cmd[1].endswith("snap-bak-io") else None)
+        sample_job._run = MagicMock(
+            side_effect=lambda cmd, **kw: (
+                deleted.append(cmd[4]) if cmd[1].endswith("sudo-exec.py") else None
+            )
+        )
 
         sample_job._cleanup_snapshots(protected_snapshot="2h_ago")
 
@@ -222,7 +247,9 @@ class TestExponentialCleanup:
 
         sample_job._cleanup_snapshots()
 
-        btrfs_calls = [c for c in sample_job._run.call_args_list if c.args[0][1].endswith("btrfs")]
+        btrfs_calls = [
+            c for c in sample_job._run.call_args_list if c.args[0][1].endswith("btrfs")
+        ]
         assert len(btrfs_calls) == 0
 
     def test_non_standard_names_skipped(self, sample_job, create_snapshots):
@@ -233,14 +260,54 @@ class TestExponentialCleanup:
 
         sample_job.snapshot_retention = {"fn": "exponential", "config": {"n": 5}}
         deleted = []
-        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[4]) if cmd[1].endswith("snap-bak-io") else None)
+        sample_job._run = MagicMock(
+            side_effect=lambda cmd, **kw: (
+                deleted.append(cmd[4]) if cmd[1].endswith("sudo-exec.py") else None
+            )
+        )
 
         sample_job._cleanup_snapshots()
 
         assert not any("random_name" in d for d in deleted)
 
 
+class TestSnapshotCleanupCadence:
+    def test_cleanup_runs_on_skipped_cycle(self, sample_job):
+        """Local snapshot retention must run on the snapshot cadence: invoke
+        _cleanup_snapshots in _run_backup_phase even when the cycle is skipped
+        (no backup). Previously cleanup only ran after a successful restic
+        backup, so 2h snapshots piled up between infrequent backups."""
+        sample_job.dry_run = False
+        sample_job.protected_snapshot = None
+        sample_job._seed_repo_throughput = MagicMock(return_value=10)
+        sample_job._check_stale_tmp = MagicMock()
+        sample_job._load_delayed_state = MagicMock()
+        sample_job._get_last_status = MagicMock(return_value=None)
+        sample_job._write_status = MagicMock()
+        sample_job._should_create_snapshot = MagicMock(return_value=False)
+        sample_job._plan = MagicMock(return_value="skip")
+        sample_job.skip_reason = "outside backup window"
+        sample_job._cleanup_snapshots = MagicMock()
+
+        result = sample_job._run_backup_phase()
+
+        assert result["status"] == "skipped"
+        sample_job._cleanup_snapshots.assert_called_once()
+        _, kwargs = sample_job._cleanup_snapshots.call_args
+        assert kwargs.get("protected_snapshot") is None
+
+    def test_cleanup_is_noop_when_snapshot_dir_missing(self, sample_job):
+        """_cleanup_snapshots must not raise when the snapshot dir is absent
+        (e.g. first run, before any snapshot is created)."""
+        sample_job.snapshot_retention = {"fn": "exponential", "config": {"n": 5}}
+        sample_job.snapshot_dir = str(Path(sample_job.snapshot_dir) / "does_not_exist")
+        sample_job._run = MagicMock()
+        sample_job._cleanup_snapshots()
+        sample_job._run.assert_not_called()
+
+
 # --- Config validation tests (pydantic-based) ---
+
 
 class TestConfigValidation:
     def test_missing_repos_raises(self):
@@ -283,7 +350,14 @@ class TestConfigValidation:
     def test_valid_config_passes(self):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:test"}],
-            jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
+            jobs=[
+                {
+                    "name": "test",
+                    "snapshot_dir": "/tmp",
+                    "source_subvolume": "data",
+                    "repo": "primary",
+                }
+            ],
         )
         assert len(config.repos) == 1
         assert len(config.jobs) == 1
@@ -307,8 +381,21 @@ class TestConfigValidation:
     def test_password_file_per_repo(self):
         """password_file should be on Repo, not top-level."""
         config = SnapBakConfig(
-            repos=[{"name": "primary", "path": "rclone:test", "password_file": "/path/to/pass"}],
-            jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
+            repos=[
+                {
+                    "name": "primary",
+                    "path": "rclone:test",
+                    "password_file": "/path/to/pass",
+                }
+            ],
+            jobs=[
+                {
+                    "name": "test",
+                    "snapshot_dir": "/tmp",
+                    "source_subvolume": "data",
+                    "repo": "primary",
+                }
+            ],
         )
         assert config.repos[0].password_file == "/path/to/pass"
 
@@ -327,17 +414,25 @@ class TestConfigValidation:
         with pytest.raises(Exception):
             SnapBakConfig(
                 repos=[{"name": "primary", "path": "rclone:test"}],
-                jobs=[{"name": "test", "snapshot_dir": "/nonexistent/path", "source_subvolume": "data", "repo": "primary"}],
+                jobs=[
+                    {
+                        "name": "test",
+                        "snapshot_dir": "/nonexistent/path",
+                        "source_subvolume": "data",
+                        "repo": "primary",
+                    }
+                ],
             )
 
 
 # --- find_oldest_snapshot_within tests ---
 
+
 class TestFindOldestSnapshotWithin:
     def test_finds_oldest_within_interval(self, sample_job, create_snapshots):
         now = datetime.now(timezone.utc)
-        snap_30m = (now - timedelta(minutes=30)).strftime("%Y-%m-%d_%H:%M")
-        snap_15m = (now - timedelta(minutes=15)).strftime("%Y-%m-%d_%H:%M")
+        snap_30m = (now - timedelta(minutes=30)).strftime("%Y-%m-%d_%H:%MZ")
+        snap_15m = (now - timedelta(minutes=15)).strftime("%Y-%m-%d_%H:%MZ")
         create_snapshots(snap_30m, now - timedelta(minutes=30))
         create_snapshots(snap_15m, now - timedelta(minutes=15))
 
@@ -359,7 +454,7 @@ class TestFindOldestSnapshotWithin:
 
     def test_skips_non_standard_names(self, sample_job, create_snapshots):
         now = datetime.now(timezone.utc)
-        snap_name = (now - timedelta(minutes=30)).strftime("%Y-%m-%d_%H:%M")
+        snap_name = (now - timedelta(minutes=30)).strftime("%Y-%m-%d_%H:%MZ")
         create_snapshots(snap_name, now - timedelta(minutes=30))
         create_snapshots("random_name", now - timedelta(minutes=15))
 
@@ -369,6 +464,7 @@ class TestFindOldestSnapshotWithin:
 
 
 # --- Throughput calculation tests ---
+
 
 class TestThroughputCalculation:
     def test_zero_backup_time_no_update(self, sample_job):
@@ -431,23 +527,28 @@ class TestThroughputCalculation:
 
 # --- Failed backup retry tests ---
 
+
 class TestFailedBackupRetry:
     def test_failed_status_triggers_retry(self, mocked_backup_job, create_snapshots):
         """When last status is 'failed' with snapshot_name, retry with that snapshot."""
         now = datetime.now(timezone.utc)
-        snap_name = (now - timedelta(hours=1)).strftime("%Y-%m-%d_%H:%M")
+        snap_name = (now - timedelta(hours=1)).strftime("%Y-%m-%d_%H:%MZ")
         create_snapshots(snap_name, now - timedelta(hours=1))
 
         # Write a failed status file
         status_file = mocked_backup_job.status_file
         status_file.parent.mkdir(parents=True, exist_ok=True)
-        status_file.write_text(json.dumps({
-            "job": "test_job",
-            "status": "failed",
-            "timestamp": (now - timedelta(hours=1)).isoformat(),
-            "message": "Backup failed",
-            "snapshot_name": snap_name,
-        }))
+        status_file.write_text(
+            json.dumps(
+                {
+                    "job": "test_job",
+                    "status": "failed",
+                    "timestamp": (now - timedelta(hours=1)).isoformat(),
+                    "message": "Backup failed",
+                    "snapshot_name": snap_name,
+                }
+            )
+        )
 
         # The 1h-old snapshot is due on schedule; fixture mocks create_snapshot.
         result = mocked_backup_job.run()
@@ -463,18 +564,22 @@ class TestFailedBackupRetry:
     def test_failed_snapshot_gone_skips(self, mocked_backup_job):
         """When failed snapshot no longer exists, skip job."""
         now = datetime.now(timezone.utc)
-        snap_name = (now - timedelta(hours=1)).strftime("%Y-%m-%d_%H:%M")
+        snap_name = (now - timedelta(hours=1)).strftime("%Y-%m-%d_%H:%MZ")
 
         # Write a failed status file
         status_file = mocked_backup_job.status_file
         status_file.parent.mkdir(parents=True, exist_ok=True)
-        status_file.write_text(json.dumps({
-            "job": "test_job",
-            "status": "failed",
-            "timestamp": (now - timedelta(hours=1)).isoformat(),
-            "message": "Backup failed",
-            "snapshot_name": snap_name,
-        }))
+        status_file.write_text(
+            json.dumps(
+                {
+                    "job": "test_job",
+                    "status": "failed",
+                    "timestamp": (now - timedelta(hours=1)).isoformat(),
+                    "message": "Backup failed",
+                    "snapshot_name": snap_name,
+                }
+            )
+        )
 
         # Fresh install (no snapshots) -> snapshot_due fires; fixture mocks it.
         result = mocked_backup_job.run()
@@ -485,16 +590,18 @@ class TestFailedBackupRetry:
 
 # --- Snapshot schedule tests ---
 
+
 class TestSnapshotSchedule:
     def test_fresh_install_creates_snapshot_and_defers(self, mocked_backup_job):
         """Fresh install: no snapshots -> create one on schedule, but it's too
         young to back up yet, so the run ends in a graceful skip."""
         now = datetime.now(timezone.utc)
-        created = Path(mocked_backup_job.snapshot_dir) / now.strftime("%Y-%m-%d_%H:%M")
+        created = Path(mocked_backup_job.snapshot_dir) / now.strftime("%Y-%m-%d_%H:%MZ")
 
         def _fake_create():
             created.mkdir(exist_ok=True)
             return created
+
         mocked_backup_job.create_snapshot = MagicMock(side_effect=_fake_create)
 
         result = mocked_backup_job.run()
@@ -506,11 +613,13 @@ class TestSnapshotSchedule:
     def test_creates_snapshot_when_none_exist_and_continues(self, mocked_backup_job):
         """A snapshot old enough to back up lets the run continue to backup."""
         created = Path(mocked_backup_job.snapshot_dir) / (
-            datetime.now(timezone.utc) - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M")
+            datetime.now(timezone.utc) - timedelta(hours=20)
+        ).strftime("%Y-%m-%d_%H:%MZ")
 
         def _fake_create():
             created.mkdir(exist_ok=True)
             return created
+
         mocked_backup_job.create_snapshot = MagicMock(side_effect=_fake_create)
 
         result = mocked_backup_job.run()
@@ -520,10 +629,12 @@ class TestSnapshotSchedule:
         success_call = mocked_backup_job._write_status.call_args_list[-1]
         assert success_call.kwargs["restic_snapshot_id"] == "restic_snap_id"
 
-    def test_does_not_create_when_snapshot_within_interval(self, mocked_backup_job, create_snapshots):
+    def test_does_not_create_when_snapshot_within_interval(
+        self, mocked_backup_job, create_snapshots
+    ):
         """Snapshot younger than snapshot_interval (but old enough to back up) -> no new snapshot."""
         recent = datetime.now(timezone.utc) - timedelta(hours=13)
-        create_snapshots(recent.strftime("%Y-%m-%d_%H:%M"), recent)
+        create_snapshots(recent.strftime("%Y-%m-%d_%H:%MZ"), recent)
         mocked_backup_job.snapshot_interval = 24 * 3600
 
         result = mocked_backup_job.run()
@@ -531,10 +642,12 @@ class TestSnapshotSchedule:
         mocked_backup_job.create_snapshot.assert_not_called()
         assert result["status"] == "success"
 
-    def test_too_young_snapshot_defers_backup(self, mocked_backup_job, create_snapshots):
+    def test_too_young_snapshot_defers_backup(
+        self, mocked_backup_job, create_snapshots
+    ):
         """A snapshot under the minimum age is skipped gracefully, not backed up."""
         recent = datetime.now(timezone.utc) - timedelta(minutes=30)
-        create_snapshots(recent.strftime("%Y-%m-%d_%H:%M"), recent)
+        create_snapshots(recent.strftime("%Y-%m-%d_%H:%MZ"), recent)
 
         result = mocked_backup_job.run()
 
@@ -543,29 +656,197 @@ class TestSnapshotSchedule:
 
     def test_dry_run_does_not_create_snapshot(self, mocked_backup_job):
         mocked_backup_job.dry_run = True
+        # Dry-run now reaches create_snapshot (which logs the sudo-exec.py
+        # command via `_run`); it must not actually create a snapshot.
+        mocked_backup_job._should_create_snapshot = MagicMock(return_value=True)
 
         result = mocked_backup_job.run()
 
-        mocked_backup_job.create_snapshot.assert_not_called()
-        assert result["status"] == "skipped"
+        mocked_backup_job.create_snapshot.assert_called()
+        assert result["status"] in ("skipped", "dry_run")
+
+
+# --- Power-saving snapshot gate tests ---
+
+
+class TestShouldCreateSnapshot:
+    """Snapshot creation is gated on (a) pool disk state and (b) changes."""
+
+    def test_dry_run_never_creates(self, sample_job):
+        sample_job.dry_run = True
+        sample_job._wrapper_status = MagicMock(return_value={"any_spun_down": False})
+        # In dry-run the create decision still runs, but create_snapshot must
+        # NOT actually create a snapshot on disk — the sudo-exec.py command is
+        # only logged (see `_run`), never executed.
+        snap = sample_job.create_snapshot()
+        assert not Path(snap).exists()
+
+    def test_spun_down_disk_skips_even_when_due_and_changed(
+        self, sample_job, create_snapshots
+    ):
+        """ANY spun-down disk in the pool suppresses the snapshot."""
+        now = datetime.now(timezone.utc)
+        create_snapshots(
+            (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%MZ"),
+            now - timedelta(hours=20),
+        )
+        sample_job.skip_snapshot_if_idle = True
+        sample_job._wrapper_status = MagicMock(
+            return_value={
+                "any_spun_down": True,
+                "changed": True,
+                "source_generation": 5,
+                "last_snapshot_generation": 4,
+            }
+        )
+        assert sample_job._should_create_snapshot() is False
+
+    def test_spun_down_ignored_when_opted_out(self, sample_job, create_snapshots):
+        """With skip_snapshot_if_idle=False the idle gate is bypassed."""
+        now = datetime.now(timezone.utc)
+        create_snapshots(
+            (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%MZ"),
+            now - timedelta(hours=20),
+        )
+        sample_job.skip_snapshot_if_idle = False
+        sample_job._wrapper_status = MagicMock(
+            return_value={
+                "any_spun_down": True,
+                "changed": True,
+                "source_generation": 5,
+                "last_snapshot_generation": 4,
+            }
+        )
+        assert sample_job._should_create_snapshot() is True
+
+    def test_no_changes_skips(self, sample_job, create_snapshots):
+        """Unchanged source (source gen == snapshot gen) -> no snapshot."""
+        now = datetime.now(timezone.utc)
+        create_snapshots(
+            (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%MZ"),
+            now - timedelta(hours=20),
+        )
+        sample_job._wrapper_status = MagicMock(
+            return_value={
+                "any_spun_down": False,
+                "changed": False,
+                "source_generation": 7,
+                "last_snapshot_generation": 7,
+            }
+        )
+        assert sample_job._should_create_snapshot() is False
+
+    def test_no_changes_logs_skip_with_names(
+        self, sample_job, create_snapshots, caplog
+    ):
+        """Unchanged source -> skip log leads with action and names the snapshots."""
+        now = datetime.now(timezone.utc)
+        snap = create_snapshots(
+            (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%MZ"),
+            now - timedelta(hours=20),
+        )
+        sample_job._wrapper_status = MagicMock(
+            return_value={
+                "any_spun_down": False,
+                "changed": False,
+                "source_generation": 7,
+                "last_snapshot_generation": 7,
+            }
+        )
+        with caplog.at_level(logging.INFO):
+            assert sample_job._should_create_snapshot() is False
+        assert "Skipping" in caplog.text
+        assert "source unchanged since" in caplog.text
+        assert snap.name in caplog.text  # the most-recent snapshot name (Z)
+
+    def test_changed_creates(self, sample_job, create_snapshots):
+        """Source generation advanced -> a new snapshot captures it."""
+        now = datetime.now(timezone.utc)
+        create_snapshots(
+            (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%MZ"),
+            now - timedelta(hours=20),
+        )
+        sample_job._wrapper_status = MagicMock(
+            return_value={
+                "any_spun_down": False,
+                "changed": True,
+                "source_generation": 8,
+                "last_snapshot_generation": 7,
+            }
+        )
+        assert sample_job._should_create_snapshot() is True
+
+    def test_fresh_install_creates(self, sample_job):
+        """No snapshot yet -> always create (fresh-install self-start)."""
+        sample_job._wrapper_status = MagicMock(
+            return_value={
+                "any_spun_down": False,
+                "changed": True,
+                "source_generation": 1,
+                "last_snapshot_generation": None,
+            }
+        )
+        assert sample_job._should_create_snapshot() is True
+
+    def test_not_due_skips(self, sample_job, create_snapshots):
+        """Within the interval nothing is created even if changed."""
+        recent = datetime.now(timezone.utc) - timedelta(minutes=30)
+        create_snapshots(recent.strftime("%Y-%m-%d_%H:%MZ"), recent)
+        sample_job.snapshot_interval = 24 * 3600
+        sample_job._wrapper_status = MagicMock(
+            return_value={
+                "any_spun_down": False,
+                "changed": True,
+                "source_generation": 9,
+                "last_snapshot_generation": 1,
+            }
+        )
+        assert sample_job._should_create_snapshot() is False
+
+    def test_probe_failure_fails_open(self, sample_job):
+        """Wrapper error ({}) falls back to the old behavior: create if due."""
+        sample_job._wrapper_status = MagicMock(return_value={})
+        assert sample_job._should_create_snapshot() is True
+
+    def test_unknown_pool_state_proceeds(self, sample_job):
+        """Indeterminate pool/generation state must not suppress a snapshot."""
+        sample_job._wrapper_status = MagicMock(
+            return_value={
+                "any_spun_down": None,
+                "changed": None,
+                "source_generation": None,
+                "last_snapshot_generation": None,
+            }
+        )
+        assert sample_job._should_create_snapshot() is True
 
 
 # --- Failure category tests ---
+
 
 class TestFailureCategories:
     def test_restic_exit_code_mapping(self):
         err = subprocess.CalledProcessError(12, "restic", stderr="wrong password")
         assert isinstance(_categorize_restic_error(err), CredentialsError)
 
-        for rc in (1, 3, 10, 11):
+        # rc=11 (repository locked) is its own category, not "remote unavailable".
+        err = subprocess.CalledProcessError(11, "restic", stderr="locked")
+        assert isinstance(_categorize_restic_error(err), RepoLockedError)
+
+        for rc in (1, 3, 10):
             err = subprocess.CalledProcessError(rc, "restic", stderr="boom")
             assert isinstance(_categorize_restic_error(err), RemoteUnavailableError), rc
 
     def test_failed_backup_records_category(self, mocked_backup_job, create_snapshots):
         """A categorized failure is persisted on the failed status."""
         now = datetime.now(timezone.utc)
-        create_snapshots((now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M"), now - timedelta(hours=20))
-        mocked_backup_job._backup = MagicMock(side_effect=CredentialsError("wrong password"))
+        create_snapshots(
+            (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%MZ"),
+            now - timedelta(hours=20),
+        )
+        mocked_backup_job._backup = MagicMock(
+            side_effect=CredentialsError("wrong password")
+        )
 
         result = mocked_backup_job.run()
 
@@ -575,10 +856,15 @@ class TestFailureCategories:
         assert call.kwargs["failure_category"] == FAIL_CREDENTIALS
         assert "wrong password" in call.kwargs["last_error"]
 
-    def test_unknown_failure_defaults_to_internal(self, mocked_backup_job, create_snapshots):
+    def test_unknown_failure_defaults_to_internal(
+        self, mocked_backup_job, create_snapshots
+    ):
         """Exceptions without a category default to FAIL_INTERNAL."""
         now = datetime.now(timezone.utc)
-        create_snapshots((now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M"), now - timedelta(hours=20))
+        create_snapshots(
+            (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%MZ"),
+            now - timedelta(hours=20),
+        )
         mocked_backup_job._backup = MagicMock(side_effect=RuntimeError("mystery"))
 
         result = mocked_backup_job.run()
@@ -591,16 +877,28 @@ class TestFailureCategories:
 
 # --- SnapBakConfig tests ---
 
+
 class TestSnapBakConfig:
     def test_creates_jobs_with_repos(self, tmp_path):
         config = SnapBakConfig(
             repos=[
-                {"name": "primary", "path": "rclone:CONFIG_ENTRY:DIRECTORY", "size_limit": 100, "latency_ms": 50, "throughput_mbps": 10},
+                {
+                    "name": "primary",
+                    "path": "rclone:CONFIG_ENTRY:DIRECTORY",
+                    "size_limit": 100,
+                    "latency_ms": 50,
+                    "throughput_mbps": 10,
+                },
             ],
             jobs=[
-                {"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary",
-                 "snapshot_retention": {"fn": "exponential", "config": {"n": 3}},
-                 "backup_interval": 7200},
+                {
+                    "name": "test",
+                    "snapshot_dir": "/tmp",
+                    "source_subvolume": "data",
+                    "repo": "primary",
+                    "snapshot_retention": {"fn": "exponential", "config": {"n": 3}},
+                    "backup_interval": 7200,
+                },
             ],
         )
         jobs = config.resolve_jobs(str(tmp_path / "config.json"))
@@ -619,7 +917,14 @@ class TestSnapBakConfig:
     def test_defaults_applied(self, tmp_path):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:test"}],
-            jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
+            jobs=[
+                {
+                    "name": "test",
+                    "snapshot_dir": "/tmp",
+                    "source_subvolume": "data",
+                    "repo": "primary",
+                }
+            ],
         )
         jobs = config.resolve_jobs(str(tmp_path / "config.json"))
 
@@ -627,11 +932,35 @@ class TestSnapBakConfig:
         assert job.snapshot_retention == {"fn": "exponential", "config": {"n": 5}}
         assert job.backup_interval == 3600
         assert job.snapshot_interval == DEFAULT_SNAPSHOT_INTERVAL
+        # Power saving is on by default (opt out per job).
+        assert job.skip_snapshot_if_idle is True
+
+    def test_skip_snapshot_if_idle_override(self, tmp_path):
+        config = SnapBakConfig(
+            repos=[{"name": "primary", "path": "rclone:test"}],
+            jobs=[
+                {
+                    "name": "test",
+                    "snapshot_dir": "/tmp",
+                    "source_subvolume": "data",
+                    "repo": "primary",
+                    "skip_snapshot_if_idle": False,
+                }
+            ],
+        )
+        assert config.jobs[0].skip_snapshot_if_idle is False
 
     def test_repo_path_resolves(self, tmp_path):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:CONFIG_ENTRY:DIRECTORY"}],
-            jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
+            jobs=[
+                {
+                    "name": "test",
+                    "snapshot_dir": "/tmp",
+                    "source_subvolume": "data",
+                    "repo": "primary",
+                }
+            ],
         )
         jobs = config.resolve_jobs(str(tmp_path / "config.json"))
         assert jobs[0].repo_path == "rclone:CONFIG_ENTRY:DIRECTORY"
@@ -639,21 +968,42 @@ class TestSnapBakConfig:
     def test_mount_base_default(self):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:test"}],
-            jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
+            jobs=[
+                {
+                    "name": "test",
+                    "snapshot_dir": "/tmp",
+                    "source_subvolume": "data",
+                    "repo": "primary",
+                }
+            ],
         )
         assert config.mount_base == "/bak"
 
     def test_stuck_threshold_default(self):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:test"}],
-            jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
+            jobs=[
+                {
+                    "name": "test",
+                    "snapshot_dir": "/tmp",
+                    "source_subvolume": "data",
+                    "repo": "primary",
+                }
+            ],
         )
         assert config.stuck_threshold == 3600
 
     def test_restic_update_default(self):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:test"}],
-            jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
+            jobs=[
+                {
+                    "name": "test",
+                    "snapshot_dir": "/tmp",
+                    "source_subvolume": "data",
+                    "repo": "primary",
+                }
+            ],
         )
         assert config.restic_update == "never"
 
@@ -661,7 +1011,14 @@ class TestSnapBakConfig:
         for v in ("after", "never"):
             config = SnapBakConfig(
                 repos=[{"name": "primary", "path": "rclone:test"}],
-                jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
+                jobs=[
+                    {
+                        "name": "test",
+                        "snapshot_dir": "/tmp",
+                        "source_subvolume": "data",
+                        "repo": "primary",
+                    }
+                ],
                 restic_update=v,
             )
             assert config.restic_update == v
@@ -673,14 +1030,28 @@ class TestSnapBakConfig:
             with pytest.raises(Exception):
                 SnapBakConfig(
                     repos=[{"name": "primary", "path": "rclone:test"}],
-                    jobs=[{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
+                    jobs=[
+                        {
+                            "name": "test",
+                            "snapshot_dir": "/tmp",
+                            "source_subvolume": "data",
+                            "repo": "primary",
+                        }
+                    ],
                     restic_update=v,
                 )
 
     def test_mount_point_mirrors_source(self):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:test"}],
-            jobs=[{"name": "CustomName", "snapshot_dir": "/tmp", "source_subvolume": "/mnt/data", "repo": "primary"}],
+            jobs=[
+                {
+                    "name": "CustomName",
+                    "snapshot_dir": "/tmp",
+                    "source_subvolume": "/mnt/data",
+                    "repo": "primary",
+                }
+            ],
         )
         jobs = config.resolve_jobs()
         assert jobs[0].mount_point == Path("/bak") / "data"
@@ -688,7 +1059,14 @@ class TestSnapBakConfig:
     def test_mount_point_relative_source(self):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:test"}],
-            jobs=[{"name": "CustomName", "snapshot_dir": "/tmp", "source_subvolume": "home", "repo": "primary"}],
+            jobs=[
+                {
+                    "name": "CustomName",
+                    "snapshot_dir": "/tmp",
+                    "source_subvolume": "home",
+                    "repo": "primary",
+                }
+            ],
         )
         jobs = config.resolve_jobs()
         assert jobs[0].mount_point == Path("/bak") / "home"
@@ -731,9 +1109,11 @@ class TestResticCmdPolicy:
         sample_job.excludes = ["*.tmp", "*.cache"]
         cmd = sample_job._restic_cmd("backup")
         assert cmd[3] == "backup"
-        assert "--compression=better" in cmd      # global option
-        assert "--one-file-system" in cmd         # backup-only option
-        assert ["--exclude-file", "/etc/x.ignore"] in [cmd[i:i + 2] for i in range(len(cmd) - 1)]
+        assert "--compression=better" in cmd  # global option
+        assert "--one-file-system" in cmd  # backup-only option
+        assert ["--exclude-file", "/etc/x.ignore"] in [
+            cmd[i : i + 2] for i in range(len(cmd) - 1)
+        ]
         assert "--exclude" in cmd
 
     def test_forget_cmd_no_backup_only_flags(self, sample_job):
@@ -743,35 +1123,51 @@ class TestResticCmdPolicy:
         sample_job.excludes = ["*.tmp"]
         cmd = sample_job._restic_cmd("forget")
         assert cmd[3] == "forget"
-        assert "--compression=better" in cmd      # global option still applies
+        assert "--compression=better" in cmd  # global option still applies
         assert "--one-file-system" not in cmd
         assert "--exclude" not in cmd
         assert "--exclude-file" not in cmd
 
     def test_probe_cmd_global_only(self, sample_job):
-        sample_job.repo_obj.restic_options = ["--compression=better", "--option", "rclone.program=foo"]
+        sample_job.repo_obj.restic_options = [
+            "--compression=better",
+            "--option",
+            "rclone.program=foo",
+        ]
         cmd = sample_job._restic_cmd("cat")
         assert cmd[3] == "cat"
         assert "--compression=better" in cmd
         assert "--option" in cmd
         assert "--exclude" not in cmd
 
-    def test_forget_and_prune_command(self, sample_job):
-        """forget carries tag + keep-* + prune, but never excludes."""
+    def test_forget_command_no_prune(self, sample_job):
+        """forget carries tag + keep-* but NOT --prune; prune runs separately."""
         sample_job.backup_retention = {"daily": 6, "monthly": 4}
         sample_job.tag = "MyTag"
         sample_job.excludes = ["*.tmp"]
         calls = []
         sample_job._run = lambda cmd, **kw: calls.append(cmd)
-        sample_job._forget_and_prune()
+        sample_job._forget_only()
         cmd = calls[0]
         assert cmd[3] == "forget"
         assert "--tag" in cmd
-        assert ["--keep-daily", "6"] in [cmd[i:i + 2] for i in range(len(cmd) - 1)]
-        assert ["--keep-monthly", "4"] in [cmd[i:i + 2] for i in range(len(cmd) - 1)]
-        assert cmd[-1] == "--prune"
+        assert ["--keep-daily", "6"] in [cmd[i : i + 2] for i in range(len(cmd) - 1)]
+        assert ["--keep-monthly", "4"] in [cmd[i : i + 2] for i in range(len(cmd) - 1)]
+        assert "--prune" not in cmd
         assert "--exclude" not in cmd
         assert "--exclude-file" not in cmd
+
+    def test_prune_once_command(self, sample_job):
+        """prune_once issues a bare `prune` (no tag/keep-*), default global opts."""
+        calls = []
+        sample_job._run = lambda cmd, **kw: calls.append(cmd)
+        sample_job.prune_once()
+        cmd = calls[0]
+        assert cmd[3] == "prune"
+        assert "--prune" not in cmd
+        assert "--tag" not in cmd
+        # graceful-timeout defaults from restic.build are present.
+        assert "--stuck-request-timeout" in cmd
 
     def test_reserved_flag_dropped_with_warning(self, sample_job, caplog):
         sample_job.restic_options = ["--tag", "bogus"]
@@ -814,46 +1210,80 @@ class TestHumanReadableQuantities:
     def test_config_accepts_human_readable(self, tmp_path):
         config = SnapBakConfig(
             repos=[{"name": "primary", "path": "rclone:test", "size_limit": "200GB"}],
-            jobs=[{
-                "name": "test",
-                "snapshot_dir": str(tmp_path),
-                "source_subvolume": "data",
-                "repo": "primary",
-                "snapshot_interval": "2h",
-                "backup_interval": "1w",
-                "timeout": "90m",
-            }],
+            jobs=[
+                {
+                    "name": "test",
+                    "snapshot_dir": str(tmp_path),
+                    "source_subvolume": "data",
+                    "repo": "primary",
+                    "snapshot_interval": "2h",
+                    "backup_interval": "1w",
+                }
+            ],
             stuck_threshold="1h",
         )
         assert config.repos[0].size_limit == 200 * 1024**3
         assert config.jobs[0].snapshot_interval == 7200
         assert config.jobs[0].backup_interval == 604800
-        assert config.jobs[0].timeout == 5400
         assert config.stuck_threshold == 3600
+
+    def test_unknown_timeout_key_is_inert(self, tmp_path):
+        """The per-job `timeout` key is gone. A leftover config must still load
+        (extra='allow' swallows it without error), and nothing in Job reads it,
+        so the value can never reach a subprocess timeout."""
+        config = SnapBakConfig(
+            repos=[{"name": "primary", "path": "rclone:test"}],
+            jobs=[
+                {
+                    "name": "test",
+                    "snapshot_dir": str(tmp_path),
+                    "source_subvolume": "data",
+                    "repo": "primary",
+                    "timeout": "90m",
+                }
+            ],
+            stuck_threshold="1h",
+        )
+        assert config.jobs[0].model_extra["timeout"] == "90m"
+        assert not hasattr(config.jobs[0], "snapshot_timeout")  # never applied
 
     def test_config_rejects_unknown_unit(self, tmp_path):
         with pytest.raises(Exception):
             SnapBakConfig(
                 repos=[{"name": "primary", "path": "rclone:test"}],
-                jobs=[{
-                    "name": "test",
-                    "snapshot_dir": str(tmp_path),
-                    "source_subvolume": "data",
-                    "repo": "primary",
-                    "backup_interval": "1fortnight",
-                }],
+                jobs=[
+                    {
+                        "name": "test",
+                        "snapshot_dir": str(tmp_path),
+                        "source_subvolume": "data",
+                        "repo": "primary",
+                        "backup_interval": "1fortnight",
+                    }
+                ],
             )
 
 
 # --- load_config tests ---
 
+
 class TestLoadConfig:
     def test_loads_valid_config(self, tmp_path):
         config_path = tmp_path / "config.json"
-        config_path.write_text(json.dumps({
-            "repos": [{"name": "primary", "path": "rclone:test"}],
-            "jobs": [{"name": "test", "snapshot_dir": "/tmp", "source_subvolume": "data", "repo": "primary"}],
-        }))
+        config_path.write_text(
+            json.dumps(
+                {
+                    "repos": [{"name": "primary", "path": "rclone:test"}],
+                    "jobs": [
+                        {
+                            "name": "test",
+                            "snapshot_dir": "/tmp",
+                            "source_subvolume": "data",
+                            "repo": "primary",
+                        }
+                    ],
+                }
+            )
+        )
         result = load_config(config_path)
         assert len(result.repos) == 1
         assert len(result.jobs) == 1
@@ -873,6 +1303,7 @@ class TestLoadConfig:
 
 
 # --- Backup window tests ---
+
 
 class TestBackupWindow:
     def test_no_window_always_allowed(self, sample_job):
@@ -938,6 +1369,7 @@ class TestBackupWindow:
 
 # --- Retention function tests ---
 
+
 class TestBuildRetentionExponential:
     def test_generates_correct_tiers(self):
         """n=4 should produce boundaries at 1h, 2h, 4h, 8h."""
@@ -966,7 +1398,6 @@ class TestBuildRetentionDatetimes:
             assert (now - dt).total_seconds() < 60 * 60 * 3 + 1
 
     def test_daily_only(self):
-        now = datetime.now(timezone.utc)
         result = build_retention_datetimes(daily=2)
         assert len(result) == 2
 
@@ -981,24 +1412,16 @@ class TestBuildRetentionDatetimes:
 
 
 class TestBuildSnapshotKeeplist:
-    def test_keeps_oldest_in_each_tier(self):
-        """With 4 tier boundaries, keeps the oldest snapshot in each tier."""
-        now = datetime.now(timezone.utc)
-        snaps = [
-            Snapshot(Path("20m"), now - timedelta(minutes=20)),
-            Snapshot(Path("90m"), now - timedelta(minutes=90)),
-            Snapshot(Path("3h"), now - timedelta(hours=3)),
-            Snapshot(Path("7h"), now - timedelta(hours=7)),
-            Snapshot(Path("12h"), now - timedelta(hours=12)),
-        ]
-        rets = [
-            now - timedelta(hours=1),
-            now - timedelta(hours=2),
-            now - timedelta(hours=4),
-            now - timedelta(hours=8),
-        ]
-        keeps = build_snapshot_keeplist(snaps, rets)
-        assert keeps == {Path("20m"), Path("90m"), Path("3h"), Path("7h")}
+    def test_exponential_keeplist(self, long_history):
+        """The youngest snapshot is always kept, across retention sizes.
+
+        Folds in the 'most recent never dropped' regression: with several
+        snapshots inside the newest tier, the youngest must still survive.
+        """
+        youngest = max(long_history, key=lambda s: s.time).path
+        for n in (0, 3, 5, 7):
+            kl = build_snapshot_keeplist(long_history, build_retention_exponential(n))
+            assert youngest in kl
 
     def test_fewer_snapshots_than_tiers(self):
         """With more tiers than snapshots, keeps what's available."""
@@ -1028,49 +1451,28 @@ class TestBuildSnapshotKeeplist:
 
 
 class TestDatetimesCleanup:
-    def test_datetimes_retention_keeps_correct_snapshots(self, sample_job, create_snapshots):
-        """Calendar-based retention keeps oldest in each tier."""
-        now = datetime.now(timezone.utc)
-        snapshot_times = {
-            "15m": now - timedelta(minutes=15),
-            "90m": now - timedelta(minutes=90),
-            "3h": now - timedelta(hours=3),
-            "15d": now - timedelta(days=15),
-            "60d": now - timedelta(days=60),
-        }
-        for label, dt in snapshot_times.items():
-            name = dt.strftime("%Y-%m-%d_%H:%M")
-            create_snapshots(name, dt)
+    def test_datetimes_keeplist(self, long_history):
+        """The youngest snapshot is always kept for calendar-based retention.
 
-        sample_job.snapshot_retention = {
-            "fn": "datetimes",
-            "config": {"hourly": 2, "daily": 1},
-        }
-        deleted = []
-        sample_job._run = MagicMock(side_effect=lambda cmd, **kw: deleted.append(cmd[4]) if cmd[1].endswith("snap-bak-io") else None)
-
-        sample_job._cleanup_snapshots()
-
-        # hourly=2, daily=1 → boundaries at now, now-1h, now-2h
-        # Boundary now: no candidates. Boundary now-1h: keeps 15m. Boundary now-2h: keeps 90m.
-        # 3h, 15d, 60d should be deleted
-        deleted_names = {Path(str(d)).name for d in deleted}
-        assert len(deleted) == 3
-        for label, dt in snapshot_times.items():
-            name = dt.strftime("%Y-%m-%d_%H:%M")
-            if label in ("3h", "15d", "60d"):
-                assert name in deleted_names, f"Expected {name} ({label}) to be deleted"
-            else:
-                assert (Path(sample_job.snapshot_dir) / name).exists(), f"Expected {name} ({label}) to be kept"
+        Folds in the 'most recent never dropped' regression guard.
+        """
+        cfg = dict(hourly=7, daily=0, weekly=3, monthly=0, yearly=1)
+        youngest = max(long_history, key=lambda s: s.time).path
+        kl = build_snapshot_keeplist(long_history, build_retention_datetimes(**cfg))
+        assert youngest in kl
 
 
 # --- Repo planning / delayed-job handling ---
+
 
 class TestRepoPlanning:
     def test_unreachable_repo_delays_job(self, mocked_backup_job, create_snapshots):
         """Phase 2 reachability failure delays the job, never backs up."""
         now = datetime.now(timezone.utc)
-        create_snapshots((now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M"), now - timedelta(hours=20))
+        create_snapshots(
+            (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%MZ"),
+            now - timedelta(hours=20),
+        )
         mocked_backup_job._check_repo_reachable = MagicMock(return_value=False)
 
         result = mocked_backup_job.run()
@@ -1082,8 +1484,13 @@ class TestRepoPlanning:
     def test_over_size_limit_delays_job(self, mocked_backup_job, create_snapshots):
         """Repo at/over size_limit delays the job (protected snapshot duty)."""
         now = datetime.now(timezone.utc)
-        create_snapshots((now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M"), now - timedelta(hours=20))
-        mocked_backup_job._measure_repo_size = MagicMock(return_value=2 * 10**12)  # 2TB > 1TiB limit
+        create_snapshots(
+            (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%MZ"),
+            now - timedelta(hours=20),
+        )
+        mocked_backup_job._measure_repo_size = MagicMock(
+            return_value=2 * 10**12
+        )  # 2TB > 1TiB limit
 
         result = mocked_backup_job.run()
 
@@ -1099,8 +1506,14 @@ class TestRepoPlanning:
         shared: dict = {}
         jobs = []
         for name, prio in (("high", 10), ("low", 5)):
-            job = Job(name=name, snapshot_dir=str(snap_dir), source_subvolume=str(snap_dir),
-                      repo="primary", repos=sample_repos, config_path=str(tmp_path / "c.json"))
+            job = Job(
+                name=name,
+                snapshot_dir=str(snap_dir),
+                source_subvolume=str(snap_dir),
+                repo="primary",
+                repos=sample_repos,
+                config_path=str(tmp_path / "c.json"),
+            )
             job.priority = prio
             job.repo_state = shared
             job._check_repo_reachable = MagicMock(return_value=True)
@@ -1122,8 +1535,14 @@ class TestRepoPlanning:
         snap_dir.mkdir()
         shared: dict = {}
         jobs = [
-            Job(name=f"j{i}", snapshot_dir=str(snap_dir), source_subvolume=str(snap_dir),
-                repo="primary", repos=sample_repos, config_path=str(tmp_path / "c.json"))
+            Job(
+                name=f"j{i}",
+                snapshot_dir=str(snap_dir),
+                source_subvolume=str(snap_dir),
+                repo="primary",
+                repos=sample_repos,
+                config_path=str(tmp_path / "c.json"),
+            )
             for i in range(3)
         ]
         reachable_mock = MagicMock(return_value=True)
@@ -1149,13 +1568,18 @@ class TestDelayedHandling:
     def test_delay_persists_and_restores(self, sample_job, create_snapshots):
         """_delay() writes the delayed group; _load_delayed_state() restores it."""
         now = datetime.now(timezone.utc)
-        snap = (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M")
+        snap = (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%MZ")
         create_snapshots(snap, now - timedelta(hours=20))
         sample_job._delay("size_limit")
 
-        fresh = Job(name=sample_job.name, snapshot_dir=sample_job.snapshot_dir,
-                    source_subvolume=sample_job.source_subvolume, repo="primary",
-                    repos=sample_job.repos, config_path=sample_job.config_path)
+        fresh = Job(
+            name=sample_job.name,
+            snapshot_dir=sample_job.snapshot_dir,
+            source_subvolume=sample_job.source_subvolume,
+            repo="primary",
+            repos=sample_job.repos,
+            config_path=sample_job.config_path,
+        )
         fresh._load_delayed_state()
         assert fresh.delayed is True
         assert fresh.delayed_reason == "size_limit"
@@ -1165,7 +1589,7 @@ class TestDelayedHandling:
     def test_retry_protected_snapshot_when_not_time(self, sample_job, create_snapshots):
         """A recovered over-limit job retries the exact protected snapshot."""
         now = datetime.now(timezone.utc)
-        snap = (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M")
+        snap = (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%MZ")
         create_snapshots(snap, now - timedelta(hours=20))
         sample_job._delay("size_limit")
         sample_job._check_repo_reachable = MagicMock(return_value=True)
@@ -1181,7 +1605,10 @@ class TestDelayedHandling:
     def test_success_clears_delayed_state(self, mocked_backup_job, create_snapshots):
         """A successful backup resets the delayed group."""
         now = datetime.now(timezone.utc)
-        create_snapshots((now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%M"), now - timedelta(hours=20))
+        create_snapshots(
+            (now - timedelta(hours=20)).strftime("%Y-%m-%d_%H:%MZ"),
+            now - timedelta(hours=20),
+        )
         mocked_backup_job.delayed = True
         mocked_backup_job.delayed_reason = "size_limit"
         mocked_backup_job.missed_slots = 3
@@ -1207,8 +1634,14 @@ class TestPriority:
         snap_dir = tmp_path / "snap"
         snap_dir.mkdir()
         jobs = [
-            Job(name=f"j{i}", snapshot_dir=str(snap_dir), source_subvolume=str(snap_dir),
-                repo="primary", repos=sample_repos, config_path=str(tmp_path / "c.json"))
+            Job(
+                name=f"j{i}",
+                snapshot_dir=str(snap_dir),
+                source_subvolume=str(snap_dir),
+                repo="primary",
+                repos=sample_repos,
+                config_path=str(tmp_path / "c.json"),
+            )
             for i in range(2)
         ]
         jobs[0].priority = 10
@@ -1223,7 +1656,14 @@ class TestNameValidation:
         with pytest.raises(ValidationError):
             SnapBakConfig(
                 repos=[{"name": "primary", "path": "rclone:test"}],
-                jobs=[{"name": "Bad Name!", "snapshot_dir": "/tmp", "source_subvolume": "home", "repo": "primary"}],
+                jobs=[
+                    {
+                        "name": "Bad Name!",
+                        "snapshot_dir": "/tmp",
+                        "source_subvolume": "home",
+                        "repo": "primary",
+                    }
+                ],
             )
 
 
@@ -1231,15 +1671,16 @@ class TestPasswordFilePermissions:
     @pytest.mark.parametrize(
         ("mode", "wrong_gid", "expect_exit"),
         [
-            (0o644, False, True),   # other-readable
-            (0o660, False, True),   # group-writable
-            (0o640, True, True),    # group-read but not the service group
+            (0o644, False, True),  # other-readable
+            (0o660, False, True),  # group-writable
+            (0o640, True, True),  # group-read but not the service group
             (0o640, False, False),  # group-read by the service group
             (0o600, False, False),  # owner-only
         ],
     )
-    def test_password_file_permissions(self, sample_repos, tmp_path, monkeypatch,
-                                       mode, wrong_gid, expect_exit):
+    def test_password_file_permissions(
+        self, sample_repos, tmp_path, monkeypatch, mode, wrong_gid, expect_exit
+    ):
         secret = tmp_path / "secret"
         secret.write_text("pw\n")
         os.chown(secret, -1, os.getgid())
@@ -1247,8 +1688,14 @@ class TestPasswordFilePermissions:
         if wrong_gid:
             real_gid = os.getgid()
             monkeypatch.setattr(snapbak_module.os, "getgid", lambda: real_gid + 1000)
-        job = Job(name="t", snapshot_dir=str(tmp_path), source_subvolume=str(tmp_path),
-                  repo="primary", repos=sample_repos, config_path=str(tmp_path / "c.json"))
+        job = Job(
+            name="t",
+            snapshot_dir=str(tmp_path),
+            source_subvolume=str(tmp_path),
+            repo="primary",
+            repos=sample_repos,
+            config_path=str(tmp_path / "c.json"),
+        )
         job.repo_obj.password_file = str(secret)
 
         if expect_exit:
@@ -1393,6 +1840,7 @@ class TestPidAlive:
     def test_permission_error_means_alive(self, monkeypatch):
         def fake_kill(pid, sig):
             raise PermissionError
+
         monkeypatch.setattr(os, "kill", fake_kill)
         assert snapbak_module._pid_alive(12345) is True
 
@@ -1418,10 +1866,14 @@ class TestMainExitCodes:
         config.restic_update = "never"
         config.resolve_jobs.return_value = jobs
         monkeypatch.setattr(snapbak_module, "load_config", lambda p: config)
-        monkeypatch.setattr(snapbak_module, "acquire_global_lock", lambda *a, **k: object())
+        monkeypatch.setattr(
+            snapbak_module, "acquire_global_lock", lambda *a, **k: object()
+        )
         monkeypatch.setattr(snapbak_module, "release_global_lock", lambda fh: None)
         monkeypatch.setattr(snapbak_module, "_run_restic_update", lambda: None)
-        monkeypatch.setattr(sys, "argv", ["snap-bak", "-c", str(tmp_path / "config.json")])
+        monkeypatch.setattr(
+            sys, "argv", ["snap-bak", "-c", str(tmp_path / "config.json")]
+        )
         try:
             snapbak_module._main_impl()
         except SystemExit as ei:
@@ -1429,31 +1881,184 @@ class TestMainExitCodes:
         return None
 
     def test_failed_exits_permanent(self, tmp_path, monkeypatch):
-        code = self._run_main([self._make_fake_job("a", {"status": "failed"})], tmp_path, monkeypatch)
+        code = self._run_main(
+            [self._make_fake_job("a", {"status": "failed"})], tmp_path, monkeypatch
+        )
         assert code == EXIT_PERM_FAILED
 
     def test_timeout_exits_permanent(self, tmp_path, monkeypatch):
-        code = self._run_main([self._make_fake_job("a", {"status": "skipped", "timeout": True})], tmp_path, monkeypatch)
+        code = self._run_main(
+            [self._make_fake_job("a", {"status": "skipped", "timeout": True})],
+            tmp_path,
+            monkeypatch,
+        )
         assert code == EXIT_PERM_TIMEOUT
 
     def test_unreachable_delay_exits_temp(self, tmp_path, monkeypatch):
         code = self._run_main(
-            [self._make_fake_job("a", {"status": "delayed", "delayed_reason": "unreachable"})],
-            tmp_path, monkeypatch)
+            [
+                self._make_fake_job(
+                    "a", {"status": "delayed", "delayed_reason": "unreachable"}
+                )
+            ],
+            tmp_path,
+            monkeypatch,
+        )
         assert code == EXIT_TEMP_UNREACHABLE
 
     def test_size_limit_delay_exits_temp(self, tmp_path, monkeypatch):
         code = self._run_main(
-            [self._make_fake_job("a", {"status": "delayed", "delayed_reason": "size_limit"})],
-            tmp_path, monkeypatch)
+            [
+                self._make_fake_job(
+                    "a", {"status": "delayed", "delayed_reason": "size_limit"}
+                )
+            ],
+            tmp_path,
+            monkeypatch,
+        )
         assert code == EXIT_TEMP_SIZE_LIMIT
 
     def test_jobs_ordered_by_effective_priority(self, tmp_path, monkeypatch):
-        """_main_impl runs delayed (higher effective priority) jobs first."""
+        """_main_impl schedules delayed (higher effective priority) jobs first.
+
+        Backups run in parallel, so we make the low-priority job sleep to make
+        the high-priority one deterministically finish first.
+        """
         order: list[str] = []
-        low = self._make_fake_job("low", {"status": "skipped"}, priority=10, missed_slots=0)
-        high = self._make_fake_job("high", {"status": "skipped"}, priority=10, missed_slots=1)
-        low.run.side_effect = lambda: order.append("low") or {"status": "skipped"}
+        low = self._make_fake_job(
+            "low", {"status": "skipped"}, priority=10, missed_slots=0
+        )
+        high = self._make_fake_job(
+            "high", {"status": "skipped"}, priority=10, missed_slots=1
+        )
+
+        def low_run():
+            time.sleep(0.05)
+            order.append("low")
+            return {"status": "skipped"}
+
+        low.run.side_effect = low_run
         high.run.side_effect = lambda: order.append("high") or {"status": "skipped"}
         self._run_main([low, high], tmp_path, monkeypatch)
         assert order == ["high", "low"]
+
+    def test_prune_runs_once_per_repo(self, tmp_path, monkeypatch):
+        """forget runs per job; prune runs once even for multiple jobs/repo."""
+        a = self._make_fake_job("a", {"status": "success"})
+        b = self._make_fake_job("b", {"status": "success"})
+        a.retention.return_value = {"status": "retention_ok"}
+        b.retention.return_value = {"status": "retention_ok"}
+        shared_repo = MagicMock()
+        shared_repo.path = "rclone:shared:repo"
+        a.repo_obj = shared_repo
+        b.repo_obj = shared_repo
+        self._run_main([a, b], tmp_path, monkeypatch)
+        assert a.retention.called and b.retention.called
+        prune_calls = a.prune_once.call_count + b.prune_once.call_count
+        assert prune_calls == 1
+
+
+class TestRetention:
+    def test_retention_ok(self, sample_job):
+        sample_job.backup_retention = {"daily": 6}
+        sample_job._run = MagicMock()
+        sample_job._write_status = MagicMock()
+        res = sample_job.retention()
+        assert res == {"job": sample_job.name, "status": "retention_ok"}
+        sample_job._run.assert_called_once()
+        # forget must NOT carry --prune (prune runs separately, once).
+        assert "--prune" not in sample_job._run.call_args[0][0]
+
+    def test_retention_failed_lock(self, sample_job):
+        sample_job.backup_retention = {"daily": 6}
+        sample_job._run = MagicMock(side_effect=RepoLockedError("locked"))
+        sample_job._write_status = MagicMock()
+        res = sample_job.retention()
+        assert res["status"] == "retention_failed"
+        # Distinct status (not generic 'failed'); backup data is safe.
+        status_call = sample_job._write_status.call_args
+        assert status_call.args[0] == "retention_failed"
+        assert status_call.kwargs["failure_category"] == FAIL_LOCKED
+
+    def test_retention_no_policy(self, sample_job):
+        sample_job.backup_retention = {}
+        sample_job._run = MagicMock()
+        assert sample_job.retention() is None
+        sample_job._run.assert_not_called()
+
+
+class TestMountHelpers:
+    def test_mounted_source_matches(self, monkeypatch):
+        mi = "23 32 0:21 /snap /mnt/bak/data ro - btrfs /dev/sda1\n"
+        monkeypatch.setattr(snapbak_module, "_mountinfo_text", lambda: mi)
+        src = _mounted_source(Path("/mnt/bak/data"))
+        assert src == Path("/dev/sda1")
+
+    def test_mounted_source_none(self, monkeypatch):
+        mi = "23 32 0:21 /other /mnt/elsewhere ro - btrfs /dev/sda1\n"
+        monkeypatch.setattr(snapbak_module, "_mountinfo_text", lambda: mi)
+        assert _mounted_source(Path("/mnt/bak/data")) is None
+
+    def test_restic_running_true(self, monkeypatch, tmp_path):
+        p = tmp_path / "1" / "cmdline"
+        p.parent.mkdir()
+        p.write_bytes(b"restic\0backup\0")
+        monkeypatch.setattr(snapbak_module, "_proc_dir", lambda: tmp_path)
+        assert restic_running() is True
+
+    def test_restic_running_false_for_orchestrator(self, monkeypatch, tmp_path):
+        p = tmp_path / "1" / "cmdline"
+        p.parent.mkdir()
+        p.write_bytes(b"python3\0snap_bak.py\0")
+        monkeypatch.setattr(snapbak_module, "_proc_dir", lambda: tmp_path)
+        assert restic_running() is False
+
+
+class TestRunCacheLogging:
+    """restic cache complaints in stderr must be surfaced at WARNING (not
+    buried at debug), since the cache dir is provisioned by setup rather than
+    checked at runtime."""
+
+    class _FakeResult:
+        def __init__(self, stdout="", stderr=""):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = 0
+
+    def _run_restic(self, monkeypatch, sample_job, stderr):
+        def fake_run(cmd, **kw):
+            return self._FakeResult(stderr=stderr)
+
+        monkeypatch.setattr(snapbak_module.subprocess, "run", fake_run)
+        sample_job._run(["restic", "-r", "x:dir", "snapshots"])
+
+    def test_restic_cache_complaint_surfaced(self, monkeypatch, sample_job, caplog):
+        with caplog.at_level("WARNING"):
+            self._run_restic(
+                monkeypatch,
+                sample_job,
+                "warning: unable to locate cache directory /x (disabling caching)\n",
+            )
+        assert any("restic cache" in r.message for r in caplog.records)
+
+    def test_restic_benign_cache_line_not_surfaced(
+        self, monkeypatch, sample_job, caplog
+    ):
+        with caplog.at_level("WARNING"):
+            self._run_restic(
+                monkeypatch,
+                sample_job,
+                "using cache dir /opt/snap-bak/cache\n",
+            )
+        assert not any("restic cache" in r.message for r in caplog.records)
+
+    def test_non_restic_cache_stderr_not_surfaced(
+        self, monkeypatch, sample_job, caplog
+    ):
+        def fake_run(cmd, **kw):
+            return self._FakeResult(stderr="unable to open cache\n")
+
+        monkeypatch.setattr(snapbak_module.subprocess, "run", fake_run)
+        with caplog.at_level("WARNING"):
+            sample_job._run(["echo", "hello"])
+        assert not any("restic cache" in r.message for r in caplog.records)

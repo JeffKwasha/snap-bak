@@ -36,8 +36,8 @@ Check global conditions once per run. If invalid, log error and exit.
 ```
 - Config/status file(s) exist, valid syntax
 - required files and directories exist with correct owner/group/permissions
-- directories exist: Snapshot, Mount, status (restic cache is only warned about —
-  restic recreates it, so a missing cache dir is not fatal)
+- directories exist: Snapshot, Mount, status (the restic cache dir + its
+  `.cache` symlink are provisioned by setup, not checked at runtime)
 - password files are readable only by the owner and (optionally) the snap-bak
   service group; never by other users or with group write/execute (hard gate,
   exit 4)
@@ -112,6 +112,28 @@ gracefully instead of failing.
 Create new btrfs snapshot of `source_subvolume` at `{snapshot_dir}/{name}` for each job
 Only one snapshot per `snapshot_interval` seconds per job.
 
+A scheduled snapshot is **suppressed** when the power-saving gate says so:
+
+1. **Disk spun down (power saving).** The wrapper's `status <job>` op resolves
+   the source's btrfs pool to its physical disks (from kernel state:
+   `/proc/self/mountinfo`, `/sys/fs/btrfs/<uuid>/devices`, `/sys/class/block`)
+   and reports `any_spun_down`. If **any** rotational disk in the pool is spun
+   down (`standby`/`slumber`/`powered_off`/`offline`/`sleep`), the snapshot is
+   skipped — creating it would wake that drive. This gate makes no disk I/O at
+   all (no btrfs calls, no snapshot-dir listing), so the drive stays asleep.
+   Other states (`running`/`active`/`live`/`parked`) and unreadable states are
+   never treated as spin-down; unknown pools fail open.
+2. **No changes.** When the pool is not spun down, the wrapper compares the
+   source's btrfs `Generation` with the latest snapshot's. Equal generations
+   mean the source is unchanged since that snapshot, so the new snapshot would
+   capture nothing and is skipped.
+
+Both gates **fail open**: an error or indeterminate result falls back to the
+historic behavior (create when the interval has elapsed). A fresh install (no
+snapshot yet) always creates one. Config per job: `skip_snapshot_if_idle`
+(default `true`) disables the spun-down-disk gate only; the no-change gate is
+always on. Backups are independent of these gates and still run on schedule.
+
 ### Phase 5: Cleanup Local Snapshots (btrfs)
 
 Retention is a choice of how timeslot boundaries are distributed — picking a
@@ -161,7 +183,7 @@ reason). `never` = manual only. `before` is deliberately unsupported: it would
 update before knowing whether any backup will happen.
 
 Duration and size fields (`stuck_threshold`, `stuck_wait`, `size_limit`,
-`snapshot_interval`, `backup_interval`, `timeout`) accept either a bare
+`snapshot_interval`, `backup_interval`) accept either a bare
 integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 `"1w"`, `"200GB"`, `"1.5TiB"`. Units: durations `s m h d w`; sizes
 `b k/kb/kib m/mb/mib g/gb/gib t/tb/tib p/pb/pib` (binary multiples).
@@ -207,7 +229,6 @@ integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
   "backup_window_end": "06:00",
   "ignore_file": "/opt/snap-bak/excludes/data.ignore",
   "excludes": ["*.tmp", "*.cache", ".DS_Store"],
-  "timeout": "24h",
   "tag": "data",
   "restic_options": []
 }
@@ -221,6 +242,7 @@ integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 | `repo` | string | required | must reference repo.name | Repo to backup to |
 | `priority` | int | `100` | `ge=1` | Job priority (higher = more important) |
 | `snapshot_interval` | int/string | `3600` | `ge=900` | Seconds between snapshots, or e.g. `"2h"` |
+| `skip_snapshot_if_idle` | bool | `true` | — | Power saving: skip snapshot creation when any disk in the source's btrfs pool is physically spun down (never wake it), and never snapshot an unchanged subvolume. See Power Saving. |
 | `backup_retention` | dict | `{}` | — | Restic retention policy (e.g., `{"daily": 6}`) |
 | `snapshot_retention` | dict | `{"fn":"exponential","config":{"n":5}}` | — | Local snapshot retention strategy |
 | `backup_interval` | int/string | `3600` | `ge=1` | Seconds between backups, or e.g. `"1w"` |
@@ -228,7 +250,6 @@ integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 | `backup_window_end` | string | `null` | `HH:MM` format | Backup window end (optional) |
 | `ignore_file` | string | `""` | — | Restic exclude-from file |
 | `excludes` | list | `[]` | — | Restic exclude patterns |
-| `timeout` | int/string | `86400` | `ge=1` | Subprocess timeout: seconds or e.g. `"24h"` |
 | `tag` | string | job name | `[A-Za-z0-9_-]` | Restic tag override |
 | `restic_options` | list | `[]` | — | Extra restic CLI flags for this job; global options apply to every command, backup-only options to `backup` alone |
 
@@ -281,7 +302,7 @@ are present on failure. All fields except `job`, `status`, `timestamp`, and
 The `delayed` group carries the delayed-job state (see Delayed Job Handling):
 `delayed` is true while the job cannot proceed; `delayed_reason` is
 `"unreachable"` or `"size_limit"`; `protected_snapshot` names the exact
-snapshot to retry (same `YYYY-MM-DD_HH:MM` format as the snapshot naming rule);
+snapshot to retry (same `YYYY-MM-DD_HH:MMZ` format as the snapshot naming rule);
 `missed_slots` counts missed backup slots and feeds the priority system. On
 success the group resets to `delayed=false`, `delayed_reason=null`,
 `protected_snapshot=null`, `missed_slots=0`.
@@ -415,7 +436,7 @@ B runs first (400), then C (200), then A (100).
 
 ## Snapshot Naming
 
-- Format: `YYYY-MM-DD_HH:MM`
+- Format: `YYYY-MM-DD_HH:MMZ`
 - This is the only accepted format. Snapshots with any other naming convention are ignored.
 
 ### Selection Logic
@@ -478,7 +499,7 @@ per-job lock would add complexity without additional protection.
 ```
 <install>                # root-owned: program, wrapper, config
   snap_bak.py            # orchestrator (root:root 0644)
-  snap-bak-io            # sudo wrapper (root:root 0755)
+  sudo-exec.py            # sudo wrapper (root:root 0755)
   config.json            # root-owned, validated by the wrapper
 
 <install>/state          # owned by snap-bak: runtime state
@@ -488,7 +509,8 @@ per-job lock would add complexity without additional protection.
 
 <install>/excludes       # ignore_file location (root:snap-bak)
 <install>/passwords      # per-repo restic password files (owned by the admin, group snap-bak)
-<install>/cache          # restic cache (RESTIC_CACHE_DIR)
+<install>/cache          # restic cache (service-owned, real dir)
+<install>/.cache         # symlink -> cache; restic's implicit $HOME/.cache default
 ```
 
 All paths are relative to the install directory (`<install>`, production
@@ -531,9 +553,9 @@ snap-bak [OPTIONS]
 | `SNAPBAK_CONFIG_FILE` | Config file path | `/opt/snap-bak/config.json` |
 | `SNAPBAK_JOB` | Job name to run | — |
 | `SNAPBAK_SUDO` | Sudo binary used to invoke the wrapper | `sudo` |
-| `SNAPBAK_IO_WRAPPER` | Path to the root-owned wrapper | `/opt/snap-bak/snap-bak-io` |
+| `SUDO_EXEC_PATH` | Path to the root-owned wrapper | `/opt/snap-bak/sudo-exec.py` |
 | `SNAPBAK_STATE_DIR` | State directory override (default: `/opt/snap-bak/state`) | `/opt/snap-bak/state` |
-| `RESTIC_CACHE_DIR` | Restic cache base | `/opt/snap-bak/cache` |
+| `RESTIC_CACHE_DIR` | Restic cache base (not set; restic uses `$HOME/.cache` → `/opt/snap-bak/.cache` → `/opt/snap-bak/cache`) | — |
 
 ---
 
@@ -541,18 +563,18 @@ snap-bak [OPTIONS]
 
 Btrfs snapshot create/delete and mount/umount require root. snap-bak runs as
 an unprivileged service user and delegates these to a **root-owned wrapper**
-(`snap-bak-io`), reachable via a single static sudoers rule:
+(`sudo-exec.py`), reachable via a single static sudoers rule:
 
 ```
-snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/snap-bak-io
+snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/sudo-exec.py
 ```
 
 A bare command name (no arguments listed) matches any arguments, per
 sudoers(5). This is valid on both sudo-rs and sudo.ws; a trailing `*` is
 deliberately NOT used because sudo-rs mishandles it. The wrapper:
 
-- Accepts only `snapshot|delete|mount|umount <job> [snapshot]` and
-  `update-restic`.
+- Accepts only `snapshot|delete|mount|umount <job> [snapshot]`, `status <job>`,
+  and `update-restic`.
 - Validates `<job>` against the root-owned `/opt/snap-bak/config.json`.
 - Validates `[snapshot]` against `^\d{4}-\d{2}-\d{2}_\d{2}:\d{2}$`.
 - Confines every path under the job's `snapshot_dir` / `mount_base`
@@ -578,13 +600,13 @@ Because the wrapper derives paths from config at runtime, changing
 
 Invariants snap-bak must never breach:
 
-1. **Least privilege.** Only `snap-bak-io` performs privileged operations.
+1. **Least privilege.** Only `sudo-exec.py` performs privileged operations.
    snap-bak is granted none of them; sudo permits only the wrapper.
-2. **Root-owned files.** `snap-bak-io`, `config.json`, and the restic binary
+2. **Root-owned files.** `sudo-exec.py`, `config.json`, and the restic binary
    are root-owned, not writable by group/other — the wrapper is the root
    boundary, config is its trusted input, and restic carries
    `cap_dac_read_search`. Writable by snap-bak ⇒ trivial root escalation.
-3. **Trust boundary.** `snap-bak-io` is trusted, snap-bak is not. The wrapper
+3. **Trust boundary.** `sudo-exec.py` is trusted, snap-bak is not. The wrapper
    validates every argument against root-owned config; privileged ops never
    trust snap-bak-supplied paths/arguments.
 4. **Update trust delegated to restic.** `restic self-update` verifies the
@@ -595,13 +617,13 @@ Invariants snap-bak must never breach:
    is executable only by root and snap-bak. — [file capabilities](https://restic.readthedocs.io/en/stable/080_examples.html#using-file-capabilities)
 
 **NOTE:** anyone able to run the restic binary with `cap_dac_read_search=+ep`
-can read files bypassing permissions. Only `snap-bak-io` may run it, and it
+can read files bypassing permissions. Only `sudo-exec.py` may run it, and it
 sets restic's source/destination itself — without trusted control over
 restic's arguments, snap-bak could "back up" secret files to Mallory.
 
 **TODO:** snap-bak currently runs restic directly, building source/repo args
 from config (snap_bak.py). Requirement 5's "wrapper sets destination itself"
-is not yet implemented — restic must be invoked via `snap-bak-io` so its args
+is not yet implemented — restic must be invoked via `sudo-exec.py` so its args
 come only from root-owned config.
 
 ---
@@ -625,7 +647,7 @@ come only from root-owned config.
 - Snapshot selection
 - Repo throughput learning
 - Restic option filtering / reserved-flag rejection
-- snap-bak-io wrapper validation and path confinement
+- sudo-exec.py wrapper validation and path confinement
 - Failed backup handling
 - Config model
 - Config loading

@@ -2,66 +2,119 @@
 """
 Everything restic-specific: command construction and JSON output parsing.
 
-This module is deliberately dependency-free: it imports only the standard
-library and MUST NOT import scripts.snap_bak. That keeps it safe for the
-root-owned snap-bak-io wrapper to reuse later (if restic execution moves
-behind the wrapper per the SECURITY TODO, restic.py must be installed
-root:root and un-writable by the snap-bak service user).
-
-Flag policy (see `build`): restic has a small set of GLOBAL flags accepted by
-every subcommand; every other flag is specific to one subcommand (e.g. the
-backup-only --exclude* family, which `restic forget` rejects with 'unknown
-flag'). RESTIC_GLOBAL_FLAGS below is derived from `restic --help`
-(restic 0.19.1). When restic adds a new global flag it must be added here;
-until then it is treated as backup-only, which degrades gracefully (it still
-applies to `backup`).
+This module STAYS dependency-free. It MUST NOT be writable by non-root users.
 """
+
 from __future__ import annotations
 
 import json
 from typing import Callable, Sequence
 
+# Default graceful-timeout options applied to EVERY restic subcommand.
+#
+# A stalled backend (rclone) must make *restic* fail cleanly, release its
+# lock, and exit — instead of hanging for hours or being killed mid-operation
+# (a SIGKILL'd backup/prune can corrupt the repo). restic's --stuck-request-timeout
+# cancels a stuck repository request so restic winds down gracefully.
+#
+# We do NOT inject `rclone.args` by default. When `rclone.args` is unset, restic
+# uses its own rclone-backend default (`serve restic --stdio --b2-hard-delete`),
+# which is the happiest path. Overriding `rclone.args` REPLACES that default, so a
+# value that omits `serve restic --stdio` breaks the backend: the repo path then
+# lands in rclone's subcommand slot ("unknown command "<remote>:<path>" for
+# "rclone""). rclone-side timeouts (--timeout/--contimeout) are therefore opt-in
+# via config restic_options, and must keep the `serve restic --stdio` prefix, e.g.
+#   -o rclone.args="serve restic --stdio --timeout 11m --contimeout 11m"
+DEFAULT_STUCK_REQUEST_TIMEOUT = "10m"
+
+
+def _default_global_options() -> list[str]:
+    """Global restic options that make stalled backends fail gracefully.
+
+    Only the restic-side --stuck-request-timeout is applied by default. rclone
+    timeouts are opt-in (see module docstring).
+    """
+    return [
+        "--stuck-request-timeout",
+        DEFAULT_STUCK_REQUEST_TIMEOUT,
+    ]
+
+
+def _with_defaults(global_options: list[str]) -> list[str]:
+    """Append the default --stuck-request-timeout unless already overridden.
+
+    Lets config-supplied restic_options win: if the user already set
+    --stuck-request-timeout, we don't add the default. We never inject
+    `rclone.args` — leaving it unset lets restic use its own backend default.
+    """
+    out = list(global_options)
+    has_stuck = any(
+        o.split("=", 1)[0] == "--stuck-request-timeout"
+        for o in out
+        if o.startswith("-")
+    )
+    if not has_stuck:
+        out.extend(_default_global_options())
+    return out
+
+
 # Global restic options: accepted by every subcommand (`restic --help`).
-RESTIC_GLOBAL_FLAGS = frozenset({
-    "--cacert",
-    "--cache-dir",
-    "--cleanup-cache",
-    "--compression",
-    "--http-user-agent",
-    "--insecure-no-password",
-    "--insecure-tls",
-    "--json",
-    "--key-hint",
-    "--limit-download",
-    "--limit-upload",
-    "--no-cache",
-    "--no-extra-verify",
-    "--no-lock",
-    "--option",
-    "-o",
-    "--pack-size",
-    "--password-command",
-    "--password-file",
-    "-p",
-    "--quiet",
-    "-q",
-    "--repo",
-    "-r",
-    "--repository-file",
-    "--retry-lock",
-    "--stuck-request-timeout",
-    "--tls-client-cert",
-    "--verbose",
-    "-v",
-})
+RESTIC_GLOBAL_FLAGS = frozenset(
+    {
+        "--cacert",
+        "--cache-dir",
+        "--cleanup-cache",
+        "--compression",
+        "--http-user-agent",
+        "--insecure-no-password",
+        "--insecure-tls",
+        "--json",
+        "--key-hint",
+        "--limit-download",
+        "--limit-upload",
+        "--no-cache",
+        "--no-extra-verify",
+        "--no-lock",
+        "--option",
+        "-o",
+        "--pack-size",
+        "--password-command",
+        "--password-file",
+        "-p",
+        "--quiet",
+        "-q",
+        "--repo",
+        "-r",
+        "--repository-file",
+        "--retry-lock",
+        "--stuck-request-timeout",
+        "--tls-client-cert",
+        "--verbose",
+        "-v",
+    }
+)
 
 # Flags snap-bak sets itself for bookkeeping; config restic_options may not
 # override them (they would collide and break summary parsing/retention).
-RESERVED_FLAGS = frozenset({
-    "-r", "--repo", "--password-file", "--json", "--dry-run", "--tag",
-    "--keep-last", "--keep-hourly", "--keep-daily", "--keep-weekly",
-    "--keep-monthly", "--keep-yearly", "--prune", "--exclude", "--exclude-file",
-})
+RESERVED_FLAGS = frozenset(
+    {
+        "-r",
+        "--repo",
+        "--password-file",
+        "--json",
+        "--dry-run",
+        "--tag",
+        "--keep-last",
+        "--keep-hourly",
+        "--keep-daily",
+        "--keep-weekly",
+        "--keep-monthly",
+        "--keep-yearly",
+        "--prune",
+        "--exclude",
+        "--exclude-file",
+    }
+)
 
 
 def build(
@@ -115,7 +168,17 @@ def build(
             backup_options.append(opt)
             last_flag_reserved = False
             last_flag_global = False
-    cmd.extend(global_options)
+    # Defensive guard: a user-supplied rclone.args that omits `serve restic
+    # --stdio` silently breaks the rclone backend (the repo path lands in
+    # rclone's subcommand slot). Warn so the misconfiguration is obvious.
+    for opt in global_options:
+        if "rclone.args=" in opt and "serve restic --stdio" not in opt:
+            if warn is not None:
+                warn(
+                    f"{opt}: rclone.args must include 'serve restic --stdio' "
+                    f"or the rclone backend breaks"
+                )
+    cmd.extend(_with_defaults(global_options))
     if password_file:
         cmd.extend(["--password-file", password_file])
     if subcommand == "backup":

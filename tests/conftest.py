@@ -6,6 +6,7 @@ imported. snap_bak.py calls STATE_DIR.mkdir(...) at module import time, so
 without this every test run would try to create the real /opt/snap-bak/state on
 the running machine. The directory is removed on interpreter exit.
 """
+
 import atexit
 import os
 import shutil

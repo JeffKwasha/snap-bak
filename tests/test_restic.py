@@ -5,6 +5,7 @@ The central regression here: backup-only flags (excludes, non-global
 restic_options) must NEVER leak onto other restic subcommands like `forget`,
 which reject them with 'unknown flag'.
 """
+
 import sys
 from pathlib import Path
 
@@ -24,13 +25,15 @@ class TestBuild:
             excludes=["*.tmp", "*.cache"],
         )
         assert cmd[:4] == ["restic", "-r", "rclone:remote:repo", "backup"]
-        assert "--compression=better" in cmd          # global
-        assert "--one-file-system" in cmd             # backup-only
-        assert ["--exclude-file", "/etc/x.ignore"] == \
-            cmd[cmd.index("--exclude-file"):cmd.index("--exclude-file") + 2]
+        assert "--compression=better" in cmd  # global
+        assert "--one-file-system" in cmd  # backup-only
+        assert ["--exclude-file", "/etc/x.ignore"] == cmd[
+            cmd.index("--exclude-file") : cmd.index("--exclude-file") + 2
+        ]
         assert "--exclude" in cmd and "*.tmp" in cmd and "*.cache" in cmd
-        assert ["--password-file", "/pw"] == \
-            cmd[cmd.index("--password-file"):cmd.index("--password-file") + 2]
+        assert ["--password-file", "/pw"] == cmd[
+            cmd.index("--password-file") : cmd.index("--password-file") + 2
+        ]
 
     def test_forget_gets_global_but_no_backup_only_flags(self):
         cmd = restic.build(
@@ -42,8 +45,8 @@ class TestBuild:
             excludes=["*.tmp"],
         )
         assert cmd[3] == "forget"
-        assert "--compression=better" in cmd          # global still applies
-        assert "--one-file-system" not in cmd         # backup-only dropped
+        assert "--compression=better" in cmd  # global still applies
+        assert "--one-file-system" not in cmd  # backup-only dropped
         assert "--exclude" not in cmd
         assert "--exclude-file" not in cmd
 
@@ -64,7 +67,16 @@ class TestBuild:
         cmd = restic.build(
             "backup",
             repo_path="r:",
-            options=["--tag", "x", "--json", "--exclude", "y", "--prune", "-r", "/other"],
+            options=[
+                "--tag",
+                "x",
+                "--json",
+                "--exclude",
+                "y",
+                "--prune",
+                "-r",
+                "/other",
+            ],
             warn=warns.append,
         )
         assert set(warns) == {"--tag", "--json", "--exclude", "--prune", "-r"}
@@ -74,9 +86,7 @@ class TestBuild:
             assert tok not in cmd
 
     def test_short_global_option_applies(self):
-        cmd = restic.build(
-            "forget", repo_path="r:", options=["-o", "key=value"]
-        )
+        cmd = restic.build("forget", repo_path="r:", options=["-o", "key=value"])
         assert "-o" in cmd and "key=value" in cmd
 
     def test_no_password_file_when_empty(self):
@@ -85,7 +95,8 @@ class TestBuild:
 
     def test_repo_option_precedes_job_option(self):
         cmd = restic.build(
-            "backup", repo_path="r:",
+            "backup",
+            repo_path="r:",
             options=["--compression=better", "--one-file-system"],
         )
         assert cmd.index("--compression=better") < cmd.index("--one-file-system")

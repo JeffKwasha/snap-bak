@@ -45,12 +45,12 @@ What `scripts/snap-bak-setup.sh` does:
 1. Verifies you are `root`.
 2. Creates the `snap-bak` user/group and `/opt/snap-bak`.
 3. Installs the orchestrator to `/opt/snap-bak/snap_bak.py` (root:root 0644)
-   and the wrapper to `/opt/snap-bak/snap-bak-io` (root:root 0755).
+   and the wrapper to `/opt/snap-bak/sudo-exec.py` (root:root 0755).
 4. Writes an annotated example config to `/opt/snap-bak/config.json`.
 5. Creates service-writable `state/`, `cache/`, `passwords/` and
    `.config/rclone/`; root:snap-bak `excludes/`.
  6. Creates the mount base `/bak` and installs a single static sudoers rule —
-    `snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/snap-bak-io` (bare command
+    `snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/sudo-exec.py` (bare command
     name = any arguments, per sudoers(5)) — valid on both sudo-rs and
     sudo.ws.
 7. Writes `snap-bak.service` (oneshot) and `snap-bak.timer` (hourly).
@@ -115,16 +115,17 @@ mount/umount) are delegated to a **root-owned wrapper** that is the only thing
 sudoers lets the service user run.
 
 ### How it Works
-1.  **Static sudoers rule**: `snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/snap-bak-io`
+1.  **Static sudoers rule**: `snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/sudo-exec.py`
     — a bare command name matches any arguments (see sudoers(5)), valid on
     both sudo-rs and sudo.ws. A trailing `*` is deliberately NOT used because
     sudo-rs mishandles it. Changing `mount_base` or `snapshot_dir` in config
     NEVER requires touching sudoers, because the wrapper derives every path
     from the root-owned config at runtime.
-2.  **The wrapper** (`snap-bak-io`, root-owned 0755) accepts only
-    `snapshot|delete|mount|umount <job> [snapshot]` and `update-restic`,
+2.  **The wrapper** (`sudo-exec.py`, root-owned 0755) accepts only
+    `snapshot|delete|mount|umount <job> [snapshot]`, `status <job>`, and
+    `update-restic`,
     validates the job against `/opt/snap-bak/config.json` and the snapshot
-    name against `YYYY-MM-DD_HH:MM`, and confines all paths under the
+    name against `YYYY-MM-DD_HH:MMZ`, and confines all paths under the
     configured `snapshot_dir` / `mount_base` (realpath traversal guard).
 3.  **Stable read-only bind mounts** — snapshots are bound at
     `<mount_base>/<source basename>` (e.g. `/mnt/data` →
@@ -161,12 +162,12 @@ sudoers lets the service user run.
 
 The config file is JSONC: standard JSON plus `//` and `/* */` comments and
 trailing commas. It is parsed with json5 by both `snap_bak.py` and the root
-wrapper `snap-bak-io` (a single code path for JSONC handling). The default
+wrapper `sudo-exec.py` (a single code path for JSONC handling). The default
 config written by `snap-bak-setup.sh` includes inline comments describing
 every field.
 
 Duration and size fields (`stuck_threshold`, `size_limit`,
-`snapshot_interval`, `backup_interval`, `timeout`) accept either a bare
+`snapshot_interval`, `backup_interval`) accept either a bare
 integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 `"1w"`, `"200GB"`, `"1.5TiB"`. Units: durations `s m h d w`; sizes
 `b k/kb/kib m/mb/mib g/gb/gib t/tb/tib p/pb/pib` (binary multiples).
@@ -203,8 +204,7 @@ Edit `config/config.json`:
       "backup_window_start": "01:00",
       "backup_window_end": "07:00",
       "ignore_file": "/opt/snap-bak/excludes/data.ignore",
-      "excludes": ["*.tmp", "*.cache", ".DS_Store"],
-      "timeout": "24h"
+      "excludes": ["*.tmp", "*.cache", ".DS_Store"]
     }
   ]
 }
@@ -241,6 +241,7 @@ Edit `config/config.json`:
 | `repo` | string | Name of repo to use (must match `repos[].name`) | — |
 | `priority` | int | Job priority (higher = more important) | `100` |
 | `snapshot_interval` | int/str | Seconds between snapshots (min 900) or e.g. `"2h"` | `3600` |
+| `skip_snapshot_if_idle` | bool | Power saving: skip snapshot creation when any disk in the source's btrfs pool is physically spun down (never wake it), and never snapshot an unchanged subvolume | `true` |
 | `backup_retention` | dict | Restic forget/keep policy (e.g., `{"daily": 6}`) | `{}` |
 | `snapshot_retention` | dict | Local snapshot retention strategy | `{"fn":"exponential","config":{"n":5}}` |
 | `backup_interval` | int/str | Minimum seconds between backups or e.g. `"1w"` | `3600` |
@@ -248,7 +249,6 @@ Edit `config/config.json`:
 | `backup_window_end` | string | End of allowed backup window (HH:MM, exclusive) | `null` |
 | `ignore_file` | string | Path to file with exclude patterns | `""` |
 | `excludes` | list | List of glob patterns to exclude | `[]` |
-| `timeout` | int/str | Command timeout: seconds or e.g. `"24h"` | `86400` |
 | `tag` | string | Restic tag override for this job's backups/forget | job name |
 | `restic_options` | list | Extra restic CLI flags for this job; global options apply to every command, backup-only options to `backup` alone | `[]` |
 
@@ -296,7 +296,7 @@ capabilities). Updating restic rewrites a binary that can read any file, so
 snap-bak only does it (`after`) after a run in which a backup actually
 completed — never for skipped, dry-run, or failed runs. `never` leaves updates
 to you. Run it by hand anytime with
-`sudo /opt/snap-bak/snap-bak-io update-restic`.
+`sudo /opt/snap-bak/sudo-exec.py update-restic`.
 
 ## Snapshot and Backup Flow
 
@@ -313,11 +313,35 @@ whenever `snapshot_interval` has elapsed since the last one (or none exists yet)
 btrfs subvolume snapshot -r <source_subvolume> <snapshot_dir>/<name>
 ```
 
-The snapshot name uses the format `YYYY-MM-DD_HH:MM` (e.g., `2026-07-26_10:30`).
+The snapshot name uses the format `YYYY-MM-DD_HH:MMZ` (e.g., `2026-07-26_10:30Z`), where the trailing `Z` marks UTC.
 Snapshots are created at most once per `snapshot_interval` seconds (default: 1 hour,
 minimum: 15 minutes). Creation is independent of backup success: fresh installs
 create their first snapshot immediately, and a long-running backup never stalls
 the snapshot cadence. Non-matching names in `snapshot_dir` are ignored.
+
+### Power saving (snapshot suppression)
+
+By default snap-bak avoids waking disks and avoids pointless snapshots:
+
+- **Never wake a spun-down drive.** If *any* physical disk in the btrfs pool
+  hosting the source subvolume is spun down, the snapshot is skipped for that
+  run (log: `Skipping '<snapshot>': pool has a spun-down disk (power saving; not waking the drive)`). The check reads
+  only kernel state (`/sys/fs/btrfs/<uuid>/devices`, `/sys/class/block/<disk>/
+  device/state`, `queue/rotational`) and never touches the disk, so an hourly
+  timer can't keep the drive spinning. "Parked" (dm/md layer) or unknown states
+  are *not* treated as spin-down — the gate fails open. Opt out per job with
+  `skip_snapshot_if_idle: false`.
+- **Never snapshot an unchanged subvolume.** After the disk-state check, the
+  source's btrfs `Generation` (last-change generation) is compared with the
+  latest snapshot's; if they are equal there are no changes to capture and the
+  snapshot is skipped (log: `Skipping '<snapshot>': source unchanged since '<last_snapshot>'`). This is the
+  same mechanism btrbk's `onchange` snapshots use.
+
+Both gates fail open: if the pool state or generation cannot be determined, the
+historic behavior (create when due) is preserved — a broken probe never silently
+stops snapshots. **Backups are unaffected** and still run in their configured
+window (the least-busy time), waking the drive for the scheduled upload as
+intended.
 
 ### When Backups Are Created
 
@@ -449,9 +473,9 @@ snap-bak --config /path/to/config.json
 | `SNAPBAK_CONFIG_FILE` | Path to config JSON file | `config/config.json` |
 | `SNAPBAK_JOB` | Run a specific job by name | (all jobs) |
 | `SNAPBAK_STATE_DIR` | State directory override (default: `/opt/snap-bak/state`) | `/opt/snap-bak/state` |
-| `RESTIC_CACHE_DIR` | Restic cache directory | `/opt/snap-bak/cache` |
+| `RESTIC_CACHE_DIR` | Restic cache directory (not set; restic uses `$HOME/.cache` → `/opt/snap-bak/.cache` → `/opt/snap-bak/cache`) | — |
 | `SNAPBAK_SUDO` | Sudo binary used to invoke the wrapper | `sudo` |
-| `SNAPBAK_IO_WRAPPER` | Path to the root-owned wrapper | `/opt/snap-bak/snap-bak-io` |
+| `SUDO_EXEC_PATH` | Path to the root-owned wrapper | `/opt/snap-bak/sudo-exec.py` |
 
 ## State Files
 
@@ -498,5 +522,5 @@ uv run pytest -q
 Tests cover retention functions (exponential, datetimes, keeplist), snapshot
 parsing, config validation, repo selection, failed backup retry, backup window
 logic, throughput calculation, config loading, restic option filtering, and the
-snap-bak-io wrapper's validation/confinement. No remote restic or actual
+sudo-exec.py wrapper's validation/confinement. No remote restic or actual
 Btrfs operations are required.

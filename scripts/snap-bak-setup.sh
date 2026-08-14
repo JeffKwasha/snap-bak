@@ -28,7 +28,8 @@ SNAPBAK_DIR="/opt/snap-bak"
 MOUNT_BASE="/bak"
 CONFIG_FILE="$SNAPBAK_DIR/config.json"
 SCRIPT_PATH="$SNAPBAK_DIR/snap_bak.py"
-WRAPPER_PATH="$SNAPBAK_DIR/snap-bak-io"
+WRAPPER_PATH="$SNAPBAK_DIR/sudo-exec.py"
+SNAPSHOT_MODULE_PATH="$SNAPBAK_DIR/snapshot.py"
 SERVICE_NAME="snap-bak"
 STATE_DIR="$SNAPBAK_DIR/state"
 CACHE_DIR="$SNAPBAK_DIR/cache"
@@ -36,7 +37,8 @@ CACHE_DIR="$SNAPBAK_DIR/cache"
 # Source files co-located with this setup script.
 SCRIPT_SRC="$(dirname "$(readlink -f "$0")")/snap_bak.py"
 RESTIC_MODULE_SRC="$(dirname "$(readlink -f "$0")")/restic.py"
-WRAPPER_SRC="$(dirname "$(readlink -f "$0")")/snap-bak-io"
+SNAPSHOT_MODULE_SRC="$(dirname "$(readlink -f "$0")")/snapshot.py"
+WRAPPER_SRC="$(dirname "$(readlink -f "$0")")/sudo-exec.py"
 
 # --- 0. PYTHON DEPENDENCIES (for system python3) ---
 # The service runs /usr/bin/python3 and the wrapper runs 'env python3', so
@@ -74,9 +76,9 @@ else
 fi
 
 # /opt/snap-bak is ROOT-owned (0755). The service user must not be able to
-# replace snap_bak.py, restic.py, or snap-bak-io: the wrapper is the sudo
-# security boundary, so a writable install dir would mean trivial root
-# escalation.
+# replace snap_bak.py, restic.py, snapshot.py, or sudo-exec.py: the wrapper is
+# the sudo security boundary, so a writable install dir would mean trivial
+# root escalation.
 mkdir -p "$SNAPBAK_DIR"
 chown root:root "$SNAPBAK_DIR"
 chmod 0755 "$SNAPBAK_DIR"
@@ -90,14 +92,19 @@ if [ ! -f "$RESTIC_MODULE_SRC" ]; then
     echo "[!] Cannot find $RESTIC_MODULE_SRC. Place restic.py next to this script." >&2
     exit 1
 fi
+if [ ! -f "$SNAPSHOT_MODULE_SRC" ]; then
+    echo "[!] Cannot find $SNAPSHOT_MODULE_SRC. Place snapshot.py next to this script." >&2
+    exit 1
+fi
 if [ ! -f "$WRAPPER_SRC" ]; then
-    echo "[!] Cannot find $WRAPPER_SRC. Place snap-bak-io next to this script." >&2
+    echo "[!] Cannot find $WRAPPER_SRC. Place sudo-exec.py next to this script." >&2
     exit 1
 fi
 install -o root -g root -m 0644 "$SCRIPT_SRC" "$SCRIPT_PATH"
 install -o root -g root -m 0644 "$RESTIC_MODULE_SRC" "$SNAPBAK_DIR/restic.py"
+install -o root -g root -m 0644 "$SNAPSHOT_MODULE_SRC" "$SNAPSHOT_MODULE_PATH"
 install -o root -g root -m 0755 "$WRAPPER_SRC" "$WRAPPER_PATH"
-echo "[*] Installed $SCRIPT_PATH, $SNAPBAK_DIR/restic.py (root:root 0644) and $WRAPPER_PATH (root:root 0755)."
+echo "[*] Installed $SCRIPT_PATH, $SNAPBAK_DIR/restic.py, $SNAPSHOT_MODULE_PATH (root:root 0644) and $WRAPPER_PATH (root:root 0755)."
 
 # --- 1d. VERIFY/UPDDATE RESTIC (setcap + self-update via the wrapper) ---
 # The wrapper is the single code path for restic trust + setcap (see its
@@ -131,6 +138,22 @@ for d in "$STATE_DIR" "$CACHE_DIR"; do
     chown "$SERVICE_USER":"$SERVICE_GROUP" "$d"
     chmod 0750 "$d"
 done
+
+# Expose the cache at restic's implicit default $HOME/.cache (HOME is
+# /opt/snap-bak for the service user). We do NOT set RESTIC_CACHE_DIR; restic
+# resolves $HOME/.cache itself, which lands on this symlink -> the real
+# snap-bak-owned cache dir. Root-owned symlink; the service user writes through
+# it. Idempotent: only (re)create if missing or pointing elsewhere.
+CACHE_LINK="$SNAPBAK_DIR/.cache"
+if [ -L "$CACHE_LINK" ]; then
+    if [ "$(readlink "$CACHE_LINK")" != "cache" ]; then
+        ln -sfn cache "$CACHE_LINK"
+    fi
+elif [ ! -e "$CACHE_LINK" ]; then
+    ln -s cache "$CACHE_LINK"
+else
+    echo "[!] $CACHE_LINK exists and is not a symlink; leaving it untouched." >&2
+fi
 
 # --- 2. GENERATE EXAMPLE CONFIG ---
 # This is JSONC: // and /* */ comments are allowed and stripped by
@@ -195,6 +218,12 @@ else
       // priority         : scheduling order, higher = earlier  (int >= 1)
       // snapshot_interval: interval between snapshots, min 900s
       //                     (int seconds or e.g. '2h')
+      // skip_snapshot_if_idle: power saving (default true). When true, snap-bak
+      //                     does NOT create a snapshot if any disk in the btrfs
+      //                     pool is physically spun down (won't wake the drive),
+      //                     and never snapshots a subvolume unchanged since the
+      //                     last snapshot. Backups are unaffected. Set false to
+      //                     always snapshot on schedule.
       // snapshot_retention: how long to keep LOCAL snapshots;
       //                     fn = exponential|datetimes; see SPEC.md for config
       // backup_retention : restic forget/prune keep-policy;
@@ -205,21 +234,20 @@ else
       // excludes         : list of restic --exclude patterns (gitignore-style)
       // tag              : optional restic tag override (default: job name)
       // restic_options   : extra restic CLI flags for this job (see repo comment)
-      // timeout          : max time for the restic backup step  (int seconds or e.g. '24h')
       "name": "Home-Protection",
       "snapshot_dir": "/home/.snapshots",
       "source_subvolume": "home",
       "repo": "primary-cloud",
       "priority": 150,
       "snapshot_interval": 3600,
+      "skip_snapshot_if_idle": true,
       "snapshot_retention": {"fn": "exponential", "config": {"n": 5}},
       "backup_retention": {"daily": 7, "weekly": 4},
       "backup_interval": 604800,
       "backup_window_start": "02:00",
       "backup_window_end": "06:00",
       "ignore_file": "/opt/snap-bak/excludes/home.ignore",
-      "excludes": ["*.tmp", "*.cache"],
-      "timeout": 7200
+      "excludes": ["*.tmp", "*.cache"]
     }
   ]
 }
@@ -298,7 +326,6 @@ Type=oneshot
 User=$SERVICE_USER
 Group=$SERVICE_GROUP
 Environment=SNAPBAK_CONFIG_FILE=$CONFIG_FILE
-Environment=RESTIC_CACHE_DIR=$CACHE_DIR
 ExecStart=/usr/bin/python3 $SCRIPT_PATH
 
 [Install]
