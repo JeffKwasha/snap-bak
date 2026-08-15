@@ -97,6 +97,8 @@ for stale in cli.py config.py job.py restic.py snapshot.py; do
     rm -f "$SNAPBAK_DIR/$stale"
 done
 cp -r "$PKG_SRC" "$PKG_PATH"
+# Drop dev bytecode so we never install .pyc built for the wrong interpreter.
+find "$PKG_PATH" -type d -name __pycache__ -exec rm -rf {} +
 chown -R root:root "$PKG_PATH"
 chmod 0755 "$PKG_PATH"
 find "$PKG_PATH" -type f -exec chmod 0644 {} \;
