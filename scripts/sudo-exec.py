@@ -20,7 +20,7 @@ never pass arbitrary paths to btrfs/mount. Accepted operations:
   files via cap_dac_read_search on the restic binary (applied by
   'update-restic').
 
-This wrapper is intentionally standalone: it must NOT import scripts.snap_bak
+This wrapper is intentionally standalone: it must NOT import the orchestrator
 (the security boundary is the wrapper itself; coupling to the orchestrator
 would let a bug there widen this path). It is installed root:root 0755 by
 snap-bak-setup.sh.
@@ -37,7 +37,7 @@ arguments (see sudoers(5)), and '*' is deliberately avoided because sudo-rs
 mishandles it.
 
 Config is JSONC (// and /* */ comments allowed); json5 is used to parse it.
-The orchestrator (snap_bak.py) parses the same config with the same library,
+The orchestrator (config.py) parses the same config with the same library,
 so the JSONC handling lives in exactly one place.
 """
 

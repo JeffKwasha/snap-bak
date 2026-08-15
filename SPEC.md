@@ -498,7 +498,11 @@ per-job lock would add complexity without additional protection.
 
 ```
 <install>                # root-owned: program, wrapper, config
-  snap_bak.py            # orchestrator (root:root 0644)
+  cli.py                 # entry point / orchestration (root:root 0644)
+  config.py              # config loading + models (root:root 0644)
+  job.py                 # backup engine (root:root 0644)
+  restic.py              # restic command building (root:root 0644)
+  snapshot.py            # snapshot domain model (root:root 0644)
   sudo-exec.py            # sudo wrapper (root:root 0755)
   config.json            # root-owned, validated by the wrapper
 
@@ -622,7 +626,7 @@ sets restic's source/destination itself — without trusted control over
 restic's arguments, snap-bak could "back up" secret files to Mallory.
 
 **TODO:** snap-bak currently runs restic directly, building source/repo args
-from config (snap_bak.py). Requirement 5's "wrapper sets destination itself"
+from config (job.py). Requirement 5's "wrapper sets destination itself"
 is not yet implemented — restic must be invoked via `sudo-exec.py` so its args
 come only from root-owned config.
 

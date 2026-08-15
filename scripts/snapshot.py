@@ -1,6 +1,6 @@
 """Snapshot domain object — the single owner of the btrfs snapshot model.
 
-Shared by the unprivileged orchestrator (snap_bak.py) and the root-owned
+Shared by the unprivileged orchestrator (config.py/job.py) and the root-owned
 wrapper (sudo-exec.py, formerly snap-bak-io). Installed as
 /opt/snap-bak/snapshot.py (root:root 0644, see snap-bak-setup.sh); both callers
 import it with a single fallback:
@@ -22,7 +22,7 @@ parse crashed a run when a legacy name reached a privileged delete), and the
 wrapper's btrfs command strings can never drift from the model.
 
 Dependency-free (standard library only) and therefore safe for the root
-wrapper to import: it must NOT import scripts.snap_bak. Privileged actions
+wrapper to import: it must NOT import the orchestrator modules. Privileged actions
 (create/delete/generation) are plain methods — callers decide who may run
 them; the orchestrator deliberately shells out to the wrapper via sudo.
 """

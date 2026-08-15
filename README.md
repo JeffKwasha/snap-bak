@@ -44,8 +44,9 @@ What `scripts/snap-bak-setup.sh` does:
 
 1. Verifies you are `root`.
 2. Creates the `snap-bak` user/group and `/opt/snap-bak`.
-3. Installs the orchestrator to `/opt/snap-bak/snap_bak.py` (root:root 0644)
-   and the wrapper to `/opt/snap-bak/sudo-exec.py` (root:root 0755).
+3. Installs the orchestrator modules to `/opt/snap-bak/` (`cli.py`, `config.py`,
+   `job.py`, `restic.py`, `snapshot.py`; root:root 0644) and the wrapper to
+   `/opt/snap-bak/sudo-exec.py` (root:root 0755).
 4. Writes an annotated example config to `/opt/snap-bak/config.json`.
 5. Creates service-writable `state/`, `cache/`, `passwords/` and
    `.config/rclone/`; root:snap-bak `excludes/`.
@@ -161,7 +162,7 @@ sudoers lets the service user run.
 ## Configuration
 
 The config file is JSONC: standard JSON plus `//` and `/* */` comments and
-trailing commas. It is parsed with json5 by both `snap_bak.py` and the root
+trailing commas. It is parsed with json5 by both `config.py` and the root
 wrapper `sudo-exec.py` (a single code path for JSONC handling). The default
 config written by `snap-bak-setup.sh` includes inline comments describing
 every field.

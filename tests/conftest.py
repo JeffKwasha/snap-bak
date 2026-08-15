@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Test-wide isolation.
 
-Redirects SNAPBAK_STATE_DIR to a throwaway directory BEFORE scripts.snap_bak is
-imported. snap_bak.py calls STATE_DIR.mkdir(...) at module import time, so
+Redirects SNAPBAK_STATE_DIR to a throwaway directory BEFORE scripts.config is
+imported. config.py calls STATE_DIR.mkdir(...) at module import time, so
 without this every test run would try to create the real /opt/snap-bak/state on
 the running machine. The directory is removed on interpreter exit.
 """

@@ -19,7 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import scripts.snap_bak as sb
+from scripts import config
 
 _WRAPPER_PATH = Path(__file__).parent.parent / "scripts" / "sudo-exec.py"
 _loader = importlib.machinery.SourceFileLoader("sudo_exec", str(_WRAPPER_PATH))
@@ -165,14 +165,19 @@ class TestMountSubpath:
             wrapper = io._job_mount_point(
                 {"mount_base": mount_base}, {"source_subvolume": source}
             )
-            model = sb.Job(
-                name="n",
-                snapshot_dir=str(tmp_path),
-                source_subvolume=source,
-                repo="primary",
-                repos=[sb.Repo(name="primary", path="rclone:x")],
+            cfg = config.Config(
+                repos=[{"name": "primary", "path": "rclone:x"}],
+                jobs=[
+                    {
+                        "name": "n",
+                        "snapshot_dir": str(tmp_path),
+                        "source_subvolume": source,
+                        "repo": "primary",
+                    }
+                ],
                 mount_base=mount_base,
-            ).mount_point
+            )
+            model = cfg.resolve()[0].mount_point
             assert str(model) == wrapper, (mount_base, source)
 
 

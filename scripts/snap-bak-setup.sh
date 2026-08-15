@@ -27,7 +27,7 @@ SERVICE_GROUP="snap-bak"
 SNAPBAK_DIR="/opt/snap-bak"
 MOUNT_BASE="/bak"
 CONFIG_FILE="$SNAPBAK_DIR/config.json"
-SCRIPT_PATH="$SNAPBAK_DIR/snap_bak.py"
+SCRIPT_PATH="$SNAPBAK_DIR/cli.py"
 WRAPPER_PATH="$SNAPBAK_DIR/sudo-exec.py"
 SNAPSHOT_MODULE_PATH="$SNAPBAK_DIR/snapshot.py"
 SERVICE_NAME="snap-bak"
@@ -35,7 +35,9 @@ STATE_DIR="$SNAPBAK_DIR/state"
 CACHE_DIR="$SNAPBAK_DIR/cache"
 
 # Source files co-located with this setup script.
-SCRIPT_SRC="$(dirname "$(readlink -f "$0")")/snap_bak.py"
+SCRIPT_SRC="$(dirname "$(readlink -f "$0")")/cli.py"
+CONFIG_MODULE_SRC="$(dirname "$(readlink -f "$0")")/config.py"
+JOB_MODULE_SRC="$(dirname "$(readlink -f "$0")")/job.py"
 RESTIC_MODULE_SRC="$(dirname "$(readlink -f "$0")")/restic.py"
 SNAPSHOT_MODULE_SRC="$(dirname "$(readlink -f "$0")")/snapshot.py"
 WRAPPER_SRC="$(dirname "$(readlink -f "$0")")/sudo-exec.py"
@@ -43,7 +45,7 @@ WRAPPER_SRC="$(dirname "$(readlink -f "$0")")/sudo-exec.py"
 # --- 0. PYTHON DEPENDENCIES (for system python3) ---
 # The service runs /usr/bin/python3 and the wrapper runs 'env python3', so
 # both share the system interpreter and both need pydantic + json5 importable
-# (json5 parses the JSONC config in snap_bak.py AND in the root wrapper).
+# (json5 parses the JSONC config in config.py AND in the root wrapper).
 echo "[*] Checking Python dependencies (pydantic, python-dateutil, json5)..."
 if ! python3 -c "import pydantic, dateutil, json5" &>/dev/null; then
     echo "[*] Installing Python dependencies with pip3..."
@@ -76,7 +78,7 @@ else
 fi
 
 # /opt/snap-bak is ROOT-owned (0755). The service user must not be able to
-# replace snap_bak.py, restic.py, snapshot.py, or sudo-exec.py: the wrapper is
+# replace config.py, job.py, cli.py, restic.py, snapshot.py, or sudo-exec.py: the wrapper is
 # the sudo security boundary, so a writable install dir would mean trivial
 # root escalation.
 mkdir -p "$SNAPBAK_DIR"
@@ -85,7 +87,15 @@ chmod 0755 "$SNAPBAK_DIR"
 
 # --- 1b. INSTALL MANAGED PROGRAM & WRAPPER ---
 if [ ! -f "$SCRIPT_SRC" ]; then
-    echo "[!] Cannot find $SCRIPT_SRC. Place snap_bak.py next to this script." >&2
+    echo "[!] Cannot find $SCRIPT_SRC. Place cli.py next to this script." >&2
+    exit 1
+fi
+if [ ! -f "$CONFIG_MODULE_SRC" ]; then
+    echo "[!] Cannot find $CONFIG_MODULE_SRC. Place config.py next to this script." >&2
+    exit 1
+fi
+if [ ! -f "$JOB_MODULE_SRC" ]; then
+    echo "[!] Cannot find $JOB_MODULE_SRC. Place job.py next to this script." >&2
     exit 1
 fi
 if [ ! -f "$RESTIC_MODULE_SRC" ]; then
@@ -101,10 +111,12 @@ if [ ! -f "$WRAPPER_SRC" ]; then
     exit 1
 fi
 install -o root -g root -m 0644 "$SCRIPT_SRC" "$SCRIPT_PATH"
+install -o root -g root -m 0644 "$CONFIG_MODULE_SRC" "$SNAPBAK_DIR/config.py"
+install -o root -g root -m 0644 "$JOB_MODULE_SRC" "$SNAPBAK_DIR/job.py"
 install -o root -g root -m 0644 "$RESTIC_MODULE_SRC" "$SNAPBAK_DIR/restic.py"
 install -o root -g root -m 0644 "$SNAPSHOT_MODULE_SRC" "$SNAPSHOT_MODULE_PATH"
 install -o root -g root -m 0755 "$WRAPPER_SRC" "$WRAPPER_PATH"
-echo "[*] Installed $SCRIPT_PATH, $SNAPBAK_DIR/restic.py, $SNAPSHOT_MODULE_PATH (root:root 0644) and $WRAPPER_PATH (root:root 0755)."
+echo "[*] Installed $SCRIPT_PATH, config.py, job.py, restic.py, $SNAPSHOT_MODULE_PATH (root:root 0644) and $WRAPPER_PATH (root:root 0755)."
 
 # --- 1d. VERIFY/UPDDATE RESTIC (setcap + self-update via the wrapper) ---
 # The wrapper is the single code path for restic trust + setcap (see its
@@ -157,7 +169,7 @@ fi
 
 # --- 2. GENERATE EXAMPLE CONFIG ---
 # This is JSONC: // and /* */ comments are allowed and stripped by
-# snap_bak.py (whitespace-preserving, so line numbers stay valid). Every real
+# config.py, job.py, cli.py (whitespace-preserving, so line numbers stay valid). Every real
 # field is shown with a value you must edit. This file loads as-is.
 # Idempotent: an existing config is left untouched so your edits survive a
 # re-run (use --force ... or rm the file to regenerate).

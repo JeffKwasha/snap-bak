@@ -2,7 +2,7 @@
 """Unit tests for the shared scripts/snapshot.py domain module.
 
 The module is the single owner of the snapshot name format and the btrfs
-command line, and is used by BOTH the orchestrator (snap_bak.py) and the
+command line, and is used by BOTH the orchestrator (cli.py) and the
 privileged wrapper (sudo-exec.py). These tests pin the strictness of the name
 parse (the crash that started all this) and the memoized generation reads.
 """
