@@ -12,15 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-try:
-    from scripts import config
-except ImportError:  # installed standalone under /opt/snap-bak/
-    import config
-
-try:
-    from scripts import job
-except ImportError:  # installed standalone under /opt/snap-bak/
-    import job
+from snap_bak import config
+from snap_bak import job
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +139,7 @@ def _main_impl() -> None:
         fh.setFormatter(logging.Formatter(config._FILE_FORMAT))
         logging.getLogger().addHandler(fh)
 
-    cfg = config.load_config(Path(args.config))
+    cfg = config.Config.load(Path(args.config))
     jobs = cfg.resolve(str(args.config))
 
     if args.list_jobs:

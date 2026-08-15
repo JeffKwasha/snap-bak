@@ -1,8 +1,8 @@
 # snap-bak refactor — public interfaces
 
-Goal: decompose `scripts/snap_bak.py` (~2k lines) into three aligned modules and
-delete it. The entry point becomes `scripts.cli:main`. `restic.py`, `snapshot.py`
-and `sudo-exec.py` are unchanged.
+Goal: decompose the old monolithic `snap_bak.py` (~2k lines) into three aligned
+modules and delete it. The entry point becomes `snap_bak.cli:main`. `restic.py`,
+`snapshot.py` and `sudo-exec.py` are unchanged.
 
 The design applies two rules everywhere:
 
@@ -18,12 +18,12 @@ missed-slot escalation, effective-priority ordering, size-limit allocation,
 dry-run chokepoint, power-saving gate, throughput learning, mount reuse safety,
 global-lock contention/stuck-wait, exit-code semantics, restic-update gating,
 password gate, sudo trust model) is **preserved exactly**. The reference for
-exact semantics is the current `scripts/snap_bak.py` (kept in the tree during
+exact semantics is the current `src/snap_bak/job.py` (kept in the tree during
 this work). Line numbers below refer to it.
 
 ---
 
-## Module: `scripts/config.py`
+## Module: `src/snap_bak/config.py`
 
 "Initialize." Constants, env paths, human-readable quantity parsing, logging
 setup, retention builders, and the config models. Imports only `snapshot`
@@ -33,7 +33,7 @@ Dual-import fallback (also used by every module that imports a sibling):
 
 ```python
 try:
-    from scripts import snapshot
+    from snap_bak import snapshot
 except ImportError:  # installed standalone under /opt/snap-bak/
     import snapshot
 ```
@@ -204,17 +204,18 @@ class Config(BaseModel):
   `config_path`/resolved `tag` on each job and returns `self.jobs` (replaces the
   old `resolve_jobs`, lines 1876–1882).
 
-### `load_config` (lines 1885–1894)
+### `Config.load` / `get` / `__getitem__` (lines 1885–1894)
 
 ```python
-def load_config(path: Path) -> Config
-# missing -> logger.error + sys.exit(EXIT_CONFIG_ERROR)
-# invalid  -> logger.error + sys.exit(EXIT_CONFIG_ERROR)
+@classmethod
+def load(cls, path: Path) -> Config          # missing/invalid -> sys.exit(EXIT_CONFIG_ERROR)
+def get(self, name: str) -> ResolvedJob | None
+def __getitem__(self, name: str) -> ResolvedJob   # KeyError when absent
 ```
 
 ---
 
-## Module: `scripts/job.py`
+## Module: `src/snap_bak/job.py`
 
 The engine: errors, /proc helpers, global lock, status persistence, and the
 `Runner` that executes one job. Imports `config` (constants + models) and
@@ -405,7 +406,7 @@ including missed_slots bookkeeping and `_delay` (lines 1173–1186).
 
 ---
 
-## Module: `scripts/cli.py`
+## Module: `src/snap_bak/cli.py`
 
 Entry point. Imports `config` and `job`. Defines `main`, argparse, and the serial
 phase orchestration.
@@ -484,6 +485,6 @@ def exit_code(results):
 ## Test conftest note
 
 `tests/conftest.py` currently sets `SNAPBAK_STATE_DIR` before importing
-`scripts.snap_bak`. It will be updated to import `scripts.config` instead (and
-`scripts.job`/`scripts.cli`); the env-var-before-import ordering stays, since
+`snap_bak`. It will be updated to import `snap_bak.config` instead (and
+`snap_bak.job`/`snap_bak.cli`); the env-var-before-import ordering stays, since
 `config.py` performs `STATE_DIR.mkdir` at import time.

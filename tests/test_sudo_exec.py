@@ -11,17 +11,15 @@ import importlib.util
 import json
 import os
 import subprocess
-import sys
 import types
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from scripts import config
+from snap_bak import config
 
-_WRAPPER_PATH = Path(__file__).parent.parent / "scripts" / "sudo-exec.py"
+_WRAPPER_PATH = Path(__file__).parent.parent / "src" / "sudo-exec.py"
 _loader = importlib.machinery.SourceFileLoader("sudo_exec", str(_WRAPPER_PATH))
 _spec = importlib.util.spec_from_loader("sudo_exec", _loader)
 io = importlib.util.module_from_spec(_spec)
@@ -30,6 +28,7 @@ _loader.exec_module(io)
 
 def _write_config(tmp_path, jobs=None, mount_base="/bak"):
     """Write a minimal JSON config and return its path."""
+    (tmp_path / "snaps").mkdir(exist_ok=True)
     config = {
         "mount_base": mount_base,
         "stuck_threshold": 3600,
@@ -49,28 +48,6 @@ def _write_config(tmp_path, jobs=None, mount_base="/bak"):
     return cfg
 
 
-class TestLoadConfigJsonc:
-    def test_parses_line_comments(self, tmp_path, monkeypatch):
-        cfg = tmp_path / "config.json"
-        cfg.write_text('{"repos": [], "jobs": []}  // trailing comment\n')
-        monkeypatch.setattr(io, "CONFIG_PATH", str(cfg))
-        assert io.load_config() == {"repos": [], "jobs": []}
-
-    def test_parses_block_comments(self, tmp_path, monkeypatch):
-        cfg = tmp_path / "config.json"
-        cfg.write_text('{\n /* block */\n "repos": [], "jobs": []\n}\n')
-        monkeypatch.setattr(io, "CONFIG_PATH", str(cfg))
-        assert io.load_config() == {"repos": [], "jobs": []}
-
-    def test_preserves_slashes_inside_strings(self, tmp_path, monkeypatch):
-        # rclone:// must not be treated as a comment.
-        cfg = tmp_path / "config.json"
-        cfg.write_text('{"path": "rclone://host:*/dir", "x": 1}  // comment\n')
-        monkeypatch.setattr(io, "CONFIG_PATH", str(cfg))
-        parsed = io.load_config()
-        assert parsed["path"] == "rclone://host:*/dir"
-
-
 class TestValidateName:
     def test_valid_iso(self):
         assert io._validate_name("2026-08-09_02:00Z") == "2026-08-09_02:00Z"
@@ -86,30 +63,26 @@ class TestValidateName:
 
 class TestJobPath:
     def test_builds_path_within_snapshot_dir(self, tmp_path):
-        job = {"snapshot_dir": str(tmp_path / "snaps")}
-        target = io._job_path(job, "2026-08-09_02:00Z")
-        assert Path(target) == Path(job["snapshot_dir"]) / "2026-08-09_02:00Z"
+        snap_dir = tmp_path / "snaps"
+        target = io._job_path(snap_dir, "2026-08-09_02:00Z")
+        assert Path(target) == snap_dir / "2026-08-09_02:00Z"
 
     def test_rejects_escape_attempt(self, tmp_path):
-        job = {"snapshot_dir": str(tmp_path / "snaps")}
+        snap_dir = tmp_path / "snaps"
         with pytest.raises(SystemExit):
-            io._job_path(job, "2026-08-09_02:00Z/../../x")
+            io._job_path(snap_dir, "2026-08-09_02:00Z/../../x")
 
 
-class TestFindJob:
+class TestConfigLookup:
     def test_finds_existing_job(self, tmp_path):
-        cfg_path = _write_config(tmp_path)
-        io.CONFIG_PATH = str(cfg_path)
-        config = io.load_config()
-        job = io._find_job(config, "home")
-        assert job["name"] == "home"
+        cfg = config.Config.load(_write_config(tmp_path))
+        rj = cfg.get("home")
+        assert rj is not None
+        assert rj.job.name == "home"
 
     def test_rejects_unknown_job(self, tmp_path):
-        cfg_path = _write_config(tmp_path)
-        io.CONFIG_PATH = str(cfg_path)
-        config = io.load_config()
-        with pytest.raises(SystemExit):
-            io._find_job(config, "not-a-job")
+        cfg = config.Config.load(_write_config(tmp_path))
+        assert cfg.get("not-a-job") is None
 
 
 class TestRun:
@@ -131,54 +104,6 @@ class TestRun:
         with pytest.raises(SystemExit) as exc:
             io._run(["btrfs"])
         assert exc.value.code == 5
-
-
-class TestMountSubpath:
-    def test_defaults_to_source_basename(self):
-        job = {"source_subvolume": "/mnt/data"}
-        assert (
-            io._job_mount_point({"mount_base": "/mnt/bak"}, job) == "/mnt/bak/data"
-        )
-
-    def test_defaults_relative_source(self):
-        job = {"source_subvolume": "home"}
-        assert io._job_mount_point({"mount_base": "/mnt/bak"}, job) == "/mnt/bak/home"
-
-    def test_defaults_absolute_source(self):
-        job = {"source_subvolume": "/mnt/data"}
-        assert io._job_mount_point({"mount_base": "/bak"}, job) == "/bak/data"
-
-    def test_matches_orchestrator_mount_point(self, tmp_path):
-        """Wrapper and orchestrator must derive the mount point identically.
-
-        The rule lives in two places (the wrapper cannot import the
-        orchestrator), so this parity test is what keeps them in lock-step.
-        """
-        cases = [
-            ("/bak", "/mnt/data"),
-            ("/bak", "home"),
-            ("/bak", "/mnt/data/"),
-            ("/bak", "/mnt/data/deep/sub"),
-            ("/mnt/bak", "/mnt/data"),
-        ]
-        for mount_base, source in cases:
-            wrapper = io._job_mount_point(
-                {"mount_base": mount_base}, {"source_subvolume": source}
-            )
-            cfg = config.Config(
-                repos=[{"name": "primary", "path": "rclone:x"}],
-                jobs=[
-                    {
-                        "name": "n",
-                        "snapshot_dir": str(tmp_path),
-                        "source_subvolume": source,
-                        "repo": "primary",
-                    }
-                ],
-                mount_base=mount_base,
-            )
-            model = cfg.resolve()[0].mount_point
-            assert str(model) == wrapper, (mount_base, source)
 
 
 class TestUpdateRestic:
@@ -295,7 +220,7 @@ class TestClassifyAnySpunDown:
 
 
 class TestSubvolumeGeneration:
-    """Generation reads moved to the shared scripts/snapshot module; the
+    """Generation reads moved to the shared snap_bak.snapshot module; the
     wrapper reaches them through snapshot.Snapshot (memoized)."""
 
     def _result(self, stdout, rc=0):
@@ -504,7 +429,14 @@ class TestStatusOp:
         snap.mkdir()
         (snap / "2026-08-10_04:00Z").mkdir()
 
-        io._op_status({"source_subvolume": "/mnt/data", "snapshot_dir": str(snap)})
+        io._op_status(
+            config.Job(
+                name="x",
+                snapshot_dir=snap,
+                source_subvolume="/mnt/data",
+                repo="primary",
+            )
+        )
         parsed = json.loads(capsys.readouterr().out)
 
         assert parsed["any_spun_down"] is True
@@ -532,7 +464,14 @@ class TestStatusOp:
         snap.mkdir()
         (snap / "2026-08-10_04:00Z").mkdir()
 
-        io._op_status({"source_subvolume": "/mnt/data", "snapshot_dir": str(snap)})
+        io._op_status(
+            config.Job(
+                name="x",
+                snapshot_dir=snap,
+                source_subvolume="/mnt/data",
+                repo="primary",
+            )
+        )
         parsed = json.loads(capsys.readouterr().out)
 
         assert parsed["any_spun_down"] is False
@@ -558,7 +497,14 @@ class TestStatusOp:
         snap = tmp_path / "snap"
         snap.mkdir()  # empty snapshot dir
 
-        io._op_status({"source_subvolume": "/mnt/data", "snapshot_dir": str(snap)})
+        io._op_status(
+            config.Job(
+                name="x",
+                snapshot_dir=snap,
+                source_subvolume="/mnt/data",
+                repo="primary",
+            )
+        )
         parsed = json.loads(capsys.readouterr().out)
 
         assert parsed["source_generation"] == 300

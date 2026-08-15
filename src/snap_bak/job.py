@@ -19,20 +19,9 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 
-try:
-    from scripts import config
-except ImportError:  # installed standalone under /opt/snap-bak/
-    import config
-
-try:
-    from scripts import restic
-except ImportError:  # installed standalone under /opt/snap-bak/
-    import restic
-
-try:
-    from scripts import snapshot
-except ImportError:  # installed standalone under /opt/snap-bak/
-    import snapshot
+from snap_bak import config
+from snap_bak import restic
+from snap_bak import snapshot
 
 logger = logging.getLogger(__name__)
 

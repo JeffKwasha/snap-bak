@@ -36,17 +36,16 @@ the orchestrator + a root-owned sudo wrapper, configures a static sudoers
 rule, and wires up a systemd *service + timer*.
 
 ```bash
-sudo scripts/snap-bak-setup.sh
+sudo snap-bak-setup.sh
 sudo systemctl enable --now snap-bak.timer
 ```
 
-What `scripts/snap-bak-setup.sh` does:
+What `snap-bak-setup.sh` does:
 
 1. Verifies you are `root`.
 2. Creates the `snap-bak` user/group and `/opt/snap-bak`.
-3. Installs the orchestrator modules to `/opt/snap-bak/` (`cli.py`, `config.py`,
-   `job.py`, `restic.py`, `snapshot.py`; root:root 0644) and the wrapper to
-   `/opt/snap-bak/sudo-exec.py` (root:root 0755).
+3. Installs the orchestrator package to `/opt/snap-bak/snap_bak/` (root:root
+   0644) and the wrapper to `/opt/snap-bak/sudo-exec.py` (root:root 0755).
 4. Writes an annotated example config to `/opt/snap-bak/config.json`.
 5. Creates service-writable `state/`, `cache/`, `passwords/` and
    `.config/rclone/`; root:snap-bak `excludes/`.
@@ -255,7 +254,7 @@ Edit `config/config.json`:
 
 **Note on `restic_options`:** Both `repos[].restic_options` and
 `jobs[].restic_options` are appended verbatim to restic command lines. Options
-in restic's global set (see `scripts/restic.py` `RESTIC_GLOBAL_FLAGS`) apply
+in restic's global set (see `src/snap_bak/restic.py` `RESTIC_GLOBAL_FLAGS`) apply
 to **every** restic command; **all other options are backup-only** and apply
 to the `backup` subcommand alone. Flags snap-bak manages itself are **ignored
 with a warning** if configured here: `-r/--repo`, `--password-file`, `--json`,

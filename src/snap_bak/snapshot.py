@@ -1,14 +1,10 @@
 """Snapshot domain object — the single owner of the btrfs snapshot model.
 
 Shared by the unprivileged orchestrator (config.py/job.py) and the root-owned
-wrapper (sudo-exec.py, formerly snap-bak-io). Installed as
-/opt/snap-bak/snapshot.py (root:root 0644, see snap-bak-setup.sh); both callers
-import it with a single fallback:
+wrapper (sudo-exec.py, formerly snap-bak-io). Installed as part of the
+snap_bak package (see snap-bak-setup.sh); both callers import it simply:
 
-    try:
-        from scripts import snapshot
-    except ImportError:          # installed standalone under /opt/snap-bak/
-        import snapshot
+    from snap_bak import snapshot
 
 Everything about a snapshot lives here and nowhere else:
 

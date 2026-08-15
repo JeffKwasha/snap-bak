@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Unit tests for the shared scripts/snapshot.py domain module.
+"""Unit tests for the shared snap_bak/snapshot.py domain module.
 
 The module is the single owner of the snapshot name format and the btrfs
 command line, and is used by BOTH the orchestrator (cli.py) and the
@@ -7,14 +7,12 @@ privileged wrapper (sudo-exec.py). These tests pin the strictness of the name
 parse (the crash that started all this) and the memoized generation reads.
 """
 
-import sys
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from scripts import snapshot
+from snap_bak import snapshot
 
 
 # --- Name format / parse ---

@@ -260,7 +260,7 @@ config.
 
 `restic_options` on both Repo and Job are appended verbatim to restic
 command lines (repo options first, then job options). Options in restic's
-global set (`RESTIC_GLOBAL_FLAGS` in `scripts/restic.py`, derived from
+global set (`RESTIC_GLOBAL_FLAGS` in `src/snap_bak/restic.py`, derived from
 `restic --help`) apply to every restic command; **all other options are
 backup-only** and apply to the `backup` subcommand alone. The `--exclude-file`
 and `--exclude` flags (from `ignore_file`/`excludes`) are likewise
@@ -497,12 +497,14 @@ per-job lock would add complexity without additional protection.
 ## State & Runtime Directories
 
 ```
-<install>                # root-owned: program, wrapper, config
-  cli.py                 # entry point / orchestration (root:root 0644)
-  config.py              # config loading + models (root:root 0644)
-  job.py                 # backup engine (root:root 0644)
-  restic.py              # restic command building (root:root 0644)
-  snapshot.py            # snapshot domain model (root:root 0644)
+<install>                # root-owned: package, wrapper, config
+  snap_bak/              # Python package (imported as `snap_bak`; root:root 0644)
+    __init__.py
+    cli.py               # entry point / orchestration
+    config.py            # config loading + models
+    job.py               # backup engine
+    restic.py            # restic command building
+    snapshot.py          # snapshot domain model
   sudo-exec.py            # sudo wrapper (root:root 0755)
   config.json            # root-owned, validated by the wrapper
 

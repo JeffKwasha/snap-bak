@@ -1,18 +1,16 @@
 # -*- coding: utf-8 -*-
-"""Tests for scripts.config: parsing, models, resolution, retention."""
+"""Tests for snap_bak.config: parsing, models, resolution, retention."""
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
-import sys
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from scripts import config
-from scripts.config import (
+from snap_bak import config
+from snap_bak.config import (
     Config,
     Job,
     Snapshot,
@@ -118,6 +116,47 @@ class TestConfig:
     def test_stuck_threshold_parsed(self, tmp_path):
         cfg = Config(**_config(tmp_path, stuck_threshold="1h"))
         assert cfg.stuck_threshold == 3600
+
+
+class TestConfigLoad:
+    def test_loads_file(self, tmp_path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps(_config(tmp_path)))
+        cfg = Config.load(cfg_file)
+        assert cfg.jobs[0].name == "home"
+
+    def test_missing_file_exits(self, tmp_path):
+        with pytest.raises(SystemExit) as exc:
+            Config.load(tmp_path / "nope.json")
+        assert exc.value.code == config.EXIT_CONFIG_ERROR
+
+    def test_invalid_json_exits(self, tmp_path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text("{ not json")
+        with pytest.raises(SystemExit) as exc:
+            Config.load(cfg_file)
+        assert exc.value.code == config.EXIT_CONFIG_ERROR
+
+
+class TestConfigLookup:
+    def test_get_hit(self, tmp_path):
+        cfg = Config(**_config(tmp_path))
+        rj = cfg.get("home")
+        assert rj is not None
+        assert rj.job.name == "home"
+
+    def test_get_miss_is_none(self, tmp_path):
+        cfg = Config(**_config(tmp_path))
+        assert cfg.get("nope") is None
+
+    def test_getitem_hit(self, tmp_path):
+        cfg = Config(**_config(tmp_path))
+        assert cfg["home"].mount_point == Path("/bak") / Path(str(tmp_path)).name
+
+    def test_getitem_miss_raises_keyerror(self, tmp_path):
+        cfg = Config(**_config(tmp_path))
+        with pytest.raises(KeyError):
+            cfg["nope"]
 
 
 # --- Job validators ---

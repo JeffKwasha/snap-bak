@@ -6,10 +6,11 @@ requires-python = ">=3.10"
 dependencies = ["pydantic>=2.0", "python-dateutil>=2.0", "json5>=0.9"]
 
 [project.scripts]
-snap-bak = "scripts.cli:main"
+snap-bak = "snap_bak.cli:main"
 
 [tool.setuptools]
-packages = ["scripts"]
+package-dir = {"" = "src"}
+packages = ["snap_bak"]
 
 [dependency-groups]
 dev = ["pytest>=8"]

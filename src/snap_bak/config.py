@@ -21,12 +21,9 @@ from dateutil.relativedelta import relativedelta
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Snapshot naming/format and the btrfs command line live in snapshot.py.
-try:
-    from scripts import snapshot
-except ImportError:  # installed standalone under /opt/snap-bak/
-    import snapshot
+from snap_bak import snapshot
 
-DEFAULT_CONFIG = Path(__file__).parent.parent / "config" / "config.json"
+DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config" / "config.json"
 DEFAULT_MOUNT_BASE = Path("/bak")
 DEFAULT_STUCK_THRESHOLD = 3600
 DEFAULT_BACKUP_INTERVAL = 3600
@@ -71,9 +68,9 @@ def load_config_json(text: str) -> dict:
 _DURATION_UNITS = {
     "s": 1,
     "m": 60,
-    "h": 3600,
-    "d": 86400,
-    "w": 604800,
+    "h": 60 * 60,
+    "d": 24 * 60 * 60,
+    "w": 7 * 24 * 60 * 60,
 }
 
 _SIZE_UNITS = {
@@ -390,6 +387,18 @@ class Config(BaseModel):
                 )
         return self
 
+    @classmethod
+    def load(cls, path: Path) -> "Config":
+        """Load and validate a JSON config file using pydantic."""
+        if not path.exists():
+            logger.error(f"Config not found: {path}")
+            sys.exit(EXIT_CONFIG_ERROR)
+        try:
+            return cls(**load_config_json(path.read_text()))
+        except Exception as e:
+            logger.error(f"Config validation error: {e}")
+            sys.exit(EXIT_CONFIG_ERROR)
+
     def resolve(self, config_path: str | None = None) -> list[ResolvedJob]:
         """Bind each job to its repo and derived paths; return resolved jobs."""
         by_name = {r.name: r for r in self.repos}
@@ -406,14 +415,15 @@ class Config(BaseModel):
             for job in self.jobs
         ]
 
+    def get(self, name: str) -> ResolvedJob | None:
+        """Look up a resolved job by name, or None."""
+        for rj in self.resolve():
+            if rj.job.name == name:
+                return rj
+        return None
 
-def load_config(path: Path) -> Config:
-    """Load and validate a JSON config file using pydantic."""
-    if not path.exists():
-        logger.error(f"Config not found: {path}")
-        sys.exit(EXIT_CONFIG_ERROR)
-    try:
-        return Config(**load_config_json(path.read_text()))
-    except Exception as e:
-        logger.error(f"Config validation error: {e}")
-        sys.exit(EXIT_CONFIG_ERROR)
+    def __getitem__(self, name: str) -> ResolvedJob:
+        rj = self.get(name)
+        if rj is None:
+            raise KeyError(name)
+        return rj

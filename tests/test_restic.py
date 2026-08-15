@@ -1,17 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Unit tests for scripts/restic.py — command construction & output parsing.
+"""Unit tests for snap_bak/restic.py — command construction & output parsing.
 
 The central regression here: backup-only flags (excludes, non-global
 restic_options) must NEVER leak onto other restic subcommands like `forget`,
 which reject them with 'unknown flag'.
 """
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from scripts import restic
+from snap_bak import restic
 
 
 class TestBuild:

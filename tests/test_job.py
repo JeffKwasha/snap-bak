@@ -1,19 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Tests for scripts.job: errors, lock helpers, status, Runner decisions."""
+"""Tests for snap_bak.job: errors, lock helpers, status, Runner decisions."""
 
 import subprocess
-import sys
 import types
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from scripts import config
-from scripts import job as job_mod
-from scripts.job import (
+from snap_bak import config
+from snap_bak import job as job_mod
+from snap_bak.job import (
     CredentialsError,
     DelayState,
     RemoteUnavailableError,

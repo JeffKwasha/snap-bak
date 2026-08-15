@@ -21,28 +21,26 @@ never pass arbitrary paths to btrfs/mount. Accepted operations:
   'update-restic').
 
 This wrapper is intentionally standalone: it must NOT import the orchestrator
-(the security boundary is the wrapper itself; coupling to the orchestrator
-would let a bug there widen this path). It is installed root:root 0755 by
-snap-bak-setup.sh.
+modules (`job`, `cli`) — the security boundary is the wrapper itself; coupling
+to the orchestrator would let a bug there widen this path. It is installed
+root:root 0755 by snap-bak-setup.sh.
 
 The snapshot DOMAIN — name format, strict parse, btrfs create/delete, and the
-generation read — is shared with the orchestrator through the dependency-free,
-root-owned scripts/snapshot.py module (installed as /opt/snap-bak/snapshot.py
-root:root 0644). Sharing it is what keeps the orchestrator and wrapper from
-disagreeing about what a valid snapshot name is.
+generation read — is shared with the orchestrator through the dependency-free
+`snap_bak.snapshot` module. Sharing it is what keeps the orchestrator and
+wrapper from disagreeing about what a valid snapshot name is.
 
 The sudoers rule `snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/sudo-exec.py`
 is valid on both sudo-rs and sudo.ws: a bare command name matches any
 arguments (see sudoers(5)), and '*' is deliberately avoided because sudo-rs
 mishandles it.
 
-Config is JSONC (// and /* */ comments allowed); json5 is used to parse it.
-The orchestrator (config.py) parses the same config with the same library,
-so the JSONC handling lives in exactly one place.
+Config is parsed by `snap_bak.config` (`config.Config.load`), so the wrapper
+and orchestrator validate the same JSONC file identically and derive the same
+mount points; the JSONC handling lives in exactly one place.
 """
 
 import json
-import json5
 import os
 import stat
 import subprocess
@@ -50,10 +48,7 @@ import sys
 from pathlib import Path
 from typing import NoReturn
 
-try:
-    from scripts import snapshot  # test layout
-except ImportError:  # installed standalone under /opt/snap-bak/
-    import snapshot
+from snap_bak import config, snapshot
 
 CONFIG_PATH = "/opt/snap-bak/config.json"
 
@@ -79,51 +74,16 @@ def _exit_err(msg: str, code: int = 1) -> "NoReturn":
     sys.exit(code)
 
 
-def load_config() -> dict:
-    try:
-        with open(CONFIG_PATH) as f:
-            return json5.loads(f.read())
-    except OSError as e:
-        _exit_err(f"cannot read {CONFIG_PATH}: {e}")
-    except Exception as e:
-        _exit_err(f"invalid JSON in {CONFIG_PATH}: {e}")
-
-
-def _find_job(config: dict, job_name: str) -> dict:
-    for job in config.get("jobs", []):
-        if job.get("name") == job_name:
-            return job
-    _exit_err(f"unknown job: {job_name}")
-    raise SystemExit(1)  # unreachable
-
-
 def _validate_name(name: str) -> str:
     if snapshot.parse_name(name) is None:
         _exit_err(f"invalid snapshot name: {name!r} (expected YYYY-MM-DD_HH:MMZ)")
     return name
 
 
-def _mount_base(config: dict) -> str:
-    return config.get("mount_base", "/bak")
-
-
-def _job_mount_point(config: dict, job: dict) -> str:
-    """Mount point for a job: <mount_base>/<source_subvolume final component>.
-
-    Always the last path component of 'source_subvolume' (e.g. /mnt/data
-    -> data, 'home' -> home); never configurable. Mirrors the real
-    filesystem path so the mount point is stable across backups (restic
-    change-tracking keys on it) and is independent of the job's display name.
-    """
-    return os.path.join(
-        _mount_base(config), os.path.basename(job["source_subvolume"].rstrip("/"))
-    )
-
-
-def _job_path(job: dict, name: str) -> str:
+def _job_path(snapshot_dir: Path, name: str) -> str:
     """snapshot_dir/name, rejecting any traversal beyond snapshot_dir."""
-    base = os.path.realpath(job["snapshot_dir"])
-    target = os.path.realpath(os.path.join(job["snapshot_dir"], name))
+    base = os.path.realpath(snapshot_dir)
+    target = os.path.realpath(os.path.join(snapshot_dir, name))
     if target != os.path.join(base, name) or os.path.commonpath([base, target]) != base:
         _exit_err(f"path escapes snapshot_dir: {name}")
     return target
@@ -289,14 +249,14 @@ def _pool_status(source_subvolume: str) -> dict:
     return {"any_spun_down": _classify_any_spun_down(info), "disks": info}
 
 
-def _op_status(job: dict) -> None:
+def _op_status(job: config.Job) -> None:
     """Emit the status JSON: disk states + generations (no disk I/O if idle).
 
     Generation reads go through the shared snapshot module: source and latest
     snapshot each hold a memoized generation, so the two `btrfs subvolume show`
     calls run exactly once per object even though has_changed() re-reads them.
     """
-    pool = _pool_status(job["source_subvolume"])
+    pool = _pool_status(str(job.source_subvolume))
     out = {
         "any_spun_down": pool["any_spun_down"],
         "disks": pool["disks"],
@@ -309,13 +269,13 @@ def _op_status(job: dict) -> None:
     if pool["any_spun_down"] is True:
         print(json.dumps(out))
         return
-    source = snapshot.Snapshot(job["source_subvolume"])
+    source = snapshot.Snapshot(job.source_subvolume)
     src_gen = source.generation
     if src_gen is None:
         print(json.dumps(out))
         return
     out["source_generation"] = src_gen
-    latest = snapshot.Snapshot.latest(job["snapshot_dir"])
+    latest = snapshot.Snapshot.latest(job.snapshot_dir)
     if latest is None:
         out["changed"] = True  # no snapshot yet -> creation warranted
         print(json.dumps(out))
@@ -415,8 +375,11 @@ def main() -> None:
     if len(sys.argv) < 3:
         _exit_err(f"{op} requires: <job> [name]")
     job_name = sys.argv[2]
-    config = load_config()
-    job = _find_job(config, job_name)
+    cfg = config.Config.load(Path(CONFIG_PATH))
+    rj = cfg.get(job_name)
+    if rj is None:
+        _exit_err(f"unknown job: {job_name}")
+    job = rj.job
 
     if op == "status":
         if len(sys.argv) != 3:
@@ -428,34 +391,33 @@ def main() -> None:
         if len(sys.argv) != 4:
             _exit_err("snapshot requires: <job> <name>")
         name = _validate_name(sys.argv[3])
-        target = _job_path(job, name)
+        target = _job_path(job.snapshot_dir, name)
         snapshot.Snapshot(target, snapshot.parse_name(name)).create(
-            Path(job["source_subvolume"])
+            job.source_subvolume
         )
 
     elif op == "delete":
         if len(sys.argv) != 4:
             _exit_err("delete requires: <job> <name>")
         name = _validate_name(sys.argv[3])
-        target = _job_path(job, name)
+        target = _job_path(job.snapshot_dir, name)
         snapshot.Snapshot(target, snapshot.parse_name(name)).delete()
 
     elif op == "mount":
         if len(sys.argv) != 4:
             _exit_err("mount requires: <job> <name>")
         name = _validate_name(sys.argv[3])
-        snap_path = _job_path(job, name)
-        mount_point = _job_mount_point(config, job)
+        snap_path = _job_path(job.snapshot_dir, name)
+        mount_point = rj.mount_point
         os.makedirs(mount_point, exist_ok=True)
         # btrfs has no uid/gid mount options; snapshots are bound read-only so
         # the mount point is stable across backups (restic change-tracking
         # keys on the source path). restic reads root-owned files via
         # cap_dac_read_search (applied by 'update-restic').
-        _run([MOUNT, "-o", "bind,ro", snap_path, mount_point])
+        _run([MOUNT, "-o", "bind,ro", snap_path, str(mount_point)])
 
     elif op == "umount":
-        mount_point = _job_mount_point(config, job)
-        _run([UMOUNT, "-l", mount_point])
+        _run([UMOUNT, "-l", str(rj.mount_point)])
 
     else:
         _exit_err(f"unknown operation: {op}")

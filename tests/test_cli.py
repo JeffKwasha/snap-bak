@@ -1,14 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Tests for scripts.cli: exit-code ladder and restic-update gating."""
+"""Tests for snap_bak.cli: exit-code ladder and restic-update gating."""
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from scripts import config
-from scripts import cli
-from scripts.job import Result, ResultStatus
+from snap_bak import config
+from snap_bak import cli
+from snap_bak.job import Result, ResultStatus
 
 
 def _r(status, reason=None, timeout=False):
