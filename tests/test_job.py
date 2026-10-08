@@ -66,7 +66,7 @@ def _runner(
         delayed=delayed, missed_slots=missed, protected_snapshot=protected
     )
     monkeypatch.setattr(runner, "_time_for_backup", lambda: time_for_backup)
-    monkeypatch.setattr(runner, "_within_backup_window", lambda: in_window)
+    monkeypatch.setattr(runner, "within_backup_window", lambda: in_window)
     return runner
 
 
@@ -304,6 +304,24 @@ class TestDecide:
         r = _runner(monkeypatch, tmp_path, in_window=False)
         d = r.decide()
         assert d.action == "skip" and d.reason == "outside backup window"
+
+    def test_outside_window_skips_remote_checks(self, monkeypatch, tmp_path):
+        r = _runner(monkeypatch, tmp_path, in_window=False)
+        calls = {"reachable": 0, "size": 0}
+
+        def spy_reachable(repo):
+            calls["reachable"] += 1
+            return True
+
+        def spy_size(repo):
+            calls["size"] += 1
+            return 0
+
+        monkeypatch.setattr(r, "_check_repo_reachable", spy_reachable)
+        monkeypatch.setattr(r, "_measure_repo_size", spy_size)
+        d = r.decide()
+        assert d.action == "skip" and d.reason == "outside backup window"
+        assert calls["reachable"] == 0 and calls["size"] == 0
 
     def test_time_for_backup(self, monkeypatch, tmp_path):
         r = _runner(monkeypatch, tmp_path, time_for_backup=True)

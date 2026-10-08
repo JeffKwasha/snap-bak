@@ -1,7 +1,176 @@
 # snap-bak Improvement Plan
 
 Date: 2026-07-25
-Status: Phase 1 in progress
+Status: Phase 4 in progress
+
+> **Historical document.** This plans the earlier Pydantic/delayed-job work and
+> is kept for context. The authoritative design for inspecting and applying
+> exclude patterns is SPEC.md → "Excludes: Inspection & Application"; the user
+> interface is `snap-bak show excludes` / `snap-bak apply excludes`.
+
+### Phase 4: Collapse Excludes Onto One Planner and One Executor
+
+The feature was built as several parallel implementations of the same question.
+Phase 3's design stands; this phase removes the duplication that made its
+guarantees false.
+
+#### The problem
+
+| Concern | `cli.py` (reachable, correct) | `job.py` `Runner` (unreachable, divergent) |
+|---------|------------------------------|------------------------------------------|
+| restic scan loop | `_do_repo` :323, `_plan_for` :470 | `apply_excludes` :851 |
+| target predicate | `label in found.per_snapshot` | `len(entries) > before or any(...)` |
+| `ls --long` | `_restic_ls` :393 (no error handling) | `_repo_listing` :810 |
+| snapshots list | `_repo_snapshots` :357 | `_restic_snapshots` :791 |
+| preflight | `_preflight` :587 | inline :895, and a third copy :783 |
+| rewrite | `_apply_now_one` :534 | `apply_excludes` :919 |
+
+Consequences, all of which are defects rather than style:
+
+1. **The scheduled path was dead.** `apply_excludes: true` and `--later` were
+   silent no-ops: `_maybe_apply_excludes` had no callers and `consume_pending`
+   was reachable only from tests. SPEC.md:621 ("the next run consumes it
+   regardless of the config key") was untrue.
+2. **It would have crashed on first use.** `_maybe_apply_excludes` took
+   `runner.job` (a `Job`, job.py:530) where it needed a `ResolvedJob`, so
+   `half_window_remaining` and `patterns_for_job` both raised `AttributeError`.
+3. **The target predicate was wrong.** `apply_excludes` selected only snapshots
+   introducing a *newly seen* path. Restic lists newest-first, so with an
+   excluded file present in N snapshots it rewrote 1 and kept the rest forever.
+   The dry-run said N. "What a user approves is what runs" held for `--now` and
+   was false for the scheduled run.
+4. **The dry-run was a second implementation**, not the first one with output
+   suppressed — which is exactly how (3) survived.
+5. **`apply` silently ignored its own selectors**: `--live`/`--snaps`/`--all`
+   were accepted and discarded, so `apply excludes --live --now` rewrote restic.
+
+440 tests passed throughout. `Runner.apply_excludes` had zero callers and zero
+tests; the integration "apply" tests called raw `restic rewrite`, never snap-bak,
+and used a single snapshot — the one shape in which both predicates agree.
+
+#### The design
+
+One planner, one executor. A mode is what you *do* with a `Plan`, not a variant
+of the code that produces it.
+
+```python
+# src/snap_bak/apply.py
+@dataclass(frozen=True)
+class Plan:
+    job: str; root: str; found: ExclusionSet
+    snapshot_ids: tuple[str, ...]     # the only target predicate
+    command: tuple[str, ...]          # the exact rewrite argv
+
+@dataclass(frozen=True)
+class Outcome:                        # deliberately not job.Result
+    status: str                       # applied | noop | failed | dry-run
+    detail: str
+    rc: int | None = None
+
+def plan(runner) -> Plan              # read-only scan
+def execute(runner, plan) -> Outcome  # preflight + rewrite; never raises, never prunes
+```
+
+`Outcome` is not a `Result` so that "this phase cannot change the run's exit
+code" (SPEC) is structural: apply outcomes are logged, never passed to
+`exit_code()`. Previously an `APPLIED` result was appended to the results list
+and merely happened to fall through the ladder.
+
+`Plan.command` is built once and both printed by the dry-run and executed, so
+the printed command cannot differ from the run command (SPEC.md:581).
+
+`execute` never prunes. Rewrite is per job; prune is per repo. That mirrors
+Phase B's existing `forgotten_repos` pattern, removes the duplicate prune for a
+shared repo, and lets the scheduled path prune a repo that has no
+`backup_retention` at all.
+
+`Runner` gains public `repo_snapshots()` and `repo_listing(id)` — public
+because the planner legitimately needs them. `cli.py` constructing
+`job.Runner(rj)` and calling `_run`/`_restic_cmd` is what caused defect (2).
+
+#### Verb surface
+
+`apply` is restic-only by construction, so its plan comes solely from
+`plan(runner)` — the same function `show excludes --repo` calls. "Forgets from
+every restic repo, as shown by the `repo` dry run" is then not a promise kept by
+discipline but the only available code path.
+
+| Verb | Flags |
+|------|-------|
+| `snap-bak show excludes` | `--live` / `--snaps` / `--repo` / `--all`, `--limit`, `--json` — read-only; never creates, removes, or modifies a snapshot or local file |
+| `snap-bak apply excludes` | `--now` / `--later`, `--json` — errors on `--live`/`--snaps`/`--all`, assumes `--repo` |
+
+Pattern linting runs on every `show` and is silent when clean, so it is not a
+flag. Per-verb parsers, so a selector cannot be silently discarded.
+
+A `backup` verb (canonical spelling for the existing bare invocation, which
+keeps working) is a separate follow-up: it needs no flags of its own, so it is
+`_main_parser().parse_args(argv[:sub] + argv[sub+1:])`.
+
+#### Orchestration
+
+```
+Phase A   backups (unchanged)
+Phase A2  apply-excludes, gated → rewritten_repos
+Phase B   retention (unchanged)  → forgotten_repos
+Phase C   prune(union) once per distinct repo
+```
+
+Inside the existing `GlobalLock`, which stays exactly where it is: the
+orchestrator is what creates and deletes btrfs snapshots, which is why the lock
+is not superfluous. `armed = job.consume_pending()` is read once at run start;
+the arming gate is `job.apply_excludes or job.name in armed`, so it never fires
+by default (config.py:297-299).
+
+`--now` takes no lock and adds no `--retry-lock`: restic serializes with its own
+lock (rc 11), so a contended `--now` fails instantly and the message recommends
+`--later`, where execution rides the next scheduled run.
+
+#### What this resolves
+
+Defects (1)-(5) disappear by deletion rather than by patch, because there is
+only one of each left. Also fixed: the dry-run writing a real stamp under `-n`,
+the unguarded `ls`, the stale pre-rewrite stamp (full re-scan every run), the
+`--json` round-trip through `_entries_json` → `_snaps_set` for rendering, and the
+duplicate prune per shared repo.
+
+Not defects, left alone: the `decide()` window-before-`_repo_state` reordering
+(it makes escalation a count of missed windows rather than of off-window runs),
+and `half_window_remaining` returning true before a daytime window starts (unreachable
+behind the window gate).
+
+#### Tests, written first
+
+1. Integration, driving snap-bak against real restic with **three** snapshots
+   sharing one excluded path: all three rewritten. Fails on defect (3) today.
+2. Orchestration: `apply_excludes: true` rewrites and consumes a `--later` arm;
+   key off with no arm, it does not. Fails on defect (1) today.
+3. CLI: `apply excludes --live` exits non-zero; `--lint` is not a flag.
+4. The three raw-restic "apply" integration tests rewritten to call snap-bak.
+
+#### Sequencing
+
+Tests, then code, then full suite, then commit. One coherent change: the
+individual fixes only make sense as part of the collapse, since defect (3)'s
+fix is "delete the second copy of the predicate".
+
+### Phase 3: Exclude Inspection & Application
+
+Delivered on `feature/excludes-inspect-and-apply` (see Phase 4 for the
+follow-up that actually made this true):
+
+| Concern | Decision |
+|---------|----------|
+| Matcher | Faithful port of restic's `internal/filter` + Go `filepath.Match`, not `fnmatch`; restic's own 152 golden cases ported as tests |
+| Path basis | The mount-point path restic stored (`/bak/<subvol>`), for every mode, so testing patterns never needs a mount |
+| Commands | `show excludes` (read-only: `--live`/`--snaps`/`--repo`/`--all`) and `apply excludes` (`--now`/`--later`) — grouped by verb, not by target |
+| Default | `show excludes` with no selector = lint (always, silent when clean) + `--live`: local and instant |
+| Rewrite | One `rewrite <ids> … --forget`, never a separate `forget` (which would apply retention policies too) |
+| Prune | Folded into the run's existing prune, so one pass reclaims retention + cleanup |
+| Arming | `apply_excludes: true` (persistent) or `--later` (one-shot); default off, so editing `excludes` never rewrites history |
+| Gate | In-window + half the window left + repo reachable/unlocked + matches exist + completion stamp current |
+| Failures | Logged with failing phase and restic exit code; never change backup results or the run's exit code; no retry counter |
+| Re-scan cost | Completion stamp keyed on a pattern digest + newest snapshot time |
 
 ## Overview
 

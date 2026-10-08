@@ -1,7 +1,7 @@
 """Config: constants, env paths, quantity parsing, logging, retention, models.
 
 Imports only `snapshot` (plus stdlib + pydantic + dateutil + json5); never
-`job` or `cli`.
+`job`, `excludes` or `cli`.
 """
 
 import contextvars
@@ -294,6 +294,10 @@ class Job(BaseModel):
     backup_window_end: str | None = None
     ignore_file: str = ""
     excludes: list[str] = Field(default_factory=list)
+    # Retroactive removal of excluded files from existing backups. Off by
+    # default: editing `excludes` must never silently rewrite history. Only
+    # `show`/`apply excludes` or an explicitly opted-in run touch old snapshots.
+    apply_excludes: bool = False
     tag: str | None = None
     restic_options: list[str] = Field(default_factory=list)
     skip_snapshot_if_idle: bool = True
@@ -332,6 +336,16 @@ class ResolvedJob:
     tag: str
     window: Window | None
     config_path: str | None
+
+    @property
+    def backup_root(self) -> str:
+        """The path prefix restic saw: the mount point it was backed up from.
+
+        Exclude patterns are matched against this (see excludes.py), not
+        against the live source path, so inspection answers "what would the next
+        backup skip?" rather than "what matches this string?".
+        """
+        return str(self.mount_point)
 
 
 class Config(BaseModel):

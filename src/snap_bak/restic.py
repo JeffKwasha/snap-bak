@@ -96,6 +96,8 @@ RESTIC_GLOBAL_FLAGS = frozenset(
 
 # Flags snap-bak sets itself for bookkeeping; config restic_options may not
 # override them (they would collide and break summary parsing/retention).
+# `--forget` belongs here because it decides *which snapshots are removed*, not
+# just how: a user must not be able to delete originals through a config value.
 RESERVED_FLAGS = frozenset(
     {
         "-r",
@@ -113,8 +115,16 @@ RESERVED_FLAGS = frozenset(
         "--prune",
         "--exclude",
         "--exclude-file",
+        "--forget",
     }
 )
+
+
+# Subcommands taking a set of paths, and so accepting the exclusion flags:
+# `backup` skips excluded paths while reading, `rewrite` drops them from an
+# existing snapshot. Every other subcommand (e.g. `forget`) rejects them with
+# 'unknown flag'.
+FILE_SET_SUBCOMMANDS = frozenset({"backup", "rewrite"})
 
 
 def build(
@@ -125,23 +135,29 @@ def build(
     options: Sequence[str] = (),
     exclude_file: str | None = None,
     excludes: Sequence[str] = (),
+    forget: bool = False,
+    extra_args: Sequence[str] = (),
     warn: Callable[[str], None] | None = None,
 ) -> list[str]:
     """Build a restic command for `subcommand` from config-derived inputs.
 
-    The base command (`-r`, global options, `--password-file`) is safe for
-    every subcommand. Backup-specific options and exclude flags are appended
-    only for the `backup` subcommand: other restic subcommands (e.g. `forget`)
-    reject them with 'unknown flag'.
+    The base command (`-r`, global options, `--password-file`) is safe for every
+    subcommand. Backup-only options are added for `backup` alone, and exclusion
+    flags for the subcommands in FILE_SET_SUBCOMMANDS alone.
 
-    - `options`: config restic_options (repo + job, verbatim). Flags in
-      RESTIC_GLOBAL_FLAGS apply to every subcommand; any other flag is
-      treated as backup-only. RESERVED_FLAGS are dropped, calling `warn(opt)`.
-    - `exclude_file`/`excludes`: become `--exclude-file`/`--exclude`, backup only.
+- `options`: config restic_options (repo + job, verbatim). Flags in
+    RESTIC_GLOBAL_FLAGS apply to every subcommand; any other flag is backup-only.
+    RESERVED_FLAGS are dropped, calling `warn(opt)`.
+    - `exclude_file`/`excludes`: `--exclude-file`/`--exclude`, for `backup`
+      and `rewrite` only.
+    - `forget`: add `--forget` (`rewrite` only), so the originals of rewritten
+      snapshots are removed in the same operation. It is snap-bak's decision,
+      never taken from restic_options, and rejected on any other subcommand.
+    - `extra_args`: positional arguments (snapshot IDs, subfolders), last.
     """
     cmd = ["restic", "-r", repo_path, subcommand]
-    global_options = []
-    backup_options = []
+    global_options: list[str] = []
+    backup_options: list[str] = []
     # Paired flags (e.g. `--option rclone.program=foo`) pass the value as a
     # separate token; a token without a leading '-' inherits the bucket of the
     # flag that precedes it (and is dropped with it if that flag was reserved).
@@ -183,10 +199,19 @@ def build(
         cmd.extend(["--password-file", password_file])
     if subcommand == "backup":
         cmd.extend(backup_options)
+    if subcommand in FILE_SET_SUBCOMMANDS:
         if exclude_file:
             cmd.extend(["--exclude-file", exclude_file])
         for pattern in excludes:
             cmd.extend(["--exclude", pattern])
+    # Validated before any output is assembled, so a caller mistake fails loudly
+    # instead of yielding a command that silently means something else.
+    if forget and subcommand != "rewrite":
+        raise ValueError(f"--forget is only valid for rewrite, not {subcommand}")
+    if forget:
+        cmd.append("--forget")
+    # Positional arguments last: snapshot IDs and subfolders.
+    cmd.extend(extra_args)
     return cmd
 
 

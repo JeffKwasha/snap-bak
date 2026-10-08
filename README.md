@@ -249,6 +249,7 @@ Edit `config/config.json`:
 | `backup_window_end` | string | End of allowed backup window (HH:MM, exclusive) | `null` |
 | `ignore_file` | string | Path to file with exclude patterns | `""` |
 | `excludes` | list | List of glob patterns to exclude | `[]` |
+| `apply_excludes` | bool | Let the normal run apply these excludes to **existing** backups when there's ample window time. Changing `excludes` alone never does this | `false` |
 | `tag` | string | Restic tag override for this job's backups/forget | job name |
 | `restic_options` | list | Extra restic CLI flags for this job; global options apply to every command, backup-only options to `backup` alone | `[]` |
 
@@ -256,15 +257,26 @@ Edit `config/config.json`:
 `jobs[].restic_options` are appended verbatim to restic command lines. Options
 in restic's global set (see `src/snap_bak/restic.py` `RESTIC_GLOBAL_FLAGS`) apply
 to **every** restic command; **all other options are backup-only** and apply
-to the `backup` subcommand alone. Flags snap-bak manages itself are **ignored
+to restic's own `backup` subcommand alone. Flags snap-bak manages itself are **ignored
 with a warning** if configured here: `-r/--repo`, `--password-file`, `--json`,
-`--dry-run`, `--tag`, `--keep-*`, `--prune`, `--exclude`, `--exclude-file`.
+`--dry-run`, `--tag`, `--keep-*`, `--prune`, `--exclude`, `--exclude-file`,
+`--forget`.
 
 **Note on `ignore_file` and `excludes`:** Both are passed to restic as
 `--exclude-file` and `--exclude` flags respectively. They are additive —
-both apply. `ignore_file` uses `.gitignore`-style syntax. Exclude flags are
-backup-only: they are never passed to other restic commands (e.g. `forget`),
+both apply. `ignore_file` uses restic's exclude syntax: `*` and `?` (within a
+path segment), `[a-z]` classes, `**` across directories, `!` negation, `#`
+comments, `$VAR` expansion and `$$` for a literal `$`. Exclude flags are passed
+to `backup` and `rewrite` only — never to other restic commands (e.g. `forget`),
 which reject them.
+
+**Note on `apply_excludes`:** patterns only govern *future* uploads. Files
+uploaded before you added a rule stay in the repo, because restic retention
+works on whole snapshots, never on a file subset. `apply_excludes: true` lets a
+normal run retroactively remove them (via `restic rewrite … --forget`, then
+prune) when there's ample window time left and all backup work is done. It
+defaults to `false`, so editing `excludes` never silently rewrites history —
+see [Inspecting & Applying Excludes](#inspecting--applying-excludes).
 
 **Note on `tag`:** Defaults to the job name, so `--tag <name>` is applied to
 every backup and forget. Set it to change the restic tag; use
@@ -466,6 +478,92 @@ snap-bak --list-jobs
 snap-bak --config /path/to/config.json
 ```
 
+## Inspecting & Applying Excludes
+
+Your `ignore_file` / `excludes` patterns decide what a **future** backup skips.
+Anything uploaded *before* you added a rule stays in the repo forever — restic's
+retention prunes whole snapshots, never a subset of files. These commands show
+what the current rules actually match, and (on request) remove exactly those
+files from existing backups.
+
+```bash
+# Lint the patterns and list live-filesystem matches — instant, local,
+# no network, and the default when you give no selector.
+snap-bak show excludes
+
+# Explicit selectors
+snap-bak show excludes --snaps      # per-local-snapshot table (local)
+snap-bak show excludes --repo       # what's already in restic (network)
+snap-bak show excludes --all        # everything, in one pass
+
+# One job, machine-readable, bounded output
+snap-bak show excludes --repo --job data --json --limit 50
+```
+
+`show` is always read-only — it never creates, removes, or modifies a snapshot or
+a local file. Patterns are linted on every invocation and print **nothing** when
+they are clean, so there is no `--lint` flag to remember.
+
+The `--snaps` / `--repo` tables put one column per snapshot, showing how many
+bytes each snapshot would drop, with a total row. `-` means "not in that
+snapshot":
+
+```
+                                      10-07Z  10-06Z  10-05Z      TOTAL
+/bak/E/build/cache                 800 MiB       -  1.2 GiB    2.0 GiB
+/bak/E/build/tmp.o                     -   12 MiB       -     12 MiB
+BYTES TO EXCLUDE                  800 MiB   12 MiB  1.2 GiB    2.0 GiB
+```
+
+To actually remove them, `apply` prints a plan first and only acts on `--now`.
+`apply` works on restic only, and prints the same plan `show excludes --repo`
+does — it is the same code, so the dry-run you approve is what runs:
+
+```bash
+# Dry-run: which snapshots, which commands, how many bytes
+snap-bak apply excludes --job data
+
+# Do it now (rewrite + forget, then prune to reclaim space)
+snap-bak apply excludes --job data --now
+
+# Or defer to the next scheduled run instead
+snap-bak apply excludes --job data --later
+```
+
+`apply` refuses `--live`, `--snaps` and `--all` with an explanation: those name
+places it never removes files from. If a scheduled run already holds the
+repository, `--now` fails immediately rather than waiting — use `--later` and let
+the next scheduled run do it.
+
+To let ordinary scheduled runs do it automatically once you're satisfied, set
+`"apply_excludes": true` on the job. The run then applies excludes only when
+it's inside the backup window, at least half the window remains, all backup
+work is finished, and the repo is reachable and unlocked. Cleanup failures are
+logged but never affect backup results or the exit code.
+
+### Things worth knowing
+
+- **Your local files are never touched.** Only restic snapshots are rewritten.
+  Live files and btrfs snapshots are read at most.
+- **Nothing is ever mounted to test patterns.** Matching runs against the path
+  strings restic stored, so it can't interfere with an in-flight backup.
+- **Patterns match the backup path**, i.e. `/bak/<source basename>/…` (that's
+  what restic saw at backup time). Relative patterns like `*.tmp` or `Trash`
+  behave as you'd expect; an anchored `/home/user/x` will never match when the
+  backup root is `/bak/data`; the lint that runs on every `show` flags that.
+- **A pattern that matches a directory takes its whole subtree with it**, as one
+  row totalling its bytes. That mirrors restic, which skips an excluded
+  directory rather than descending — so a `!` pattern cannot re-include
+  something inside an excluded directory.
+- **Rewriting is metadata-scale**, but **`prune` is not**: it repacks and
+  re-uploads every affected pack, which is real network I/O on rclone backends
+  and can take minutes to hours. That's why `--later` and `apply_excludes` gate
+  on available window time. Space actually reclaimed is reported afterwards
+  from `restic stats`, and will differ from the raw-byte estimate.
+- Runs are idempotent: snapshots with no matching files are skipped, so
+  repeating a command converges instead of re-uploading.
+- `--later` and `apply_excludes` never touch your local filesystem.
+
 ## Environment Variables
 
 | Variable | Description | Default |
@@ -486,7 +584,9 @@ All state files live under `/opt/snap-bak/state/`:
 ├── snap-bak.lock             # Global lock + current job info (JSON)
 ├── throughput.json           # Per-repo transfer-rate history (capped)
 ├── {job_name}_status.json    # Per-job status (success/failed/skipped)
-└── {job_name}_status.json.tmp # Atomic write temp file
+├── {job_name}_status.json.tmp # Atomic write temp file
+├── apply_excludes_pending.json # one-shot `apply excludes --later` arm
+└── apply_excludes_done.json    # completion stamp (patterns digest + snapshot time)
 ```
 
 (Logs go to stderr — captured by the systemd journal. A file log is opt-in via `--log-file`.)
@@ -521,6 +621,9 @@ uv run pytest -q
 
 Tests cover retention functions (exponential, datetimes, keeplist), snapshot
 parsing, config validation, repo selection, failed backup retry, backup window
-logic, throughput calculation, config loading, restic option filtering, and the
-sudo-exec.py wrapper's validation/confinement. No remote restic or actual
-Btrfs operations are required.
+logic, throughput calculation, config loading, restic option filtering, the
+sudo-exec.py wrapper's validation/confinement, and the exclude engine (a port
+of restic's own pattern-matching golden cases, pattern-file parsing, lint
+diagnostics, table rendering, and an end-to-end apply against a throwaway local
+restic repo in a temp directory). No remote restic or actual Btrfs operations
+are required.

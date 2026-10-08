@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Backup engine: errors, /proc helpers, global lock, status, and the Runner.
 
-Imports config, restic and snapshot; must not import cli.
+Imports config, excludes, restic and snapshot; must not import cli.
 """
 
 from __future__ import annotations
@@ -18,8 +18,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
+from typing import TextIO
 
 from snap_bak import config
+from snap_bak import excludes
 from snap_bak import restic
 from snap_bak import snapshot
 
@@ -229,27 +231,28 @@ class GlobalLock:
     ):
         self._stuck_threshold = stuck_threshold
         self._stuck_wait = stuck_wait
-        self._fh = None
+        self._fh: TextIO | None = None
 
     def __enter__(self):
         while True:
             fh = open(config.GLOBAL_LOCK_FILE, "a+")
             try:
-                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except IOError:
                 fh.close()
                 if _resolve_lock_contention(self._stuck_threshold, self._stuck_wait):
                     continue
             else:
                 break
-        self._fh = fh
+        self._fh: TextIO | None = fh
         _write_lock_info()
         logger.info("Global lock acquired.")
         return self
 
     def __exit__(self, *exc):
-        fcntl.flock(self._fh, fcntl.LOCK_UN)
-        self._fh.close()
+        if self._fh is not None:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            self._fh.close()
         config.GLOBAL_LOCK_FILE.unlink(missing_ok=True)
         logger.info("Global lock released.")
 
@@ -353,6 +356,9 @@ class ResultStatus(str, Enum):
     DRY_RUN = "dry_run"
     RETENTION_OK = "retention_ok"
     RETENTION_FAILED = "retention_failed"
+    # There is deliberately no status for an apply-excludes result. Those are
+    # `apply.Outcome`, a different type, so an apply can never be mistaken for a
+    # backup result nor reach exit_code().
 
 
 @dataclass
@@ -405,8 +411,116 @@ def _median(values):
     return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) // 2
 
 
+# --- applying excludes to existing backups (opt-in, gated) ---------------
+
+PENDING_FILE = "apply_excludes_pending.json"
+DONE_FILE = "apply_excludes_done.json"
+
+
+def pending_arm() -> Path:
+    """Path of the one-shot `apply excludes --later` arm."""
+    return config.STATE_DIR / PENDING_FILE
+
+
+def completion_stamp() -> Path:
+    """Path of the record that a pattern set was already applied."""
+    return config.STATE_DIR / DONE_FILE
+
+
+def read_pending() -> list[str]:
+    """Job names armed by `--later`, or [] when nothing is armed.
+
+    Tolerates a missing or corrupt file: an unreadable arm must not wedge a run,
+    it just means nothing is armed.
+    """
+    try:
+        data = json.loads(pending_arm().read_text())
+    except (OSError, ValueError):
+        return []
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    return [str(j) for j in jobs] if isinstance(jobs, list) else []
+
+
+def consume_pending() -> list[str]:
+    """Read the armed job names and clear the arm, whatever the outcome.
+
+    One-shot by construction: a run either uses the arm or drops it, so an arm
+    never lingers to surprise-runs days later.
+    """
+    jobs = read_pending()
+    try:
+        pending_arm().unlink()
+    except OSError:
+        pass
+    return jobs
+
+
+def stamp_current(
+    repo_path: str, patterns: list[str], newest_snapshot: str | None
+) -> bool:
+    """True when these patterns were already applied and nothing is newer.
+
+    Cheap enough to check every run, which is the point: with
+    `apply_excludes` on, an unchanged repo must cost one `restic snapshots` call
+    rather than a per-snapshot `restic ls`. Adding or reordering a pattern
+    changes the digest and forces a rescan; so does a newer snapshot.
+    """
+    try:
+        stamp = json.loads(completion_stamp().read_text())
+    except (OSError, ValueError):
+        return False
+    return (
+        stamp.get("repo") == repo_path
+        and stamp.get("digest") == excludes.patterns_digest(patterns)
+        and stamp.get("newest_snapshot") == newest_snapshot
+    )
+
+
+def write_stamp(
+    repo_path: str, patterns: list[str], newest_snapshot: str | None
+) -> None:
+    """Record a completed apply so the next run can skip the scan.
+
+    Written only on success — a failed apply must be retried, not remembered.
+    """
+    config.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "repo": repo_path,
+        "digest": excludes.patterns_digest(patterns),
+        "newest_snapshot": newest_snapshot,
+        "applied_at": datetime.now(timezone.utc).isoformat(),
+    }
+    tmp = completion_stamp().with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.replace(completion_stamp())
+
+
+def half_window_remaining(rj) -> bool:
+    """True when at least half the backup window is still ahead.
+
+    The cheap test for "ample time remains", and all a rewrite needs: rewriting
+    is metadata-scale. The expensive prune rides along with whatever the run
+    already does after a successful backup.
+    """
+    window = rj.window
+    if window is None:
+        return True  # no window configured: never time-boxed
+    now = datetime.now()
+    minutes = now.hour * 60 + now.minute
+    length = (window.end_min - window.start_min) % (24 * 60) or 24 * 60
+    if window.start_min < window.end_min:
+        elapsed = minutes - window.start_min
+    else:  # overnight window
+        elapsed = (
+            minutes - window.start_min
+            if minutes >= window.start_min
+            else minutes + 24 * 60 - window.start_min
+        )
+    return length - elapsed >= length / 2
+
+
 class Runner:
-    """Executes one resolved Job: backups (run) and retention (retention/prune)."""
+    """Executes one resolved Job: backups, retention, and (opt-in) applies."""
 
     def __init__(
         self,
@@ -439,7 +553,7 @@ class Runner:
 
     # --- command execution ---
 
-    def _run(self, cmd, check=True, timeout=None):
+    def run_command(self, cmd, check=True, timeout=None):
         """Single chokepoint for external commands; dry-run logs instead of running."""
         if self.dry_run:
             logger.info(f"DRY-RUN: would execute: {' '.join(cmd)}")
@@ -523,7 +637,7 @@ class Runner:
         cmd = [config.SUDO, config.SUDO_EXEC, "snapshot", self.job.name, snap_name]
         logger.info(f"Creating snapshot: {' '.join(cmd)}")
         try:
-            self._run(cmd)
+            self.run_command(cmd)
         except subprocess.CalledProcessError as e:
             msg = f"Snapshot creation failed: {e.stderr}"
             logger.error(msg)
@@ -546,7 +660,7 @@ class Runner:
         """Query the root wrapper for pool/generation status; {} fails open."""
         cmd = [config.SUDO, config.SUDO_EXEC, "status", self.job.name]
         try:
-            result = self._run(cmd, timeout=config.REPO_CHECK_TIMEOUT)
+            result = self.run_command(cmd, timeout=config.REPO_CHECK_TIMEOUT)
             data = json.loads(result.stdout)
             return data if isinstance(data, dict) else {}
         except Exception as e:
@@ -607,7 +721,7 @@ class Runner:
             return
         for s in to_delete:
             logger.info(f"Deleting old snapshot: {s.path.name}")
-            self._run(
+            self.run_command(
                 [config.SUDO, config.SUDO_EXEC, "delete", self.job.name, s.path.name]
             )
 
@@ -624,7 +738,7 @@ class Runner:
         cmd.extend(["--tag", self.tag])
         for key, val in self.job.backup_retention.items():
             cmd.extend([f"--keep-{key}", str(val)])
-        self._run(cmd)
+        self.run_command(cmd)
 
     def retention(self) -> Result | None:
         """Forget policy; reports (never raises) retention_failed."""
@@ -646,9 +760,16 @@ class Runner:
         return Result(self.job.name, ResultStatus.RETENTION_OK)
 
     def prune(self) -> Result:
-        """A single `restic prune` (exclusive lock); reports, never raises."""
+        """A single `restic prune` (exclusive lock); reports, never raises.
+
+        Prune repacks and re-uploads every pack holding unreferenced data, making
+        it by far the most expensive restic operation snap-bak runs. The
+        duration is logged because it is the number an operator needs to judge
+        whether the work fit comfortably in the window.
+        """
+        started = time.monotonic()
         try:
-            self._run(self._restic_cmd("prune"))
+            self.run_command(self._restic_cmd("prune"))
         except Exception as e:
             msg = str(e)
             logger.error(f"Prune failed for {self.repo.path}: {msg}", exc_info=True)
@@ -659,7 +780,62 @@ class Runner:
                 last_error=msg,
             )
             return Result(self.job.name, ResultStatus.RETENTION_FAILED, reason=msg)
+        elapsed = int(time.monotonic() - started)
+        logger.info(f"Prune completed for {self.repo.path} in {elapsed}s")
         return Result(self.job.name, ResultStatus.RETENTION_OK)
+
+    # --- read-only repo inspection (the API apply.py is built on) ---
+    #
+    # Public because apply.py is a collaborator: planning and executing an
+    # apply-excludes legitimately needs to list snapshots and read one stored
+    # snapshot's metadata. Both degrade to empty on a dead repo rather than
+    # raising, so an inspection reports "nothing found" instead of crashing.
+
+    def repo_snapshots(self) -> list[dict]:
+        """This job's snapshots in its repo, as restic's JSON objects.
+
+        Tagged, so a repo shared between jobs never mixes them.
+        """
+        cmd = self._restic_cmd("snapshots") + ["--json", "--tag", self.tag]
+        try:
+            out = self.run_command(cmd, timeout=config.REPO_CHECK_TIMEOUT)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.error(f"Cannot list snapshots for {self.repo.path}: {e}")
+            return []
+        try:
+            data = json.loads(out.stdout or "[]")
+        except ValueError as e:
+            logger.error(f"Unparseable `restic snapshots` output: {e}")
+            return []
+        return data if isinstance(data, list) else []
+
+    def repo_listing(self, snapshot_id: str):
+        """(path, size, is_dir) triples for one stored snapshot (metadata only)."""
+        try:
+            out = self.run_command(
+                self._restic_cmd("ls") + ["--long", snapshot_id],
+                timeout=config.REPO_CHECK_TIMEOUT,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.error(f"Cannot list snapshot {snapshot_id[:8]}: {e}")
+            return []
+        return list(excludes.parse_ls_long(out.stdout or ""))
+
+    def repo_ping(self) -> int | None:
+        """`restic cat config`: None when the repo is readable, else its rc.
+
+        Reports only what restic said; what each code means is the caller's
+        business. A timeout propagates, so a caller can tell "unreachable" from
+        "locked" without this method inventing an exit code.
+        """
+        try:
+            self.run_command(
+                self._restic_cmd("cat") + ["config"],
+                timeout=config.REPO_CHECK_TIMEOUT,
+            )
+        except subprocess.CalledProcessError as e:
+            return e.returncode
+        return None
 
     # --- throughput learning ---
 
@@ -706,7 +882,7 @@ class Runner:
         if self.dry_run:
             return True
         try:
-            self._run(
+            self.run_command(
                 self._restic_cmd("cat", repo) + ["config"],
                 timeout=config.REPO_CHECK_TIMEOUT,
             )
@@ -719,7 +895,7 @@ class Runner:
         if self.dry_run:
             return 0
         try:
-            result = self._run(
+            result = self.run_command(
                 self._restic_cmd("stats", repo) + ["--mode", "raw-data", "--json"],
                 timeout=config.REPO_STATS_TIMEOUT,
             )
@@ -776,7 +952,7 @@ class Runner:
             >= self.job.backup_interval
         )
 
-    def _within_backup_window(self) -> bool:
+    def within_backup_window(self) -> bool:
         return self.window is None or self.window.contains(datetime.now())
 
     def _delay(self, reason):
@@ -794,8 +970,14 @@ class Runner:
 
     def decide(self) -> Decision:
         repo = self.repo
-        state = self._repo_state(repo)
         was_delayed = self.delay.delayed
+
+        # Cheap local-time gate first: when no backup can happen anyway, skip
+        # before the costly remote repo checks (restic cat config / restic stats).
+        if not self.within_backup_window():
+            return Decision("skip", "outside backup window", None)
+
+        state = self._repo_state(repo)
 
         if state.get("reachable") is False:
             return Decision("delayed", "unreachable", None)
@@ -808,9 +990,6 @@ class Runner:
                 )
             state["allocated"] = True
             return Decision("delayed", "size_limit", None)
-
-        if not self._within_backup_window():
-            return Decision("skip", "outside backup window", None)
 
         if self._time_for_backup():
             if was_delayed:
@@ -836,7 +1015,7 @@ class Runner:
         cmd = self._restic_cmd("backup", repo)
         cmd.extend([str(mount_point), "--tag", self.tag, "--json", "--dry-run"])
         try:
-            result = self._run(cmd)
+            result = self.run_command(cmd)
             summary = restic.last_json_line(result.stdout)
             if summary is None:
                 logger.warning("Could not parse preflight output")
@@ -856,7 +1035,7 @@ class Runner:
         cmd = self._restic_cmd("backup", repo)
         cmd.extend([str(mount_point), "--tag", self.tag, "--json"])
         try:
-            result = self._run(cmd)
+            result = self.run_command(cmd)
         except subprocess.CalledProcessError as e:
             raise categorize_restic_error(e) from e
         if result.stderr and result.stderr.strip():
@@ -896,10 +1075,10 @@ class Runner:
                         f"{mount_point} mounted at {mounted.name}; unmounting to mount "
                         f"{snapshot_path.name}."
                     )
-                    self._run([config.SUDO, config.SUDO_EXEC, "umount", self.job.name])
+                    self.run_command([config.SUDO, config.SUDO_EXEC, "umount", self.job.name])
             if not reuse:
                 try:
-                    self._run(
+                    self.run_command(
                         [
                             config.SUDO,
                             config.SUDO_EXEC,
@@ -921,7 +1100,7 @@ class Runner:
                     )
                 else:
                     try:
-                        self._run(
+                        self.run_command(
                             [config.SUDO, config.SUDO_EXEC, "umount", self.job.name]
                         )
                     except subprocess.CalledProcessError:
@@ -1044,7 +1223,7 @@ class Runner:
             return Result(self.job.name, ResultStatus.SKIPPED)
 
         # If the window closed between planning and execution, the slot is missed.
-        if not self._within_backup_window():
+        if not self.within_backup_window():
             self._write_status(
                 "skipped", "Backup window closed before backup could run"
             )
