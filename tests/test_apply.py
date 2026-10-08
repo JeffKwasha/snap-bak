@@ -217,6 +217,20 @@ class TestExecute:
         assert not issubclass(apply.Outcome, job.Result)
 
 
+@pytest.fixture
+def state_dir(tmp_path, monkeypatch):
+    """Point STATE_DIR at this test's own tmp_path, which pytest reaps.
+
+    The rest of the suite relies on conftest redirecting STATE_DIR to a
+    directory removed at interpreter exit; this goes one better for the tests
+    that actually write stamps.
+    """
+    d = tmp_path / "state"
+    d.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(job.config, "STATE_DIR", d)
+    return d
+
+
 class TestCompletionStamp:
     """The record that a job's patterns were already applied to its repo.
 
@@ -230,8 +244,7 @@ class TestCompletionStamp:
     def _stamp_files(self):
         return sorted(p.name for p in job.done_dir().iterdir())
 
-    def test_two_jobs_on_one_repo_keep_independent_stamps(self, monkeypatch):
-        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+    def test_two_jobs_on_one_repo_keep_independent_stamps(self, state_dir):
         repo = "rclone:CONFIG_ENTRY:DIRECTORY"
         a, b = ["*.tmp"], ["*.tmp", ".immich_db"]
 
@@ -243,14 +256,12 @@ class TestCompletionStamp:
             "one job's apply must not invalidate another's stamp"
         )
 
-    def test_three_jobs_each_get_their_own_file(self, monkeypatch):
-        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+    def test_three_jobs_each_get_their_own_file(self, state_dir):
         for name in ("data", "home", "Immich"):
             job.write_stamp(name, "rclone:CONFIG_ENTRY:DIRECTORY", ["*.tmp"], "snap")
         assert self._stamp_files() == ["data.json", "Immich.json", "home.json"]
 
-    def test_stamp_records_the_job_name(self, monkeypatch):
-        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+    def test_stamp_records_the_job_name(self, state_dir):
         job.write_stamp("data", "r", ["*.tmp"], "snapA")
         body = json.loads(
             (job.done_dir() / "data.json").read_text()
@@ -259,27 +270,22 @@ class TestCompletionStamp:
         assert body["repo"] == "r"
         assert body["newest_snapshot"] == "snapA"
 
-    def test_one_jobs_patterns_do_not_satisfy_another(self, monkeypatch):
-        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+    def test_one_jobs_patterns_do_not_satisfy_another(self, state_dir):
         job.write_stamp("data", "r", ["*.tmp"], "snapA")
         assert job.stamp_current("data", "r", ["*.tmp", "cache"], "snapA") is False
 
-    def test_a_newer_snapshot_invalidates(self, monkeypatch):
-        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+    def test_a_newer_snapshot_invalidates(self, state_dir):
         job.write_stamp("data", "r", ["*.tmp"], "snapA")
         assert job.stamp_current("data", "r", ["*.tmp"], "snapB") is False
 
-    def test_a_different_repo_invalidates(self, monkeypatch):
-        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+    def test_a_different_repo_invalidates(self, state_dir):
         job.write_stamp("data", "repoA", ["*.tmp"], "snapA")
         assert job.stamp_current("data", "repoB", ["*.tmp"], "snapA") is False
 
-    def test_missing_stamp_is_not_current(self, monkeypatch):
-        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+    def test_missing_stamp_is_not_current(self, state_dir):
         assert job.stamp_current("data", "r", ["*.tmp"], "snapA") is False
 
-    def test_corrupt_stamp_is_not_current(self, monkeypatch):
-        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+    def test_corrupt_stamp_is_not_current(self, state_dir):
         job.write_stamp("data", "r", ["*.tmp"], "snapA")
         (job.done_dir() / "data.json").write_text("{not json")
         assert job.stamp_current("data", "r", ["*.tmp"], "snapA") is False
@@ -301,28 +307,16 @@ class TestCompletionStamp:
 
 
 class TestArmFile:
-    def test_arm_and_stamp_are_distinct_facts(self, monkeypatch):
+    def test_arm_and_stamp_are_distinct_facts(self, state_dir):
         """The arm is a request, consumed once whatever happens; the stamp is a
         record of completion that outlives the run. Distinct lifecycles, so
-        distinct files — naming them pending/done made them read like two states
-        of one thing."""
-        state = _tmp_state()
-        monkeypatch.setattr(job.config, "STATE_DIR", state)
+        distinct files."""
         job.arm_file().write_text(json.dumps({"jobs": ["data"]}))
         job.write_stamp("data", "r", ["*.tmp"], "snapA")
 
         assert job.arm_file() != job.completion_stamp("data")
         assert job.read_pending() == ["data"]  # the arm outlives the stamp
         assert job.stamp_current("data", "r", ["*.tmp"], "snapA") is True
-
-
-def _tmp_state():
-    import tempfile
-    from pathlib import Path
-
-    d = Path(tempfile.mkdtemp(prefix="snap-bak-stamp-"))
-    d.mkdir(parents=True, exist_ok=True)
-    return d
 
 
 needs_restic = pytest.mark.skipif(
