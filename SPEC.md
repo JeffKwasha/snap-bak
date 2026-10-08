@@ -648,7 +648,7 @@ Two mechanisms, one execution path:
 | `apply_excludes: true` (job config) | persistent | the normal run may apply, when gated |
 | `--later` | one-shot | arm the next run without editing config |
 
-`--later` writes `<state>/apply_excludes_pending.json`; the next run consumes it
+`--later` writes `<state>/apply_excludes_armed.json`; the next run consumes it
 once, whatever the outcome and regardless of the config key. `--now` persists
 nothing. Either way, applying twice is harmless: a snapshot with nothing to
 exclude is skipped, so repeated runs converge instead of re-uploading identical
@@ -687,12 +687,18 @@ code, and no completion stamp on failure (so the next run does try again).
 
 ### Completion stamp
 
-`<state>/apply_excludes_done.json` records the repo, a digest of the pattern
-set, and the newest snapshot time at apply time. While it is current, the run
-skips the scan entirely — so a persistent `apply_excludes: true` costs one
+`<state>/apply_excludes_done/<job>.json` records the job, the repo, a digest of
+the pattern set, and the newest snapshot id at apply time. While it is current,
+the run skips the scan entirely — so a persistent `apply_excludes: true` costs one
 `restic snapshots` call, not a per-snapshot `restic ls`. Adding or reordering a
 pattern changes the digest and forces a rescan, as does a new backup appearing
 after the stamp. The stamp is only written on success.
+
+**One file per job, not per repo.** Jobs routinely share one restic repo while
+carrying different `excludes` and different `ignore_file`s, so a stamp keyed only
+by repo would be overwritten by whichever job applied last. Every job would then
+read as not-current and rescan in full — the network cost the stamp exists to
+avoid, paid on every run. The job name is part of the key and of the payload.
 
 The digest joins patterns with NUL before hashing, so `["ab","c"]` and
 `["a","bc"]` cannot collide.
@@ -755,8 +761,8 @@ per-job lock would add complexity without additional protection.
   snap-bak.lock          # Global lock file
   throughput.json        # Per-repo transfer-rate history
   <job_name>_status.json # Per-job status
-  apply_excludes_pending.json  # one-shot `apply excludes --later` arm
-  apply_excludes_done.json     # completion stamp (patterns digest + snapshot time)
+  apply_excludes_armed.json          # one-shot `apply excludes --later` arm
+  apply_excludes_done/<job>.json     # per-job completion stamp (digest + snapshot id)
 
 <install>/excludes       # ignore_file location (root:snap-bak)
 <install>/passwords      # per-repo restic password files (owned by the admin, group snap-bak)

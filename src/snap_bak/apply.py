@@ -248,6 +248,7 @@ def execute(runner, p: Plan) -> Outcome:
     # rescan in full and restamp.
     if not runner.dry_run:
         job.write_stamp(
+            runner.job.name,
             runner.repo.path,
             excludes.patterns_for_job(runner.job),
             newest_id(runner),

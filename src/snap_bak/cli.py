@@ -307,7 +307,7 @@ def _arm(jobs: list, as_json: bool) -> int:
     root-owned config file, and is consumed (never reused) by that run.
     """
     config.STATE_DIR.mkdir(parents=True, exist_ok=True)
-    pending = config.STATE_DIR / job.PENDING_FILE
+    pending = job.arm_file()
     armed = {
         "jobs": [rj.job.name for rj in jobs],
         "armed_at": datetime.now(timezone.utc).isoformat(),
@@ -407,7 +407,9 @@ def _apply_excludes_phase(runs: list, *, armed: set[str]) -> set[str]:
             )
             continue
         patterns = excludes.patterns_for_job(runner.job)
-        if job.stamp_current(runner.repo.path, patterns, apply.newest_id(runner)):
+        if job.stamp_current(
+            runner.job.name, runner.repo.path, patterns, apply.newest_id(runner)
+        ):
             logger.info("%s: apply excludes skipped (already applied)", name)
             continue
 

@@ -413,18 +413,32 @@ def _median(values):
 
 # --- applying excludes to existing backups (opt-in, gated) ---------------
 
-PENDING_FILE = "apply_excludes_pending.json"
-DONE_FILE = "apply_excludes_done.json"
+# Two facts with different lifecycles, so two files. The arm is a *request*,
+# consumed once whatever the outcome; the stamp is a *record* of completion that
+# outlives the run. Naming them pending/done made them read like two states of
+# one thing, which they are not.
+ARM_FILE = "apply_excludes_armed.json"
+DONE_DIR = "apply_excludes_done"
 
 
-def pending_arm() -> Path:
+def arm_file() -> Path:
     """Path of the one-shot `apply excludes --later` arm."""
-    return config.STATE_DIR / PENDING_FILE
+    return config.STATE_DIR / ARM_FILE
 
 
-def completion_stamp() -> Path:
-    """Path of the record that a pattern set was already applied."""
-    return config.STATE_DIR / DONE_FILE
+def done_dir() -> Path:
+    """Directory holding one completion stamp per job."""
+    return config.STATE_DIR / DONE_DIR
+
+
+def completion_stamp(job_name: str) -> Path:
+    """Path of the record that a job's patterns were already applied.
+
+    One file per job, inside a directory: job names are validated as
+    `[A-Za-z0-9_-]+` (config.py), the same guarantee that lets them name
+    `<job>_status.json`.
+    """
+    return done_dir() / f"{job_name}.json"
 
 
 def read_pending() -> list[str]:
@@ -434,7 +448,7 @@ def read_pending() -> list[str]:
     it just means nothing is armed.
     """
     try:
-        data = json.loads(pending_arm().read_text())
+        data = json.loads(arm_file().read_text())
     except (OSError, ValueError):
         return []
     jobs = data.get("jobs") if isinstance(data, dict) else None
@@ -449,14 +463,14 @@ def consume_pending() -> list[str]:
     """
     jobs = read_pending()
     try:
-        pending_arm().unlink()
+        arm_file().unlink()
     except OSError:
         pass
     return jobs
 
 
 def stamp_current(
-    repo_path: str, patterns: list[str], newest_snapshot: str | None
+    job_name: str, repo_path: str, patterns: list[str], newest_snapshot: str | None
 ) -> bool:
     """True when these patterns were already applied and nothing is newer.
 
@@ -464,20 +478,26 @@ def stamp_current(
     `apply_excludes` on, an unchanged repo must cost one `restic snapshots` call
     rather than a per-snapshot `restic ls`. Adding or reordering a pattern
     changes the digest and forces a rescan; so does a newer snapshot.
+
+    Keyed by job, not merely by repo. Several jobs commonly share one restic
+    repo with different excludes and different ignore_files, so a single shared
+    file meant each job's write invalidated the last and every run rescanned in
+    full — the network cost the stamp exists to avoid, paid on every run.
     """
     try:
-        stamp = json.loads(completion_stamp().read_text())
+        stamp = json.loads(completion_stamp(job_name).read_text())
     except (OSError, ValueError):
         return False
     return (
-        stamp.get("repo") == repo_path
+        stamp.get("job") == job_name
+        and stamp.get("repo") == repo_path
         and stamp.get("digest") == excludes.patterns_digest(patterns)
         and stamp.get("newest_snapshot") == newest_snapshot
     )
 
 
 def write_stamp(
-    repo_path: str, patterns: list[str], newest_snapshot: str | None
+    job_name: str, repo_path: str, patterns: list[str], newest_snapshot: str | None
 ) -> None:
     """Record a completed apply so the next run can skip the scan.
 
@@ -485,14 +505,17 @@ def write_stamp(
     """
     config.STATE_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
+        "job": job_name,
         "repo": repo_path,
         "digest": excludes.patterns_digest(patterns),
         "newest_snapshot": newest_snapshot,
         "applied_at": datetime.now(timezone.utc).isoformat(),
     }
-    tmp = completion_stamp().with_suffix(".json.tmp")
+    target = completion_stamp(job_name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, indent=2))
-    tmp.replace(completion_stamp())
+    tmp.replace(target)
 
 
 def half_window_remaining(rj) -> bool:

@@ -16,6 +16,7 @@ from conftest import backup, init_repo, resolved_job, restic
 from snap_bak import cli
 from snap_bak import config
 from snap_bak import excludes
+from snap_bak import job
 
 pytestmark = pytest.mark.skipif(
     shutil.which("restic") is None, reason="restic binary not available"
@@ -252,9 +253,9 @@ class TestArm:
             cli._do_apply([rj], now=False, later=True, as_json=False, limit=None)
             == config.EXIT_SUCCESS
         )
-        pending = config.STATE_DIR / "apply_excludes_pending.json"
-        assert pending.exists()
-        assert json.loads(pending.read_text())["jobs"] == ["Test"]
+        arm = job.arm_file()
+        assert arm.exists()
+        assert json.loads(arm.read_text())["jobs"] == ["Test"]
 
     def test_now_and_later_are_mutually_exclusive(self, tmp_path, monkeypatch, capsys):
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
@@ -263,7 +264,6 @@ class TestArm:
 
     def test_arm_is_consumed_once(self, tmp_path, monkeypatch):
         _rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
-        from snap_bak import job
 
         job.consume_pending()
         assert job.read_pending() == []

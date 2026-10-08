@@ -585,8 +585,8 @@ All state files live under `/opt/snap-bak/state/`:
 ├── throughput.json           # Per-repo transfer-rate history (capped)
 ├── {job_name}_status.json    # Per-job status (success/failed/skipped)
 ├── {job_name}_status.json.tmp # Atomic write temp file
-├── apply_excludes_pending.json # one-shot `apply excludes --later` arm
-└── apply_excludes_done.json    # completion stamp (patterns digest + snapshot time)
+├── apply_excludes_armed.json        # one-shot `apply excludes --later` arm
+└── apply_excludes_done/<job>.json   # per-job stamp (pattern digest + snapshot id)
 ```
 
 (Logs go to stderr — captured by the systemd journal. A file log is opt-in via `--log-file`.)

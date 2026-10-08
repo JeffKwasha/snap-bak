@@ -217,6 +217,114 @@ class TestExecute:
         assert not issubclass(apply.Outcome, job.Result)
 
 
+class TestCompletionStamp:
+    """The record that a job's patterns were already applied to its repo.
+
+    The stamp is a per-(repo, job) fact, and the three jobs in the production
+    config all share one rclone repo with different excludes and different
+    ignore_files. A single shared file meant each job's stamp invalidated the
+    last, so every run fell back to a full per-snapshot `restic ls` scan — the
+    network cost the stamp exists to avoid, paid on every single run.
+    """
+
+    def _stamp_files(self):
+        return sorted(p.name for p in job.done_dir().iterdir())
+
+    def test_two_jobs_on_one_repo_keep_independent_stamps(self, monkeypatch):
+        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+        repo = "rclone:CONFIG_ENTRY:DIRECTORY"
+        a, b = ["*.tmp"], ["*.tmp", ".immich_db"]
+
+        job.write_stamp("data", repo, a, "snapA")
+        job.write_stamp("Immich", repo, b, "snapB")
+
+        assert job.stamp_current("data", repo, a, "snapA") is True
+        assert job.stamp_current("Immich", repo, b, "snapB") is True, (
+            "one job's apply must not invalidate another's stamp"
+        )
+
+    def test_three_jobs_each_get_their_own_file(self, monkeypatch):
+        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+        for name in ("data", "home", "Immich"):
+            job.write_stamp(name, "rclone:CONFIG_ENTRY:DIRECTORY", ["*.tmp"], "snap")
+        assert self._stamp_files() == ["data.json", "Immich.json", "home.json"]
+
+    def test_stamp_records_the_job_name(self, monkeypatch):
+        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+        job.write_stamp("data", "r", ["*.tmp"], "snapA")
+        body = json.loads(
+            (job.done_dir() / "data.json").read_text()
+        )
+        assert body["job"] == "data"
+        assert body["repo"] == "r"
+        assert body["newest_snapshot"] == "snapA"
+
+    def test_one_jobs_patterns_do_not_satisfy_another(self, monkeypatch):
+        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+        job.write_stamp("data", "r", ["*.tmp"], "snapA")
+        assert job.stamp_current("data", "r", ["*.tmp", "cache"], "snapA") is False
+
+    def test_a_newer_snapshot_invalidates(self, monkeypatch):
+        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+        job.write_stamp("data", "r", ["*.tmp"], "snapA")
+        assert job.stamp_current("data", "r", ["*.tmp"], "snapB") is False
+
+    def test_a_different_repo_invalidates(self, monkeypatch):
+        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+        job.write_stamp("data", "repoA", ["*.tmp"], "snapA")
+        assert job.stamp_current("data", "repoB", ["*.tmp"], "snapA") is False
+
+    def test_missing_stamp_is_not_current(self, monkeypatch):
+        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+        assert job.stamp_current("data", "r", ["*.tmp"], "snapA") is False
+
+    def test_corrupt_stamp_is_not_current(self, monkeypatch):
+        monkeypatch.setattr(job.config, "STATE_DIR", _tmp_state())
+        job.write_stamp("data", "r", ["*.tmp"], "snapA")
+        (job.done_dir() / "data.json").write_text("{not json")
+        assert job.stamp_current("data", "r", ["*.tmp"], "snapA") is False
+
+    def test_job_names_are_safe_as_filenames(self, tmp_path):
+        """A job name becomes a path component, so the config validator is what
+        makes that safe — it already gates `<name>_status.json` the same way."""
+        import pydantic
+
+        from snap_bak import config
+
+        with pytest.raises(pydantic.ValidationError):
+            config.Job(
+                name="../escape",
+                snapshot_dir=tmp_path,
+                source_subvolume=tmp_path,
+                repo="r",
+            )
+
+
+class TestArmFile:
+    def test_arm_and_stamp_are_distinct_facts(self, monkeypatch):
+        """The arm is a request, consumed once whatever happens; the stamp is a
+        record of completion that outlives the run. Distinct lifecycles, so
+        distinct files — naming them pending/done made them read like two states
+        of one thing."""
+        state = _tmp_state()
+        monkeypatch.setattr(job.config, "STATE_DIR", state)
+        job.arm_file().write_text(json.dumps({"jobs": ["data"]}))
+        job.write_stamp("data", "r", ["*.tmp"], "snapA")
+
+        assert job.arm_file() != job.completion_stamp("data")
+        assert job.read_pending() == ["data"]  # the arm outlives the stamp
+        assert job.stamp_current("data", "r", ["*.tmp"], "snapA") is True
+
+
+def _tmp_state():
+    import tempfile
+    from pathlib import Path
+
+    d = Path(tempfile.mkdtemp(prefix="snap-bak-stamp-"))
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 needs_restic = pytest.mark.skipif(
     shutil.which("restic") is None, reason="restic binary not available"
 )
