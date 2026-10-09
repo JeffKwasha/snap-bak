@@ -101,6 +101,9 @@ class Plan:
     snapshot_ids: tuple[str, ...] = ()
     command: tuple[str, ...] = field(default=())
     query_error: job.RepoQueryError | None = None
+    # The newest snapshot the scan saw, kept so callers can ask "was this the
+    # one just written?" without listing the repository a second time.
+    newest_snapshot_id: str | None = None
 
     @property
     def empty(self) -> bool:
@@ -183,12 +186,18 @@ def plan(runner) -> Plan:
         if label in found.per_snapshot:
             targets.append(snapshot_id)
 
+    # restic lists newest-first, so the first snapshot is the one a backup that
+    # ran moments ago would have written. Recorded here so the caller need not
+    # ask again.
+    newest = snaps[0].get("id") if snaps else None
+
     return Plan(
         runner.job.name,
         root,
         found,
         tuple(targets),
         tuple(_rewrite_cmd(runner, targets)),
+        newest_snapshot_id=newest,
     )
 
 
@@ -346,10 +355,12 @@ def warns_on_newest(runner, p: Plan) -> bool:
         # We never reached the repo, so "the newest snapshot is clean" is not a
         # fact we have. Answering either way would be a guess.
         return False
-    snaps = runner.repo_snapshots()
-    if not snaps or not p.snapshot_ids:
+    if not p.snapshot_ids:
         return False
-    return snaps[0]["id"] in p.snapshot_ids
+    # The newest id comes from the plan's own scan rather than a second
+    # `restic snapshots` call: the plan already listed them, and on a remote
+    # repository that call is not free.
+    return p.newest_snapshot_id is not None and p.newest_snapshot_id in p.snapshot_ids
 
 # --- the queued task --------------------------------------------------------
 
@@ -360,13 +371,19 @@ TASK_NAME = "rewrite-drop-excluded-files"
 
 
 @todo.task(TASK_NAME)
-def rewrite_drop_excluded(runner, entry) -> tuple[job.Result, set[str]]:
+def rewrite_drop_excluded(runner, entry, p: Plan | None = None) -> tuple[job.Result, set[str]]:
     """Remove this job's excluded files from snapshots restic already holds.
 
     Uses the job's *current* excludes, the same list the backup that ran
     moments earlier used, so there is nothing to pin and no variant to carry.
     Returns the repos it made prunable, which the run folds into its single
     prune pass.
+
+    `p` lets a caller that has already built a plan hand it over. The run's
+    orchestrator does exactly that — it needs the plan to check the newest
+    snapshot anyway — and planning again costs one `restic ls --long` per stored
+    snapshot, which on a remote repository is the most expensive thing this tool
+    does. Building it once and reusing it halves the network work per job.
     """
-    result = execute(runner, plan(runner))
+    result = execute(runner, p if p is not None else plan(runner))
     return result, {runner.repo.path} if result.status == job.ResultStatus.SUCCESS else set()

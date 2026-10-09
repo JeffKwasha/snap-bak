@@ -278,7 +278,7 @@ def segment_match(pattern: str, name: str) -> bool:
 # --------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class _Part:
     pattern: str
     is_simple: bool
@@ -331,20 +331,85 @@ def _has_double_wildcard(p: Pattern) -> tuple[bool, int]:
     return False, 0
 
 
+# Resolving a pattern's `**` into concrete part lists costs real time and is
+# repeated for every path, so it is memoised. Resolving the *match* is not
+# memoised, and must not be: matching depends on the segment values, so
+# `*.tmp` matches a 4-segment `/bak/E/a.tmp` but not `/bak/E/b.txt` — the same
+# pattern and the same segment count, different answers. Only the shape of a
+# pattern is independent of the path, so only the shape is cached.
+_RESOLVED_CACHE: dict[tuple, tuple[Pattern, ...]] = {}
+_RESOLVED_LIMIT = 20_000
+
+
+def clear_matcher_cache() -> None:
+    """Drop memoised pattern expansions. Call between independent scans."""
+    _RESOLVED_CACHE.clear()
+
+
+def _resolve(p: Pattern, segment_count: int) -> tuple[Pattern, ...]:
+    """Every part-list `p` can take for a path of `segment_count` segments.
+
+    `**` becomes a run of `*` parts, one longer per iteration (i=0 expands to
+    nothing). restic reaches the same set by reusing one buffer whose slots stay
+    "*" across iterations; building each run directly is equivalent and avoids
+    re-parsing. Several `**` recurse, which is how a pattern absorbs any number
+    of intermediate directories — so `**/x/**` expands into a family that is
+    resolved here once rather than re-expanded on every path that reaches it.
+
+    Each round derives its own bound from the pattern *as it stands at that
+    round*. That is not incidental: expanding a later `**` against the original
+    segment count instead silently drops anchorings, so `/a/**/b/**/c` never
+    matches `/a/x/b/y/c` because the run that would absorb the single `x` is
+    never generated. restic's own golden cases pin this.
+    """
+    # Keyed on the parts themselves, not on (original, part count): mid-expansion
+    # children of the same pattern share both of those while being entirely
+    # different patterns — `/a/**/b/**/c` at pos 2 and pos 4 are six parts of the
+    # same original text. Keying on them returns one child's shapes for the
+    # other, and `/a/**/b/**/c` then fails to match `/a/x/b/y/c`.
+    key = (
+        p.original,
+        p.is_negated,
+        segment_count,
+        tuple((pt.pattern, pt.is_simple) for pt in p.parts),
+    )
+    hit = _RESOLVED_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    ok, pos = _has_double_wildcard(p)
+    if not ok:
+        out = (p,)
+    else:
+        max_stars = max(segment_count - len(p.parts) + 1, 0)
+        seen: list[Pattern] = []
+        for i in range(max_stars + 1):
+            candidate = Pattern(
+                p.original,
+                p.parts[:pos] + [_Part("*", False)] * i + p.parts[pos + 1 :],
+                p.is_negated,
+            )
+            # `len(strs) - len(candidate.parts)` is the bound the recursive
+            # call in `_match_parts` would compute for itself, so recursing with
+            # `segment_count` reproduces the original recursion exactly rather
+            # than freezing the count at the first round.
+            seen.extend(_resolve(candidate, segment_count))
+        # Deduplicate on the part list: `Pattern` holds a list and is not
+        # hashable, and several expansions of the same `**` coincide.
+        out = tuple(
+            {tuple((pt.pattern, pt.is_simple) for pt in q.parts): q for q in seen}.values()
+        )
+
+    if len(_RESOLVED_CACHE) < _RESOLVED_LIMIT:
+        _RESOLVED_CACHE[key] = out
+    return out
+
+
 def _match_parts(p: Pattern, strs: list[str]) -> bool:
     """Port of restic's unexported `match`."""
-    ok, pos = _has_double_wildcard(p)
-    if ok:
-        # Expand `**` into a run of `*` parts, one longer per iteration (i=0
-        # expands to nothing). restic achieves this by reusing one buffer whose
-        # slots stay "*" across iterations; building the run directly is
-        # equivalent and avoids re-parsing. With several `**`, the recursive
-        # call expands the next one, which is how a pattern absorbs any number
-        # of intermediate directories. The bound keeps len(new_parts) <= len(strs).
-        max_stars = max(len(strs) - len(p.parts) + 1, 0)
-        for i in range(max_stars + 1):
-            new_parts = p.parts[:pos] + [_Part("*", False)] * i + p.parts[pos + 1 :]
-            if _match_parts(Pattern(p.original, new_parts, p.is_negated), strs):
+    if _has_double_wildcard(p)[0]:
+        for resolved in _resolve(p, len(strs)):
+            if _match_parts(resolved, strs):
                 return True
         return False
 

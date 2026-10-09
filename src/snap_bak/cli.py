@@ -498,14 +498,19 @@ def _apply_excludes_phase(runs: list) -> tuple[list, set[str]]:
             )
             continue
 
-        if apply.warns_on_newest(runner, apply.plan(runner)):
+        # One plan, used twice. It costs one `restic ls --long` per stored
+        # snapshot, which on a remote repository is the slowest thing this tool
+        # does; planning separately for the check and the rewrite did that work
+        # twice for every job with queued work.
+        planned = apply.plan(runner)
+        if apply.warns_on_newest(runner, planned):
             logger.warning(
                 "%s: the newest snapshot still holds excluded files, so the "
                 "backup that just ran is not applying this job's excludes",
                 runner.job.name,
             )
 
-        result, repos = todo.dispatch(runner.state_file, runner)
+        result, repos = todo.dispatch(runner.state_file, runner, plan=planned)
         if result is None:
             continue
         logger.info("%s: %s: %s", runner.job.name, result.status, result.reason)

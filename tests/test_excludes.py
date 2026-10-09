@@ -262,6 +262,73 @@ def test_realistic_patterns(pattern, path, expected):
     assert excludes.excluded(excludes.parse_patterns([pattern]), path) is expected
 
 
+# --- the memoised `**` expansion -----------------------------------------
+
+
+class TestExpansionCache:
+    """The `**` expansion is memoised so a large pattern set stays affordable.
+
+    Every restic golden case above runs through it, but these pin the two ways
+    a cache here can be wrong in ways the goldens do not catch: colliding keys,
+    and an answer that depends on the path rather than only on the shape.
+    """
+
+    def test_a_warm_cache_answers_identically_to_a_cold_one(self):
+        """The cache must not change any answer, only how long one takes."""
+        pats = [
+            "/a/**/b/**/c", "**/a/**/b/**/c", "user/**/hidden*/**/c",
+            "**/node_modules/**", "*.tmp", "!keep.tmp", "**", "**/x/**/**/y",
+        ]
+        paths = [
+            "/a/x/b/y/c", "/q/a/r/b/t/c", "/home/user/work/x/y/hidden/z/a/b/c",
+            "/bak/E/node_modules/z.js", "/bak/E/a.tmp", "/bak/E/keep.tmp",
+            "/bak/E/x/p/q/r/y", "/bak/E/deep/a/b/c/d/e",
+        ]
+        for raw in pats:
+            parsed = excludes.parse_patterns([raw])
+            cold = [excludes.list_match(parsed, p) for p in paths]
+            for p in paths:  # warm it
+                excludes.list_match(parsed, p)
+            warm = [excludes.list_match(parsed, p) for p in paths]
+            assert warm == cold, f"{raw!r} changed answer once cached"
+
+    def test_matching_depends_on_segment_values_not_only_their_count(self):
+        """Why the cache stores expansions and not results.
+
+        `/bak/E/a.tmp` and `/bak/E/b.txt` have the same pattern, the same
+        segment count and the same depth — and opposite answers. A cache keyed on
+        (pattern, segment count) would return one answer for both.
+        """
+        pats = excludes.parse_patterns(["*.tmp"])
+        a = list(excludes.split_path("/bak/E/a.tmp"))
+        b = list(excludes.split_path("/bak/E/b.txt"))
+        assert len(a) == len(b)
+        assert excludes._match_parts(pats[0], a) is True
+        assert excludes._match_parts(pats[0], b) is False
+
+    def test_mid_expansion_children_do_not_collide(self):
+        """The key uses the parts, not (original, part count).
+
+        Expanding `/a/**/b/**/c` produces six-part children that share its
+        original text; keying on the text alone returned one child's shapes for
+        the other and the pattern silently stopped matching.
+        """
+        pats = excludes.parse_patterns(["/a/**/b/**/c"])
+        excludes.clear_matcher_cache()
+        assert excludes.excluded(pats, "/a/x/b/y/c") is True
+
+    def test_clear_is_observable(self):
+        pats = excludes.parse_patterns(["/a/**/b/**/c"])
+        excludes.list_match(pats, "/a/x/b/y/c")
+        assert excludes._RESOLVED_CACHE
+        excludes.clear_matcher_cache()
+        assert excludes._RESOLVED_CACHE == {}
+
+    def test_cache_is_bounded(self):
+        """An unbounded cache would grow for every distinct depth a walk meets."""
+        assert excludes._RESOLVED_LIMIT <= 100_000
+
+
 # --- restic TestInvalidStrs / TestInvalidPattern -------------------------
 
 

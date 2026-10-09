@@ -18,6 +18,7 @@ the function it names.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from collections.abc import Callable
@@ -143,7 +144,7 @@ def record_attempt(path, task_name: str, *, rc: int | None, error: str | None) -
 # --- running queued work ---------------------------------------------------
 
 
-def dispatch(path, runner) -> tuple[job.Result | None, set[str]]:
+def dispatch(path, runner, plan=None) -> tuple[job.Result | None, set[str]]:
     """Run whatever this job has queued; return its result and repos to prune.
 
     A task that failed or was delayed keeps its entry and is retried at the next
@@ -157,6 +158,10 @@ def dispatch(path, runner) -> tuple[job.Result | None, set[str]]:
 
     A dry run reports and returns without touching the queue at all: simulating a
     run must not consume the request the real run is waiting for.
+
+    `plan` is forwarded to handlers that accept one, so a caller holding a plan
+    does not pay for it to be rebuilt. Handlers that do not take it are called
+    exactly as before.
     """
     dry_run = bool(getattr(runner, "dry_run", False))
     for entry in queued_tasks(path):
@@ -170,7 +175,7 @@ def dispatch(path, runner) -> tuple[job.Result | None, set[str]]:
             return job.Result(runner.job.name, job.ResultStatus.FAILED, detail), set()
 
         try:
-            result, repos = handler(runner, entry)
+            result, repos = _invoke(handler, runner, entry, plan)
         except Exception as e:
             # Deliberately blind: a task must never be able to take down a
             # backup run, whatever it did on the way.
@@ -190,6 +195,17 @@ def dispatch(path, runner) -> tuple[job.Result | None, set[str]]:
 # A task that failed or was delayed has not done the work, so its request stands.
 # Everything else — applied, or nothing to apply — has satisfied it. An entry
 # left behind for a task that keeps finding nothing would rescan for ever.
+def _invoke(handler, runner, entry, plan):
+    """Call a task handler, passing a pre-built plan only if it accepts one.
+
+    Inspecting the signature keeps handlers simple to write: a task that needs no
+    plan declares `def h(runner, entry)` and is still called with two arguments.
+    """
+    if plan is None or "p" not in inspect.signature(handler).parameters:
+        return handler(runner, entry)
+    return handler(runner, entry, plan)
+
+
 _UNSETTLED = (job.ResultStatus.FAILED, job.ResultStatus.DELAYED, job.ResultStatus.DRY_RUN)
 
 
