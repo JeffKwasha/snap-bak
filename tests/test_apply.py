@@ -23,6 +23,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from pathlib import Path
 
 import pytest
 from conftest import backup, init_repo, resolved_job, restic, stored_files
@@ -490,9 +491,21 @@ class TestReporting:
         found.add(None, "/bak/sub/cache", 100, True)
         live = apply.payload("Test", "/bak/sub", found)
         repo = self._plan().to_json()
-        assert set(live) == set(repo) - {"snapshot_ids", "command"}
+        assert set(live) == set(repo) - {"snapshot_ids", "command", "query_error"}
         assert live["snapshots"] == [], "no snapshot dimension, but present"
         assert live["entries"][0]["per_snapshot"] == {}
+
+    def test_query_error_is_explicit_null_not_absent(self, tmp_path, monkeypatch):
+        """`snapshot_ids: []` is ambiguous on its own: an unreachable repo and a
+        clean repo both look empty. `query_error` is always present so an agent
+        can tell them apart without reading prose."""
+        rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
+        assert not Path(rj.repo.path).exists(), "fixture repo must not exist"
+        body = apply.plan(job.Runner(rj)).to_json()
+        assert body["snapshot_ids"] == []
+        assert body["query_error"] is not None
+        assert body["query_error"]["returncode"] == 10
+        assert body["query_error"]["retryable"] is True
 
 
 class TestNewestSnapshotCheck:

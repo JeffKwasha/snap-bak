@@ -614,13 +614,85 @@ diagnose what was running when the crash occurred.
 
 ## Error Codes
 
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | General error (job failed, etc.) |
-| 2 | Config validation error |
-| 3 | Mount base not found |
-| 4 | Permission error |
+Permanent codes will not resolve without a change; temporary ones may fix
+themselves on a later run.
+
+| Code | Meaning | Kind |
+|------|---------|------|
+| 0 | Success — the operation ran and found nothing wrong | — |
+| 1 | General error (unknown job name, refused action) | permanent |
+| 2 | Config validation error — nothing ran | permanent |
+| 3 | Mount base not found | permanent |
+| 4 | Permission error | permanent |
+| 30 | Repository unreachable or locked; ran out of window time | temporary |
+| 31 | Destination out of space | temporary |
+| 40 | Timeout beyond the stuck threshold | permanent |
+| 41 | Backup or rewrite failed (bad password, restic error) | permanent |
+| 50 | Internal error | permanent |
+| 51 | A previous run appears stuck | permanent |
+
+`30` and `41` are the distinction worth keeping: 30 means the repository was
+busy or absent and a later run may well succeed, 41 means it will keep failing
+until something changes. Reporting a 30 as a broken backup sends an operator
+chasing a problem that does not exist.
+
+restic's own codes fold into these: 10 (no repository), 11 (locked) and 12
+(wrong password) are all `30`, since each may resolve on its own.
+
+`apply excludes --now` reports through the same ladder, so an unreachable
+repository exits `30` there too rather than `0`.
+
+A **read-only** command that could not reach the repository also exits `30` or
+`41` rather than `0`. `snap-bak show excludes --repo` against an unreachable
+repository reports the reason and fails — it never prints "nothing found" and
+exits clean, because a caller reading `0` would conclude a backup had been
+verified when in fact nothing was checked. In `--json` this is the `query_error`
+key, which is always present and explicitly `null` when restic answered.
+
+## Using snap-bak from an AI agent
+
+The operational knowledge above — how to verify a backup, which exit code means
+what, when `--now` is a bad idea, how to read the state files — ships as a
+skill, so an agent loads it only when it is actually working with backups rather
+than carrying it in every session.
+
+It lives in this repo at [`.opencode/skills/snap-bak/`](.opencode/skills/snap-bak/):
+a `SKILL.md` plus `references/reference.md`, holding the full config and flag
+tables.
+
+**opencode** picks it up automatically from a clone of this repo. To use it
+globally instead, copy it into your opencode skills directory:
+
+```bash
+mkdir -p ~/.config/opencode/skills
+cp -r .opencode/skills/snap-bak ~/.config/opencode/skills/
+```
+
+**Hermes** loads skills from `~/.hermes/skills/`, where a subdirectory is the
+category the skill is listed under. Copy it into the category you want:
+
+```bash
+mkdir -p ~/.hermes/skills/devops
+cp -r .opencode/skills/snap-bak ~/.hermes/skills/devops/
+```
+
+Confirm with `/skills list`, load it with `/snap-bak`. Installed skills apply to
+new sessions — `/reset` to pick it up in the current one.
+
+Hermes can also install straight from a URL, which is the better route once this
+repo is public:
+
+```bash
+hermes skills install \
+  https://raw.githubusercontent.com/JeffKwasha/snap-bak/main/.opencode/skills/snap-bak/SKILL.md
+```
+
+That URL 404s while the repo is private, so use the copy step above until it is
+public. If you fork or mirror it, point the URL at your own copy — the skill is
+plain markdown and has no dependency on this repository.
+
+If you would rather not install anything, paste the `SKILL.md` into your agent's
+context — it is self-contained and deliberately short.
 
 ## Testing
 

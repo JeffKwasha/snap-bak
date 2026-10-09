@@ -15,19 +15,15 @@ they are ``show``/``apply`` rather than a bare noun group.
 """
 
 import argparse
+import json
 import logging
 import os
 import subprocess
 import sys
-import json
 from pathlib import Path
 
-from snap_bak import apply
-from snap_bak import config
-from snap_bak import excludes
-from snap_bak import job
+from snap_bak import __version__, apply, config, excludes, job, todo
 from snap_bak import snapshot as snapshot_model
-from snap_bak import todo
 
 logger = logging.getLogger(__name__)
 
@@ -122,10 +118,19 @@ def exit_code(results: list[job.Result]) -> int:
     def any_timeout():
         return any(r.timeout for r in results)
 
+    def any_unreachable():
+        # Matched by text, not by a sentinel string: `apply --now` reports the
+        # restic error verbatim so the reason survives into the log, and routing
+        # that through the ladder is what keeps an unreachable repo from exiting
+        # 0 as if the rewrite had simply found nothing to do.
+        return any(r.status == "delayed" and "could not read repository" in (r.reason or "")
+                   for r in results)
+
     ladder = [
         (lambda: has("failed"), config.EXIT_PERM_FAILED),
         (any_timeout, config.EXIT_PERM_TIMEOUT),
-        (lambda: has("delayed", "unreachable"), config.EXIT_TEMP_UNREACHABLE),
+        (lambda: has("delayed", "unreachable") or any_unreachable(),
+         config.EXIT_TEMP_UNREACHABLE),
         (lambda: has("delayed"), config.EXIT_TEMP_SIZE_LIMIT),
     ]
     for predicate, code in ladder:
@@ -151,7 +156,11 @@ def _selected_jobs(cfg: config.Config, name: str | None, path: str) -> list:
         return jobs
     chosen = [j for j in jobs if j.job.name == name]
     if not chosen:
-        logger.error(f"Job '{name}' not found in config.")
+        # Names are the one thing an agent has to know before it can ask
+        # anything, so the error names them. Guessing a job name otherwise ends
+        # in a bare "not found" and a retry loop with nothing to vary.
+        available = ", ".join(j.job.name for j in jobs)
+        logger.error(f"Job '{name}' not found in config. Available: {available}")
         sys.exit(config.EXIT_ERROR)
     return chosen
 
@@ -255,14 +264,54 @@ def _do_repo(jobs: list, limit: int | None, as_json: bool) -> int:
     plans = [apply.plan(job.Runner(rj)) for rj in jobs]
     if as_json:
         print(json.dumps({"repo": [p.to_json() for p in plans]}, indent=2))
-        return config.EXIT_SUCCESS
+        return _plan_exit_code(plans)
     for p in plans:
         print(f"=== {p.job} ({p.root}) ===")
+        if p.query_error is not None:
+            print(f"  {describe_query_error(p.query_error)}")
+            continue
         if not p.found.per_snapshot:
             print("  no snapshots matched")
             continue
         print(excludes.format_table(p.found, limit))
-    return config.EXIT_SUCCESS
+    return _plan_exit_code(plans)
+
+
+def describe_query_error(e: job.RepoQueryError) -> str:
+    """One sentence naming what restic said and what to do about it.
+
+    An agent reading a log has no way to infer from a bare exit code whether to
+    fix a path, wait for a lock, or repair credentials, so the restic code is
+    mapped to the action it implies.
+    """
+    reasons: dict[int | None, str] = {
+        10: "the repository does not exist at that path",
+        11: "another restic holds the repository lock",
+        12: "the password file is wrong or unreadable",
+    }
+    reason = reasons.get(e.returncode, "restic could not be queried")
+    advice = (
+        "Retry later; the repo may be reachable or unlocked by then."
+        if e.retryable
+        else "This will not resolve on its own — fix the config or repository."
+    )
+    return f"could not read repository: {reason} (restic exit {e.returncode}). {advice}"
+
+
+def _plan_exit_code(plans: list) -> int:
+    """Success unless a repo could not be read at all.
+
+    A plan that scanned successfully and found nothing is a success, and says so.
+    A plan that never reached the repository is not: reporting 0 there would tell
+    an operator — or an agent reading the exit code — that a backup was verified
+    clean when in fact nothing was checked. restic 10/11/12 mean "not now"
+    (delayed, 30); anything else means the setup is wrong (failed, 41).
+    """
+    if all(p.query_error is None for p in plans):
+        return config.EXIT_SUCCESS
+    if any(not p.query_error.retryable for p in plans if p.query_error):
+        return config.EXIT_PERM_FAILED
+    return config.EXIT_TEMP_UNREACHABLE
 
 
 def _do_apply(jobs: list, now: bool, later: bool, as_json: bool, limit: int | None) -> int:
@@ -287,9 +336,12 @@ def _plan(jobs: list, as_json: bool, limit: int | None) -> int:
     plans = [apply.plan(job.Runner(rj)) for rj in jobs]
     if as_json:
         print(json.dumps({"plan": [p.to_json() for p in plans]}, indent=2))
-        return config.EXIT_SUCCESS
+        return _plan_exit_code(plans)
     for p in plans:
         print(f"=== {p.job} ({p.root}) ===")
+        if p.query_error is not None:
+            print(f"  {describe_query_error(p.query_error)}")
+            continue
         if p.empty:
             print("  nothing to remove")
             continue
@@ -297,7 +349,7 @@ def _plan(jobs: list, as_json: bool, limit: int | None) -> int:
         print(f"  would rewrite {len(p.snapshot_ids)} snapshot(s): "
               f"{', '.join(p.snapshot_ids)}")
         print(f"  $ {' '.join(p.command)}")
-    return config.EXIT_SUCCESS
+    return _plan_exit_code(plans)
 
 
 def _arm(jobs: list, as_json: bool) -> int:
@@ -316,6 +368,11 @@ def _arm(jobs: list, as_json: bool) -> int:
     for rj in jobs:
         runner = job.Runner(rj)
         p = apply.plan(runner)
+        if p.query_error is not None:
+            detail = describe_query_error(p.query_error)
+            logger.error("%s: refusing to queue: %s", rj.job.name, detail)
+            refused.append({"job": rj.job.name, "reason": detail})
+            continue
         if p.empty:
             detail = (
                 "no snapshots hold files matching this job's excludes"
@@ -390,11 +447,14 @@ def _apply_now(jobs: list, as_json: bool) -> int:
         for entry in results:
             print(f"[{entry['job']}] {entry['status']}: {entry['detail']}")
 
-    return (
-        config.EXIT_ERROR
-        if any(r["status"] in ("failed", "prune-failed") for r in results)
-        else config.EXIT_SUCCESS
-    )
+    # Through the same ladder a scheduled run uses, rather than a hand-rolled
+    # check: `--now` is a mutation an agent may well drive unattended, so its
+    # outcome has to be classified exactly as the orchestrator would classify it.
+    statuses = [
+        job.Result(r["job"], r["status"], reason=r["detail"]) for r in results
+    ]
+    code = exit_code(statuses)
+    return config.EXIT_ERROR if code == config.EXIT_PERM_FAILED else code
 
 
 def _result_json(result: job.Result) -> dict:
@@ -539,14 +599,21 @@ def _excludes_main(argv: list[str], config_path: str) -> None:
 
     if verb == "show":
         _do_lint(jobs, args.json)  # always; silent when clean
+        # A `show` that cannot reach what it was asked about must not exit 0.
+        # The worst outcome for a caller is a clean report that was never
+        # actually checked, so each mode's code is accumulated, never overwritten.
+        code = config.EXIT_SUCCESS
         for mode in _selected_modes(args):
             if mode == "live":
                 _do_live(jobs, args.limit, args.json)
             elif mode == "snaps":
                 _do_snaps(jobs, args.limit, args.json)
             elif mode == "repo":
-                _do_repo(jobs, args.limit, args.json)
-        sys.exit(config.EXIT_SUCCESS)
+                # Accumulate rather than overwrite: `--all` includes --repo, so a
+                # last-wins assignment would let an unreachable repository be
+                # reported as a clean success by the modes that ran after it.
+                code = max(code, _do_repo(jobs, args.limit, args.json))
+        sys.exit(code)
 
     sys.exit(_do_apply(jobs, args.now, args.later, args.json, args.limit))
 
@@ -599,6 +666,12 @@ def _main_parser() -> argparse.ArgumentParser:
         "--list-jobs",
         action="store_true",
         help="List all configured jobs and exit.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"snap-bak {__version__}",
+        help="Print the installed version and exit.",
     )
     return parser
 

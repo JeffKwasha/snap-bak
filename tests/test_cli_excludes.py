@@ -6,16 +6,18 @@ rendering), plus a couple of end-to-end runs against a throwaway local restic
 repo so the wiring is proven against the real binary rather than mocks.
 """
 
+import contextlib
 import json
+import logging
 import shutil
+import subprocess
+from pathlib import Path
 
 import pytest
-
 from conftest import backup, init_repo, resolved_job, restic
 
-from snap_bak import cli
-from snap_bak import config
-from snap_bak import excludes
+import snap_bak
+from snap_bak import cli, config, excludes, job
 
 pytestmark = pytest.mark.skipif(
     shutil.which("restic") is None, reason="restic binary not available"
@@ -143,11 +145,30 @@ class TestSnapsOutput:
         assert data["snaps"][0]["snapshots"] == []
 
 
+@contextlib.contextmanager
+def _empty_repo(rj):
+    """An initialised repo that genuinely holds no snapshots.
+
+    Distinct from the default fixture's un-initialised path: restic answers
+    rc 0 with `[]` here, where it answers rc 10 there. Only this one means
+    "nothing to report".
+    """
+    init_repo(rj.repo.path)
+    try:
+        yield
+    finally:
+        shutil.rmtree(rj.repo.path, ignore_errors=True)
+
+
 class TestRepoOutput:
     def test_repo_empty_when_no_snapshots(self, tmp_path, monkeypatch, capsys):
+        # An initialised but empty repo is a real "nothing to report": restic
+        # answers with an empty list, which is a success. This is the case the
+        # unreachable-repo tests below must not swallow.
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
-        assert cli._do_repo([rj], limit=None, as_json=False) == config.EXIT_SUCCESS
-        assert "no snapshots matched" in capsys.readouterr().out
+        with _empty_repo(rj):
+            assert cli._do_repo([rj], limit=None, as_json=False) == config.EXIT_SUCCESS
+            assert "no snapshots matched" in capsys.readouterr().out
 
     def test_repo_shows_stored_matches(self, tmp_path, monkeypatch, capsys):
         # Back up with only *.tmp excluded, so `cache` is still stored; the
@@ -219,14 +240,36 @@ class TestApplyNow:
     def test_apply_now_noop_when_repo_has_no_snapshots(
         self, tmp_path, monkeypatch, capsys
     ):
-        """No repo means no snapshots, which means nothing to remove — a noop,
-        not a failure. The preflight only matters once there is work to do."""
-        rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
+        """An initialised repo holding no snapshots means nothing to remove —
+        a skip, not a failure. An *uninitialised* one is a different answer
+        entirely: restic could not be asked, so this reports delayed."""
+        rj, src, repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
+        init_repo(repo)
+        backup(repo, str(src), "--exclude", "*.tmp")  # stored, but matches nothing now
+
         assert (
             cli._do_apply([rj], now=True, later=False, as_json=False, limit=None)
             == config.EXIT_SUCCESS
         )
         assert "skipped" in capsys.readouterr().out
+
+    def test_apply_now_reports_an_unreadable_repo_as_delayed(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """`--now` is a mutation an agent may drive unattended. Reporting
+        "skipped: nothing to remove" for a repository that was never read would
+        tell it the cleanup was unnecessary when the answer is unknown."""
+        rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
+        assert not Path(rj.repo.path).exists()
+
+        assert (
+            cli._do_apply([rj], now=True, later=False, as_json=False, limit=None)
+            == config.EXIT_TEMP_UNREACHABLE
+        )
+        out = capsys.readouterr().out
+        assert "delayed" in out
+        assert "could not read repository" in out
+        assert "skipped" not in out, "an unread repo is not a clean skip"
 
     def test_preflight_refuses_cleanly_when_repo_missing(
         self, tmp_path, monkeypatch, capsys
@@ -303,6 +346,147 @@ class TestQueueing:
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
         assert cli._do_apply([rj], now=True, later=True, as_json=False, limit=None)
         assert config.EXIT_ERROR
+
+    def test_later_refuses_when_the_repo_cannot_be_read(self, tmp_path, monkeypatch, caplog):
+        """Queueing blind to an unreachable repo would schedule work nobody
+        verified, and would keep retrying it at every eligible window. The
+        refusal has to name the reason, not just 'nothing to do'."""
+        from snap_bak import todo as todo_mod
+
+        rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
+        assert not Path(rj.repo.path).exists()  # restic will answer rc 10
+
+        assert (
+            cli._do_apply([rj], now=False, later=True, as_json=False, limit=None)
+            == config.EXIT_ERROR
+        )
+        assert "could not read repository" in caplog.text
+        assert todo_mod.queued_tasks(rj.state_file) == []
+
+
+class TestUnreachableRepoReporting:
+    """The failure mode this whole class exists to prevent.
+
+    `repo_snapshots()` used to log the restic failure and return `[]`, which is
+    indistinguishable from a repo that genuinely holds no snapshots. So
+    `show excludes --repo` against an unreachable repository printed "no
+    snapshots matched" and exited 0 — a caller reading the exit code would
+    conclude the backups were verified clean when nothing had been checked at
+    all. Silence in a monitoring tool is only safe when it means "nothing wrong".
+    """
+
+    def _unreachable(self, path, monkeypatch):
+        """A job whose repo restic cannot open, as a distinct temp tree.
+
+        Takes a subdirectory rather than `tmp_path` so a test can ask for a
+        healthy job *and* a broken one in the same run — `resolved_job` owns
+        `src`, `snaps` and `repo` under whatever path it is handed.
+        """
+        rj, _src, _repo = resolved_job(path, monkeypatch, excludes_list=["*.tmp"])
+        assert not Path(rj.repo.path).exists(), "restic must answer rc 10 here"
+        return rj
+
+    def test_repo_snapshots_raises_instead_of_returning_empty(
+        self, tmp_path, monkeypatch
+    ):
+        rj = self._unreachable(tmp_path / "broken", monkeypatch)
+        with pytest.raises(job.RepoQueryError) as caught:
+            job.Runner(rj).repo_snapshots()
+        assert caught.value.returncode == 10
+        assert caught.value.retryable is True
+
+    def test_show_repo_exits_delayed_and_names_the_cause(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        rj = self._unreachable(tmp_path / "broken", monkeypatch)
+        # 30 (delayed), not 41: restic 10/11/12 are environmental and may well
+        # be fine on the next run.
+        assert cli._do_repo([rj], limit=None, as_json=False) == config.EXIT_TEMP_UNREACHABLE
+        out = capsys.readouterr().out
+        assert "could not read repository" in out
+        assert "no snapshots matched" not in out, "must not read as a clean result"
+
+    def test_json_carries_the_error_rather_than_a_silent_empty(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        rj = self._unreachable(tmp_path / "broken", monkeypatch)
+        cli._do_repo([rj], limit=None, as_json=True)
+        body = json.loads(capsys.readouterr().out)["repo"][0]
+        assert body["snapshot_ids"] == []
+        assert body["query_error"]["returncode"] == 10
+        assert body["query_error"]["retryable"] is True
+
+    def test_apply_dry_run_reports_it_too(self, tmp_path, monkeypatch, capsys):
+        """The dry-run is what a user approves, so it must not print
+        'nothing to remove' for a repository it never reached."""
+        rj = self._unreachable(tmp_path / "broken", monkeypatch)
+        assert cli._plan([rj], as_json=False, limit=None) == config.EXIT_TEMP_UNREACHABLE
+        out = capsys.readouterr().out
+        assert "could not read repository" in out
+        assert "nothing to remove" not in out
+
+    def test_non_environmental_failure_is_permanent(self, tmp_path, monkeypatch, capsys):
+        """Anything outside restic 10/11/12 will not fix itself, so it must not
+        be reported as merely delayed."""
+        rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
+        runner = job.Runner(rj)
+
+        def boom(_cmd, timeout=None):
+            raise subprocess.CalledProcessError(13, "restic")
+
+        monkeypatch.setattr(runner, "run_command", boom)
+        with pytest.raises(job.RepoQueryError) as caught:
+            runner.repo_snapshots()
+        assert caught.value.retryable is False
+        monkeypatch.setattr(
+            job.Runner, "repo_snapshots", lambda self: (_ for _ in ()).throw(caught.value)
+        )
+        assert cli._do_repo([rj], limit=None, as_json=False) == config.EXIT_PERM_FAILED
+
+    def test_one_broken_repo_does_not_hide_a_healthy_one(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Two jobs, one repo unreachable. The reachable one still gets a real
+        answer, and the command as a whole still fails."""
+        good, src, repo = resolved_job(
+            tmp_path / "good", monkeypatch, excludes_list=["*.tmp", "cache"]
+        )
+        init_repo(repo)
+        backup(repo, str(src), "--exclude", "*.tmp")
+        bad = self._unreachable(tmp_path / "broken", monkeypatch)
+
+        codes = {id(good): cli._do_repo([good], limit=None, as_json=False)}
+        assert codes[id(good)] == config.EXIT_SUCCESS
+        out = capsys.readouterr().out
+        assert "cache" in out, "the healthy repo must still be reported"
+
+        assert cli._do_repo([good, bad], limit=None, as_json=False) == (
+            config.EXIT_TEMP_UNREACHABLE
+        )
+        out = capsys.readouterr().out
+        assert "could not read repository" in out
+        assert "cache" in out, "a broken repo must not suppress the healthy one"
+
+
+class TestAgentFacingErrors:
+    def test_unknown_job_name_lists_the_available_ones(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A job name is the one thing a caller must know up front. Without the
+        list, a wrong name is a dead end that invites a retry loop with nothing
+        to vary."""
+        rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
+        cfg = config.Config(repos=[rj.repo], jobs=[rj.job])
+        with pytest.raises(SystemExit) as caught:
+            cli._selected_jobs(cfg, "data", "cfg.json")
+        assert caught.value.code == config.EXIT_ERROR
+        assert "data" in caplog.text
+        assert f"Available: {rj.job.name}" in caplog.text
+        assert [r.levelno for r in caplog.records] == [logging.ERROR]
+
+    def test_version_comes_from_package_metadata(self, capsys):
+        assert cli.__version__ == snap_bak.__version__
+        assert cli.__version__ != "unknown", "the package must be installed"
 
 
 class TestHalfWindowRemaining:

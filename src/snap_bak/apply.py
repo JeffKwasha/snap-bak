@@ -100,6 +100,7 @@ class Plan:
     found: excludes.ExclusionSet
     snapshot_ids: tuple[str, ...] = ()
     command: tuple[str, ...] = field(default=())
+    query_error: job.RepoQueryError | None = None
 
     @property
     def empty(self) -> bool:
@@ -113,6 +114,20 @@ class Plan:
         body = payload(self.job, self.root, self.found)
         body["snapshot_ids"] = list(self.snapshot_ids)
         body["command"] = list(self.command)
+        # An explicit null, not an omitted key: `snapshot_ids: []` alongside
+        # `query_error: null` means "restic said there is nothing", and the same
+        # empty list with a non-null error means "restic never answered". An
+        # agent must be able to tell those apart without inspecting prose.
+        body["query_error"] = (
+            None
+            if self.query_error is None
+            else {
+                "path": self.query_error.path,
+                "returncode": self.query_error.returncode,
+                "retryable": self.query_error.retryable,
+                "detail": self.query_error.detail,
+            }
+        )
         return body
 
 
@@ -121,9 +136,17 @@ def plan(runner) -> Plan:
 
     Read-only. Executes no restic command that can mutate, creates, or delete
     anything; the only restic calls are `snapshots` and `ls --long`, both
-    metadata. A repo that dies mid-scan yields fewer targets rather than an
-    exception, which is the safe direction: a target we failed to see is not
-    removed.
+    metadata.
+
+    An unreachable or locked repository is recorded on the returned `Plan` as
+    `query_error` rather than raised. Raising would abort the whole command when
+    one job of several is broken; swallowing it would report "nothing to clean
+    up" for a repo nobody ever asked. Carrying it means the caller can print the
+    reason next to the job it belongs to and fail the exit code, while the other
+    jobs still get their answer.
+
+    A snapshot that dies *mid-scan* is the opposite case and stays non-fatal: a
+    target we failed to see is not removed, which is the safe direction.
     """
     patterns = excludes.patterns_for_job(runner.job)
     parsed = excludes.parse_patterns(patterns)
@@ -134,9 +157,14 @@ def plan(runner) -> Plan:
         # restic would reject these, so there is nothing coherent to plan.
         return Plan(runner.job.name, root, excludes.ExclusionSet())
 
+    try:
+        snaps = runner.repo_snapshots()
+    except job.RepoQueryError as e:
+        return Plan(runner.job.name, root, excludes.ExclusionSet(), query_error=e)
+
     found = excludes.ExclusionSet()
     targets: list[str] = []
-    for snap in runner.repo_snapshots():
+    for snap in snaps:
         snapshot_id = snap.get("id")
         if not snapshot_id:
             continue
@@ -180,6 +208,18 @@ def execute(runner, p: Plan) -> job.Result:
     caller merges them into the run's single prune pass.
     """
     name = p.job
+    if p.query_error is not None:
+        # An unreachable repo makes an empty plan unknowable, not empty. Without
+        # this, `--now` against a locked repository reports "skipped: no excluded
+        # files" and exits 0 — telling a caller the rewrite found nothing to do
+        # when in fact it never looked.
+        return job.Result(
+            name,
+            job.ResultStatus.DELAYED
+            if p.query_error.retryable
+            else job.ResultStatus.FAILED,
+            f"could not read repository: {p.query_error.detail}",
+        )
     if p.empty:
         return job.Result(
             name, job.ResultStatus.SKIPPED, "no excluded files in stored snapshots"
@@ -302,6 +342,10 @@ def warns_on_newest(runner, p: Plan) -> bool:
     the backup path is not honouring the excludes — a real bug that would
     otherwise be hidden, because the rewrite quietly cleans up after it.
     """
+    if p.query_error is not None:
+        # We never reached the repo, so "the newest snapshot is clean" is not a
+        # fact we have. Answering either way would be a guess.
+        return False
     snaps = runner.repo_snapshots()
     if not snaps or not p.snapshot_ids:
         return False

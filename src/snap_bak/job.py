@@ -20,10 +20,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TextIO
 
-from snap_bak import config
-from snap_bak import excludes
-from snap_bak import restic
-from snap_bak import snapshot
+from snap_bak import config, excludes, restic, snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +57,48 @@ class MountError(BackupError):
 
 class StuckInstanceError(Exception):
     """A previous snap-bak instance appears stuck."""
+
+
+class RepoQueryError(Exception):
+    """restic could not be asked a read-only question about a repository.
+
+    Raised instead of returning an empty answer, because an empty answer is
+    indistinguishable from "there is nothing here" — and a tool that reports
+    "nothing found" for a repository it never reached is worse than one that
+    reports failure. `returncode` is None for timeouts and unparseable output;
+    when it is set, it is restic's own code, so callers can tell a missing repo
+    (10) from a locked one (11) from a bad password (12) without parsing text.
+    """
+
+    def __init__(self, path, returncode: int | None, detail: str):
+        self.path = path
+        self.returncode = returncode
+        self.detail = detail
+        super().__init__(f"{path}: {detail}")
+
+    @property
+    def retryable(self) -> bool:
+        """True when the repo may well answer on the next run.
+
+        restic 10/11/12 are environmental — missing, locked, or unreadable — so
+        the next eligible window is a reasonable thing to wait for. Anything
+        else will not fix itself without a config change.
+        """
+        return self.returncode in (10, 11, 12)
+
+
+def _stderr_excerpt(e: subprocess.CalledProcessError, limit: int = 200) -> str:
+    """Restic's own error text, on one line.
+
+    CalledProcessError.__str__ is just the argv, which is already in the debug
+    log, so without this the only readable reason for a failure would be the
+    exit code.
+    """
+    text = (e.stderr or b"").decode(errors="replace").strip() if isinstance(
+        e.stderr, bytes
+    ) else (e.stderr or "")
+    text = " ".join(text.split())
+    return text[:limit] or f"restic exited {e.returncode}"
 
 
 def categorize_restic_error(e: subprocess.CalledProcessError) -> BackupError:
@@ -730,19 +769,31 @@ class Runner:
         """This job's snapshots in its repo, as restic's JSON objects.
 
         Tagged, so a repo shared between jobs never mixes them.
+
+        Raises `RepoQueryError` when restic could not answer, and returns `[]`
+        only when it genuinely answered "none". The distinction is the whole
+        point: a caller asked "is anything to clean up?" and both answers look
+        identical in a list, so folding them together lets an unreachable or
+        locked repo report "nothing found" with a success exit code. A `show`
+        that cannot reach the repository must say so, not look like a clean bill
+        of health.
         """
         cmd = self._restic_cmd("snapshots") + ["--json", "--tag", self.tag]
         try:
             out = self.run_command(cmd, timeout=config.REPO_CHECK_TIMEOUT)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            logger.error(f"Cannot list snapshots for {self.repo.path}: {e}")
-            return []
+        except subprocess.CalledProcessError as e:
+            raise RepoQueryError(
+                self.repo.path, e.returncode, _stderr_excerpt(e)
+            ) from e
+        except subprocess.TimeoutExpired as e:
+            raise RepoQueryError(self.repo.path, None, f"timed out: {e}") from e
         try:
             data = json.loads(out.stdout or "[]")
         except ValueError as e:
-            logger.error(f"Unparseable `restic snapshots` output: {e}")
-            return []
-        return data if isinstance(data, list) else []
+            raise RepoQueryError(self.repo.path, None, f"unparseable output: {e}") from e
+        if not isinstance(data, list):
+            raise RepoQueryError(self.repo.path, None, "expected a JSON list")
+        return data
 
     def repo_listing(self, snapshot_id: str):
         """(path, size, is_dir) triples for one stored snapshot (metadata only)."""
