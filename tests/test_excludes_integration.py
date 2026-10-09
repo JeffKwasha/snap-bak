@@ -13,9 +13,10 @@ no real repo, seconds per run, and the directory is removed afterwards.
 import json
 import os
 import shutil
-import subprocess
 
 import pytest
+
+from conftest import backup, init_repo, restic, stored_files
 
 from snap_bak import excludes
 
@@ -23,28 +24,11 @@ pytestmark = pytest.mark.skipif(
     shutil.which("restic") is None, reason="restic binary not available"
 )
 
-PASSWORD = "test-password"
-
-
-def _restic(repo: str, *args, timeout=120) -> subprocess.CompletedProcess:
-    """Run restic against the throwaway repo."""
-    env = dict(os.environ, RESTIC_PASSWORD=PASSWORD)
-    return subprocess.run(
-        ["restic", "-r", repo, *args],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=timeout,
-    )
-
-
 @pytest.fixture
 def repo(tmp_path):
     """An initialised local restic repo."""
     path = str(tmp_path / "repo")
-    result = _restic(path, "init")
-    assert result.returncode == 0, result.stderr
-    return path
+    return init_repo(path)
 
 
 @pytest.fixture
@@ -87,36 +71,6 @@ def tree(tmp_path):
     return root
 
 
-def _stored(repo: str, snapshot_id: str) -> set[str]:
-    """The paths restic actually stored in a snapshot (directories included)."""
-    result = _restic(repo, "ls", "--long", snapshot_id)
-    assert result.returncode == 0, result.stderr
-    return {path for path, _size, _is_dir in excludes.parse_ls_long(result.stdout)}
-
-
-def _stored_files(repo: str, snapshot_id: str) -> set[str]:
-    """Only the stored files/symlinks — `restic ls` also lists directories."""
-    result = _restic(repo, "ls", "--long", snapshot_id)
-    assert result.returncode == 0, result.stderr
-    return {
-        path for path, _size, is_dir in excludes.parse_ls_long(result.stdout) if not is_dir
-    }
-
-
-def _backup(repo: str, source: str, *extra: str) -> str:
-    """Back up `source`, returning the new snapshot id."""
-    result = _restic(repo, "backup", source, "--json", *extra)
-    assert result.returncode == 0, result.stderr
-    for line in reversed(result.stdout.splitlines()):
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict) and obj.get("message_type") == "summary":
-            return obj["snapshot_id"]
-    raise AssertionError(f"no summary in backup output: {result.stdout}")
-
-
 def test_matcher_agrees_with_what_restic_actually_excludes(repo, tree):
     """The core cross-check: for a set of patterns, the module's answer for every
     path in the tree must equal restic's decision about whether to store it."""
@@ -127,9 +81,9 @@ def test_matcher_agrees_with_what_restic_actually_excludes(repo, tree):
         "file?.txt",
         "!file2.txt",
     ]
-    snap = _backup(repo, str(tree), *[a for p in patterns for a in ("--exclude", p)])
+    snap = backup(repo, str(tree), *[a for p in patterns for a in ("--exclude", p)])
 
-    stored = _stored_files(repo, snap)
+    stored = stored_files(repo, snap)
 
     # Every file in the tree is either stored or excluded — never both, never
     # neither. That is the property the whole feature rests on.
@@ -160,11 +114,11 @@ def test_matcher_agrees_with_what_restic_actually_excludes(repo, tree):
     )
 
 
-def test_directory_match_prunes_subtree_like_restic(repo, tree):
+def test_directory_match_prunes_subtree_likerestic(repo, tree):
     """A pattern matching a directory must exclude everything beneath it, the
     same way restic's walker prunes rather than descends."""
-    snap = _backup(repo, str(tree), "--exclude", "cache")
-    stored = _stored(repo, snap)
+    snap = backup(repo, str(tree), "--exclude", "cache")
+    stored = stored_files(repo, snap)
 
     assert not any("/cache/" in p for p in stored), stored
     # Siblings of the excluded directory are untouched.
@@ -174,10 +128,10 @@ def test_directory_match_prunes_subtree_like_restic(repo, tree):
 def test_negation_cannot_rescue_inside_excluded_directory(repo, tree):
     """restic cannot re-include a file inside an excluded directory, because it
     never descends into one. The walk must agree."""
-    snap = _backup(
+    snap = backup(
         repo, str(tree), "--exclude", "cache", "--exclude", "!cache/keep.txt"
     )
-    stored = _stored(repo, snap)
+    stored = stored_files(repo, snap)
     assert not any("/cache/" in p for p in stored), stored
 
 
@@ -189,8 +143,8 @@ def test_anchored_pattern_matches_backup_root_not_live_path(repo, tree):
     reaches only what is beneath that exact prefix. Here the backup root is the
     tree path.
     """
-    snap = _backup(repo, str(tree), "--exclude", f"{tree}/.config")
-    stored = _stored_files(repo, snap)
+    snap = backup(repo, str(tree), "--exclude", f"{tree}/.config")
+    stored = stored_files(repo, snap)
     # The anchored directory is gone...
     assert not any(p.endswith(".config/app.cfg") for p in stored), stored
     # ...but a same-named directory elsewhere in the tree survives, because the
@@ -199,8 +153,8 @@ def test_anchored_pattern_matches_backup_root_not_live_path(repo, tree):
 
     # A non-anchored pattern with the same tail matches at any depth, so it
     # takes both — the contrast that shows what anchoring buys you.
-    snap2 = _backup(repo, str(tree), "--exclude", ".config")
-    stored2 = _stored_files(repo, snap2)
+    snap2 = backup(repo, str(tree), "--exclude", ".config")
+    stored2 = stored_files(repo, snap2)
     assert not any(".config" in p for p in stored2), stored2
 
 
@@ -213,16 +167,16 @@ def test_restic_rewrite_forget_removes_excluded_files(repo, tree):
     snapshots get *selected* — is in tests/test_apply.py.
     """
     # First backup: only *.tmp excluded.
-    snap1 = _backup(repo, str(tree), "--exclude", "*.tmp")
-    assert any(p.endswith("cache/big.bin") for p in _stored(repo, snap1))
+    snap1 = backup(repo, str(tree), "--exclude", "*.tmp")
+    assert any(p.endswith("cache/big.bin") for p in stored_files(repo, snap1))
 
     # Now `cache` becomes excluded too. Rewriting must drop it.
     patterns = ["*.tmp", "cache"]
-    result = _restic(repo, "snapshots", "--json")
+    result = restic(repo, "snapshots", "--json")
     snaps = json.loads(result.stdout)
     target = snaps[0]["id"]
 
-    result = _restic(
+    result = restic(
         repo,
         "rewrite",
         target,
@@ -232,12 +186,12 @@ def test_restic_rewrite_forget_removes_excluded_files(repo, tree):
     assert result.returncode == 0, result.stderr
 
     # The original is gone; a rewritten snapshot remains, without `cache`.
-    result = _restic(repo, "snapshots", "--json")
+    result = restic(repo, "snapshots", "--json")
     remaining = json.loads(result.stdout)
     assert len(remaining) == 1
     assert remaining[0]["id"] != target
 
-    stored = _stored(repo, remaining[0]["id"])
+    stored = stored_files(repo, remaining[0]["id"])
     assert not any("/cache/" in p for p in stored), stored
     # Files that were never excluded are still there.
     assert any(p.endswith("keep.txt") for p in stored)
@@ -246,14 +200,14 @@ def test_restic_rewrite_forget_removes_excluded_files(repo, tree):
 def test_restic_rewrite_is_idempotent(repo, tree):
     """restic's rewrite+forget is idempotent: applying the same rules twice
     changes nothing the second time. Again, restic's behaviour, not snap-bak's."""
-    _backup(repo, str(tree), "--exclude", "*.tmp", "--exclude", "cache")
+    backup(repo, str(tree), "--exclude", "*.tmp", "--exclude", "cache")
     patterns = ["*.tmp", "cache"]
 
-    result = _restic(repo, "snapshots", "--json")
+    result = restic(repo, "snapshots", "--json")
     target = json.loads(result.stdout)[0]["id"]
 
     for _ in range(2):
-        result = _restic(
+        result = restic(
             repo,
             "rewrite",
             target,
@@ -261,10 +215,10 @@ def test_restic_rewrite_is_idempotent(repo, tree):
             "--forget",
         )
         assert result.returncode == 0, result.stderr
-        result = _restic(repo, "snapshots", "--json")
+        result = restic(repo, "snapshots", "--json")
         target = json.loads(result.stdout)[0]["id"]
 
-    stored = _stored(repo, target)
+    stored = stored_files(repo, target)
     assert not any(p.endswith(".tmp") for p in stored)
     assert not any("/cache/" in p for p in stored)
 
@@ -272,21 +226,21 @@ def test_restic_rewrite_is_idempotent(repo, tree):
 def test_restic_prune_after_rewrite_reclaims_and_stays_readable(repo, tree):
     """After rewrite+forget, prune must succeed and the repo must stay readable
     — the data still referenced survives. restic's behaviour, not snap-bak's."""
-    _backup(repo, str(tree), "--exclude", "*.tmp")
-    result = _restic(repo, "snapshots", "--json")
+    backup(repo, str(tree), "--exclude", "*.tmp")
+    result = restic(repo, "snapshots", "--json")
     target = json.loads(result.stdout)[0]["id"]
 
-    result = _restic(
+    result = restic(
         repo, "rewrite", target, "--exclude", "*.tmp", "--exclude", "cache", "--forget"
     )
     assert result.returncode == 0, result.stderr
 
-    result = _restic(repo, "prune")
+    result = restic(repo, "prune")
     assert result.returncode == 0, result.stderr
 
     # The repo is still valid and the kept files are still there.
-    result = _restic(repo, "snapshots", "--json")
+    result = restic(repo, "snapshots", "--json")
     remaining = json.loads(result.stdout)
     assert len(remaining) == 1
-    stored = _stored(repo, remaining[0]["id"])
+    stored = stored_files(repo, remaining[0]["id"])
     assert any(p.endswith("keep.txt") for p in stored)

@@ -249,7 +249,6 @@ Edit `config/config.json`:
 | `backup_window_end` | string | End of allowed backup window (HH:MM, exclusive) | `null` |
 | `ignore_file` | string | Path to file with exclude patterns | `""` |
 | `excludes` | list | List of glob patterns to exclude | `[]` |
-| `apply_excludes` | bool | Let the normal run apply these excludes to **existing** backups when there's ample window time. Changing `excludes` alone never does this | `false` |
 | `tag` | string | Restic tag override for this job's backups/forget | job name |
 | `restic_options` | list | Extra restic CLI flags for this job; global options apply to every command, backup-only options to `backup` alone | `[]` |
 
@@ -270,13 +269,12 @@ comments, `$VAR` expansion and `$$` for a literal `$`. Exclude flags are passed
 to `backup` and `rewrite` only — never to other restic commands (e.g. `forget`),
 which reject them.
 
-**Note on `apply_excludes`:** patterns only govern *future* uploads. Files
-uploaded before you added a rule stay in the repo, because restic retention
-works on whole snapshots, never on a file subset. `apply_excludes: true` lets a
-normal run retroactively remove them (via `restic rewrite … --forget`, then
-prune) when there's ample window time left and all backup work is done. It
-defaults to `false`, so editing `excludes` never silently rewrites history —
-see [Inspecting & Applying Excludes](#inspecting--applying-excludes).
+**Note:** patterns only govern *future* uploads. Files uploaded before you added
+a rule stay in the repo, because restic retention works on whole snapshots,
+never on a file subset. `snap-bak apply excludes` removes them retroactively (via
+`restic rewrite … --forget`, then prune) when you ask for it — see
+[Inspecting & Applying Excludes](#inspecting--applying-excludes). Editing
+`excludes` never silently rewrites history.
 
 **Note on `tag`:** Defaults to the job name, so `--tag <name>` is applied to
 every backup and forget. Set it to change the restic tag; use
@@ -288,7 +286,7 @@ in the remote repo). `snapshot_retention` controls local Btrfs snapshot
 cleanup (how many snapshots to keep on disk).
 
 **Note on `name` vs the mount point:** the job `name` must be filesystem-safe
-(`[A-Za-z0-9_-]`, no `/` or `..`) because it drives `<state>/<name>_status.json`
+(`[A-Za-z0-9_-]`, no `/` or `..`) because it drives `<state>/<name>.json`
 and the restic tag — but it does NOT control the mount point. The mount point
 is always `<mount_base>/<last path component of source_subvolume>` (e.g.
 `/mnt/data` → `/mnt/bak/data`), mirroring the real filesystem path. It
@@ -298,7 +296,7 @@ on the source path, so a changing mount point would force full-copy backups.
 - Mount point: `<mount_base>/<source basename>` — the read-only snapshot is
   bound here before backup (`mount -o bind,ro`)
 - restic tag: `--tag <name>` on every backup/forget (overridable via `tag`)
-- Status file: `<state_dir>/<name>_status.json`
+- State file: `<state_dir>/<name>.json`
 
 **Note on `restic_update`:** updating restic is a privileged operation handled
 by the wrapper's `update-restic` op, which validates the binary is root-owned
@@ -535,11 +533,16 @@ places it never removes files from. If a scheduled run already holds the
 repository, `--now` fails immediately rather than waiting — use `--later` and let
 the next scheduled run do it.
 
-To let ordinary scheduled runs do it automatically once you're satisfied, set
-`"apply_excludes": true` on the job. The run then applies excludes only when
-it's inside the backup window, at least half the window remains, all backup
-work is finished, and the repo is reachable and unlocked. Cleanup failures are
-logged but never affect backup results or the exit code.
+`--later` queues the rewrite in that job's state file
+(`/opt/snap-bak/state/<job>.json`, under `queued`), and the next run that has
+enough window time left, after all backup work is done, carries it out and then
+forgets it. There is no config switch for this: rewriting history is always
+something you ask for by name.
+
+The queue entry survives a failure — so a transient problem is retried at the
+next eligible window — with an attempt count that escalates the log rather than
+retrying silently for ever. Queueing the same thing twice is an error, not a
+silent no-op, and `--later` refuses outright when there is nothing to remove.
 
 ### Things worth knowing
 
@@ -557,12 +560,12 @@ logged but never affect backup results or the exit code.
   something inside an excluded directory.
 - **Rewriting is metadata-scale**, but **`prune` is not**: it repacks and
   re-uploads every affected pack, which is real network I/O on rclone backends
-  and can take minutes to hours. That's why `--later` and `apply_excludes` gate
-  on available window time. Space actually reclaimed is reported afterwards
-  from `restic stats`, and will differ from the raw-byte estimate.
+  and can take minutes to hours. That's why a queued rewrite waits for available
+  window time. Space actually reclaimed is reported afterwards from
+  `restic stats`, and will differ from the raw-byte estimate.
 - Runs are idempotent: snapshots with no matching files are skipped, so
   repeating a command converges instead of re-uploading.
-- `--later` and `apply_excludes` never touch your local filesystem.
+- Queued and immediate rewrites never touch your local filesystem.
 
 ## Environment Variables
 
@@ -583,11 +586,17 @@ All state files live under `/opt/snap-bak/state/`:
 /opt/snap-bak/state/
 ├── snap-bak.lock             # Global lock + current job info (JSON)
 ├── throughput.json           # Per-repo transfer-rate history (capped)
-├── {job_name}_status.json    # Per-job status (success/failed/skipped)
-├── {job_name}_status.json.tmp # Atomic write temp file
-├── apply_excludes_armed.json        # one-shot `apply excludes --later` arm
-└── apply_excludes_done/<job>.json   # per-job stamp (pattern digest + snapshot id)
+├── {job_name}.json            # Per-job state: last status + queued work
+└── {job_name}.json.tmp        # Atomic write temp file
 ```
+
+One file per job, holding both its last status and the work queued against it.
+There is no separate record of work already done: an empty `queued` list is the
+only statement needed that nothing is outstanding.
+
+State for a job removed from the config is deleted once it has been gone for
+`state_retention_days` (default 90). A job still in the config is never touched,
+and queued work is never discarded for being old.
 
 (Logs go to stderr — captured by the systemd journal. A file log is opt-in via `--log-file`.)
 

@@ -9,7 +9,6 @@ import logging
 import os
 import re
 import sys
-import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -226,7 +225,9 @@ RETENTION_FN: dict[str, Callable[..., list[datetime]]] = {
 class Repo(BaseModel):
     """A restic repository with metadata."""
 
-    model_config = ConfigDict(extra="ignore")
+    # "forbid" rather than "ignore": a mistyped key must be a loud config
+    # error, not a setting that silently never takes effect.
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     path: str
@@ -275,7 +276,7 @@ class Window:
 class Job(BaseModel):
     """A job's config fields (validated); resolve() binds it to a ResolvedJob."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     snapshot_dir: Path
@@ -294,10 +295,6 @@ class Job(BaseModel):
     backup_window_end: str | None = None
     ignore_file: str = ""
     excludes: list[str] = Field(default_factory=list)
-    # Retroactive removal of excluded files from existing backups. Off by
-    # default: editing `excludes` must never silently rewrite history. Only
-    # `show`/`apply excludes` or an explicitly opted-in run touch old snapshots.
-    apply_excludes: bool = False
     tag: str | None = None
     restic_options: list[str] = Field(default_factory=list)
     skip_snapshot_if_idle: bool = True
@@ -332,7 +329,7 @@ class ResolvedJob:
     job: Job
     repo: Repo
     mount_point: Path
-    status_file: Path
+    state_file: Path
     tag: str
     window: Window | None
     config_path: str | None
@@ -351,7 +348,7 @@ class ResolvedJob:
 class Config(BaseModel):
     """Top-level config model."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     repos: list[Repo]
     jobs: list[Job]
@@ -359,20 +356,10 @@ class Config(BaseModel):
     stuck_threshold: int = Field(default=DEFAULT_STUCK_THRESHOLD, ge=1)
     stuck_wait: int = Field(default=DEFAULT_STUCK_WAIT, ge=1)
     restic_update: str = "never"
-
-    def __init__(self, **data):
-        known_keys = {
-            "repos",
-            "jobs",
-            "mount_base",
-            "stuck_threshold",
-            "stuck_wait",
-            "restic_update",
-        }
-        unknown = set(data.keys()) - known_keys
-        if unknown:
-            warnings.warn(f"Unknown config keys: {unknown}")
-        super().__init__(**data)
+    # How long a job's state file survives without being touched, and how old a
+    # file for a job no longer in the config may be. Only *state* is reaped:
+    # queued work is intent and is never aged out.
+    state_retention_days: int = 90
 
     @field_validator("stuck_threshold", "stuck_wait", mode="before")
     @classmethod
@@ -421,7 +408,7 @@ class Config(BaseModel):
                 job=job,
                 repo=by_name[job.repo],
                 mount_point=Path(self.mount_base) / job.source_subvolume.name,
-                status_file=STATE_DIR / f"{job.name}_status.json",
+                state_file=STATE_DIR / f"{job.name}.json",
                 tag=job.tag or job.name,
                 window=Window.parse(job.backup_window_start, job.backup_window_end),
                 config_path=config_path,

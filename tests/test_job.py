@@ -362,7 +362,7 @@ class TestRun:
         rj = cfg.resolve()[0]
         (tmp_path / "snap").mkdir()
         write_status(
-            rj.status_file,
+            rj.state_file,
             job="j",
             status="failed",
             message="x",

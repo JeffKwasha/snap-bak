@@ -1,7 +1,7 @@
 # snap-bak Improvement Plan
 
 Date: 2026-07-25
-Status: Phase 4 in progress
+Status: Phase 5 in progress
 
 > **Historical document.** This plans the earlier Pydantic/delayed-job work and
 > is kept for context. The authoritative design for inspecting and applying
@@ -153,6 +153,33 @@ behind the window gate).
 Tests, then code, then full suite, then commit. One coherent change: the
 individual fixes only make sense as part of the collapse, since defect (3)'s
 fix is "delete the second copy of the predicate".
+
+### Phase 5: Excludes As Queued Work
+
+The completion stamp was the wrong shape and is gone. Phase 3 and 4 remembered
+"already applied" so a recurring check could skip its scan; the user's actual
+intent is a one-shot rewrite requested by hand, and an empty queue already says
+"nothing outstanding". There is now no record of completed work anywhere.
+
+| Concern | Decision |
+|---------|----------|
+| Arming | `--later` adds a task to the job's state file; `--now` runs it now. No config key schedules this, so editing `excludes` can never rewrite history by itself |
+| Task names | Declared once by the handler that implements them (`@todo.task(...)`), so a name cannot drift from its function. Stored verbatim for a human to read: `rewrite-drop-excluded-files` |
+| Success | The entry is removed. Nothing is remembered |
+| Failure | The entry stays, with `attempts` and the last restic rc, and is retried at the next eligible window. The count escalates the log; it never gates the retry, because the window gate already bounds how often this runs |
+| State | One file per job, `<state>/<name>.json`, holding the last status *and* `queued`. `write_status` carries `queued` forward — the only key it preserves |
+| Exit codes | Tasks report `job.Result`, so they reach the existing ladder. restic 10/11/12 are temporary (`delayed`, 30); anything else is `failed` (41); finding nothing is an ordinary `skipped` |
+| `--later` validation | Refuses when there is nothing to remove, and when the task is already queued |
+| Reaping | State for jobs that left the config is deleted after `state_retention_days` (90). Live jobs are never reaped; queued work is never reaped for its age |
+| Config strictness | `extra="forbid"` on Job/Repo/Config, so a typo is a load error rather than a setting that silently does nothing |
+
+Two bugs surfaced while building this and are fixed:
+
+- `ResultStatus` is a `str` mixin enum, so f-string interpolation rendered
+  `ResultStatus.SKIPPED` into the terminal and the journal. `__str__` now returns
+  the value.
+- `dispatch` cleared the queue entry only on `success`, so a task that kept
+  finding nothing to remove would rescan on every eligible window for ever.
 
 ### Phase 3: Exclude Inspection & Application
 

@@ -90,13 +90,26 @@ class TestConfig:
         assert jobs[0].repo.name == "primary"
         assert jobs[0].repo.path == "rclone:test"
         assert jobs[0].mount_point == Path("/bak") / Path(str(tmp_path)).name
-        assert jobs[0].status_file == config.STATE_DIR / "home_status.json"
+        assert jobs[0].state_file == config.STATE_DIR / "home.json"
         assert jobs[0].tag == "home"  # resolved from name
         assert jobs[0].config_path == "/tmp/cfg.json"
 
-    def test_unknown_top_level_key_warns(self, tmp_path):
-        with pytest.warns(UserWarning):
+    def test_unknown_top_level_key_is_rejected(self, tmp_path):
+        """A typo must be a loud error, not a setting that silently does nothing."""
+        with pytest.raises(ValidationError):
             Config(**_config(tmp_path, bogus_key=1))
+
+    def test_unknown_job_key_is_rejected(self, tmp_path):
+        base = _config(tmp_path)
+        data = _config(tmp_path, jobs=[{**base["jobs"][0], "exclude": ["*.tmp"]}])
+        with pytest.raises(ValidationError):
+            Config(**data)
+
+    def test_unknown_repo_key_is_rejected(self, tmp_path):
+        base = _config(tmp_path)
+        data = _config(tmp_path, repos=[{**base["repos"][0], "pasword_file": "x"}])
+        with pytest.raises(ValidationError):
+            Config(**data)
 
     def test_empty_repos_rejected(self, tmp_path):
         with pytest.raises(ValidationError):

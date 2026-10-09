@@ -27,29 +27,25 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 
-from snap_bak import excludes, job, restic
+from snap_bak import excludes, job, restic, todo
 
 logger = logging.getLogger(__name__)
 
-# Outcome.status values. Plain strings, and deliberately not job.ResultStatus:
-# an apply outcome is never fed to exit_code(), so this phase cannot move the
-# run's exit code.
-APPLIED = "applied"
-NOOP = "noop"
-FAILED = "failed"
-DRY_RUN = "dry-run"
-
+# restic exit codes we can say something useful about.
 LOCKED_ADVICE = (
     "another restic holds the repository lock; "
     "use `apply excludes --later` to rewrite on the next scheduled run"
 )
 
-# restic exit codes we can say something useful about.
 _PREFLIGHT_REASONS = {
     10: "repository does not exist",
     11: "repository is locked by another restic",
     12: "wrong password",
 }
+
+# restic codes that mean "not now" rather than "not ever": the repo may well be
+# there on the next eligible window, so the task is delayed, not failed.
+_RETRYABLE = frozenset({10, 11, 12})
 
 
 def payload(job_name: str, root: str, found: excludes.ExclusionSet) -> dict:
@@ -120,26 +116,6 @@ class Plan:
         return body
 
 
-@dataclass(frozen=True)
-class Outcome:
-    """What executing a plan did.
-
-    Not a `job.Result`: that is the type exit_code() consumes, and keeping the
-    types apart makes "apply cannot change the run's exit code" structural
-    rather than a property of how each status happens to fall through the
-    ladder. `rc` is the restic exit code when there was one, so a caller can
-    distinguish a locked repo (11) from a missing one (10).
-    """
-
-    status: str
-    detail: str
-    rc: int | None = None
-
-    @property
-    def ok(self) -> bool:
-        return self.status in (APPLIED, NOOP, DRY_RUN)
-
-
 def plan(runner) -> Plan:
     """Scan this job's stored snapshots and decide what a rewrite would remove.
 
@@ -167,7 +143,7 @@ def plan(runner) -> Plan:
         label = snap.get("short_id") or snapshot_id[:8]
         try:
             listing = runner.repo_listing(snapshot_id)
-        except Exception as e:  # noqa: BLE001 - one bad snapshot is not fatal
+        except Exception as e:
             logger.error("%s: cannot list snapshot %s: %s", runner.job.name, label, e)
             continue
         excludes.collect_from_listing(listing, label, parsed, into=found)
@@ -188,19 +164,25 @@ def plan(runner) -> Plan:
     )
 
 
-def execute(runner, p: Plan) -> Outcome:
+def execute(runner, p: Plan) -> job.Result:
     """Perform the plan: preflight, then one rewrite. Never raises.
 
     Ordered so that every failure is harmless: the preflight refuses before
     anything is modified, a failed rewrite leaves the originals in place, and
     the caller's prune leaves the data merely unreclaimed rather than deleted.
 
+    Reports a `job.Result`, the same type a backup produces, so the outcome
+    reaches the run's exit-code ladder through exactly one path. A rewrite the
+    user asked for and that did not happen is worth a non-zero exit; a rewrite
+    that found nothing to do is an ordinary skip.
+
     Pruning is not done here — rewrite is per job, prune is per repo, and the
     caller merges them into the run's single prune pass.
     """
+    name = p.job
     if p.empty:
-        return Outcome(
-            NOOP, f"no excluded files in {p.job}'s snapshots; nothing to remove"
+        return job.Result(
+            name, job.ResultStatus.SKIPPED, "no excluded files in stored snapshots"
         )
 
     logger.info(
@@ -216,8 +198,8 @@ def execute(runner, p: Plan) -> Outcome:
         logger.info("  ... and %d more", len(p.found.entries) - 20)
 
     if runner.dry_run:
-        return Outcome(
-            DRY_RUN, f"would rewrite {len(p.snapshot_ids)} snapshot(s)"
+        return job.Result(
+            name, job.ResultStatus.DRY_RUN, f"would rewrite {len(p.snapshot_ids)} snapshot(s)"
         )
 
     refused = preflight(runner)
@@ -228,13 +210,24 @@ def execute(runner, p: Plan) -> Outcome:
     try:
         runner.run_command(list(p.command))
     except subprocess.CalledProcessError as e:
-        return Outcome(
-            FAILED,
+        status = (
+            job.ResultStatus.DELAYED
+            if e.returncode in _RETRYABLE
+            else job.ResultStatus.FAILED
+        )
+        todo.record_attempt(
+            runner.state_file, TASK_NAME, rc=e.returncode, error="rewrite failed"
+        )
+        return job.Result(
+            name,
+            status,
             f"rewrite failed (rc={e.returncode}); original snapshots intact",
-            rc=e.returncode,
         )
     except subprocess.TimeoutExpired:
-        return Outcome(FAILED, "rewrite timed out; original snapshots intact")
+        todo.record_attempt(runner.state_file, TASK_NAME, rc=None, error="timed out")
+        return job.Result(
+            name, job.ResultStatus.DELAYED, "rewrite timed out; originals intact"
+        )
     logger.info(
         "%s: rewrote %d snapshot(s) in %ds",
         p.job,
@@ -242,41 +235,39 @@ def execute(runner, p: Plan) -> Outcome:
         int(time.monotonic() - started),
     )
 
-    # Stamp it so the next run skips the scan. The stamp records the snapshot
-    # id *after* the rewrite, because `rewrite --forget` replaces the originals
-    # with new ids: stamping the pre-rewrite id would make every subsequent run
-    # rescan in full and restamp.
-    if not runner.dry_run:
-        job.write_stamp(
-            runner.job.name,
-            runner.repo.path,
-            excludes.patterns_for_job(runner.job),
-            newest_id(runner),
-        )
-    return Outcome(
-        APPLIED,
+    return job.Result(
+        name,
+        job.ResultStatus.SUCCESS,
         f"rewrote {len(p.snapshot_ids)} snapshot(s), "
         f"{excludes.human_bytes(p.total_size)} excluded",
     )
 
 
-def preflight(runner) -> Outcome | None:
+def preflight(runner) -> job.Result | None:
     """Refuse before modifying anything; None when the repo is usable.
 
-    Nothing has changed when this runs, so refusing is always safe.
+    Nothing has changed when this runs, so refusing is always safe. A repo that
+    is missing, locked or unreadable is a temporary problem that the next
+    eligible window will retry, so it reports as delayed rather than failed.
     """
     try:
         rc = runner.repo_ping()
     except subprocess.TimeoutExpired:
-        return Outcome(
-            FAILED,
+        todo.record_attempt(
+            runner.state_file, TASK_NAME, rc=None, error="preflight timed out"
+        )
+        return job.Result(
+            runner.job.name,
+            job.ResultStatus.DELAYED,
             "preflight refused: repository unreachable (timed out); nothing changed",
         )
     if rc is None:
         return None
     why = _PREFLIGHT_REASONS.get(rc, "repository not usable")
-    return Outcome(
-        FAILED, f"preflight refused: {why} (rc={rc}); nothing changed", rc=rc
+    status = job.ResultStatus.DELAYED if rc in _RETRYABLE else job.ResultStatus.FAILED
+    todo.record_attempt(runner.state_file, TASK_NAME, rc=rc, error=why)
+    return job.Result(
+        runner.job.name, status, f"preflight refused: {why} (rc={rc}); nothing changed"
     )
 
 
@@ -303,6 +294,35 @@ def _rewrite_cmd(runner, snapshot_ids) -> list[str]:
     )
 
 
-def newest_id(runner) -> str | None:
+def warns_on_newest(runner, p: Plan) -> bool:
+    """True when the newest snapshot still holds files the excludes should skip.
+
+    The backup that ran moments before this rewrote using the job's current
+    excludes, so its snapshot should hold nothing to remove. Matches there mean
+    the backup path is not honouring the excludes — a real bug that would
+    otherwise be hidden, because the rewrite quietly cleans up after it.
+    """
     snaps = runner.repo_snapshots()
-    return snaps[0]["id"] if snaps else None
+    if not snaps or not p.snapshot_ids:
+        return False
+    return snaps[0]["id"] in p.snapshot_ids
+
+# --- the queued task --------------------------------------------------------
+
+# Named here, once, and declared to the registry by the handler that implements
+# it. The name is what a human reads in `<job>.json`, so it says both the restic
+# operation and the goal rather than being an internal identifier.
+TASK_NAME = "rewrite-drop-excluded-files"
+
+
+@todo.task(TASK_NAME)
+def rewrite_drop_excluded(runner, entry) -> tuple[job.Result, set[str]]:
+    """Remove this job's excluded files from snapshots restic already holds.
+
+    Uses the job's *current* excludes, the same list the backup that ran
+    moments earlier used, so there is nothing to pin and no variant to carry.
+    Returns the repos it made prunable, which the run folds into its single
+    prune pass.
+    """
+    result = execute(runner, plan(runner))
+    return result, {runner.repo.path} if result.status == job.ResultStatus.SUCCESS else set()

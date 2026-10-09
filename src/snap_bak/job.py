@@ -318,6 +318,15 @@ def delay_from_status(data: dict | None) -> DelayState:
     return delay
 
 
+# `write_status` rewrites the job's whole state file on every status transition,
+# so the queued list has to survive those writes. It is the only key carried
+# forward: the rest of the document reports the run that just happened, while
+# `queued` records work that has not happened yet. Declared here as a literal
+# rather than copying every unrecognised key forward, so a typo in a key name is
+# dropped rather than preserved forever.
+_CARRIED_FORWARD_KEYS = ("queued",)
+
+
 def write_status(
     path: Path,
     *,
@@ -342,6 +351,10 @@ def write_status(
                 if key == "snapshot_time"
                 else value
             )
+    existing = read_status(path) or {}
+    for key in _CARRIED_FORWARD_KEYS:
+        if key not in data and existing.get(key) is not None:
+            data[key] = existing[key]
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(path)
@@ -357,8 +370,14 @@ class ResultStatus(str, Enum):
     RETENTION_OK = "retention_ok"
     RETENTION_FAILED = "retention_failed"
     # There is deliberately no status for an apply-excludes result. Those are
-    # `apply.Outcome`, a different type, so an apply can never be mistaken for a
+    # `job.Result`, a different type, so an apply can never be mistaken for a
     # backup result nor reach exit_code().
+
+    def __str__(self) -> str:
+        # Without this, f-string interpolation renders "ResultStatus.SKIPPED"
+        # rather than "skipped", which is what reaches the user's terminal and
+        # the journal.
+        return self.value
 
 
 @dataclass
@@ -411,113 +430,6 @@ def _median(values):
     return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) // 2
 
 
-# --- applying excludes to existing backups (opt-in, gated) ---------------
-
-# Two facts with different lifecycles, so two files. The arm is a *request*,
-# consumed once whatever the outcome; the stamp is a *record* of completion that
-# outlives the run. Naming them pending/done made them read like two states of
-# one thing, which they are not.
-ARM_FILE = "apply_excludes_armed.json"
-DONE_DIR = "apply_excludes_done"
-
-
-def arm_file() -> Path:
-    """Path of the one-shot `apply excludes --later` arm."""
-    return config.STATE_DIR / ARM_FILE
-
-
-def done_dir() -> Path:
-    """Directory holding one completion stamp per job."""
-    return config.STATE_DIR / DONE_DIR
-
-
-def completion_stamp(job_name: str) -> Path:
-    """Path of the record that a job's patterns were already applied.
-
-    One file per job, inside a directory: job names are validated as
-    `[A-Za-z0-9_-]+` (config.py), the same guarantee that lets them name
-    `<job>_status.json`.
-    """
-    return done_dir() / f"{job_name}.json"
-
-
-def read_pending() -> list[str]:
-    """Job names armed by `--later`, or [] when nothing is armed.
-
-    Tolerates a missing or corrupt file: an unreadable arm must not wedge a run,
-    it just means nothing is armed.
-    """
-    try:
-        data = json.loads(arm_file().read_text())
-    except (OSError, ValueError):
-        return []
-    jobs = data.get("jobs") if isinstance(data, dict) else None
-    return [str(j) for j in jobs] if isinstance(jobs, list) else []
-
-
-def consume_pending() -> list[str]:
-    """Read the armed job names and clear the arm, whatever the outcome.
-
-    One-shot by construction: a run either uses the arm or drops it, so an arm
-    never lingers to surprise-runs days later.
-    """
-    jobs = read_pending()
-    try:
-        arm_file().unlink()
-    except OSError:
-        pass
-    return jobs
-
-
-def stamp_current(
-    job_name: str, repo_path: str, patterns: list[str], newest_snapshot: str | None
-) -> bool:
-    """True when these patterns were already applied and nothing is newer.
-
-    Cheap enough to check every run, which is the point: with
-    `apply_excludes` on, an unchanged repo must cost one `restic snapshots` call
-    rather than a per-snapshot `restic ls`. Adding or reordering a pattern
-    changes the digest and forces a rescan; so does a newer snapshot.
-
-    Keyed by job, not merely by repo. Several jobs commonly share one restic
-    repo with different excludes and different ignore_files, so a single shared
-    file meant each job's write invalidated the last and every run rescanned in
-    full — the network cost the stamp exists to avoid, paid on every run.
-    """
-    try:
-        stamp = json.loads(completion_stamp(job_name).read_text())
-    except (OSError, ValueError):
-        return False
-    return (
-        stamp.get("job") == job_name
-        and stamp.get("repo") == repo_path
-        and stamp.get("digest") == excludes.patterns_digest(patterns)
-        and stamp.get("newest_snapshot") == newest_snapshot
-    )
-
-
-def write_stamp(
-    job_name: str, repo_path: str, patterns: list[str], newest_snapshot: str | None
-) -> None:
-    """Record a completed apply so the next run can skip the scan.
-
-    Written only on success — a failed apply must be retried, not remembered.
-    """
-    config.STATE_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "job": job_name,
-        "repo": repo_path,
-        "digest": excludes.patterns_digest(patterns),
-        "newest_snapshot": newest_snapshot,
-        "applied_at": datetime.now(timezone.utc).isoformat(),
-    }
-    target = completion_stamp(job_name)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    tmp.replace(target)
-
-
 def half_window_remaining(rj) -> bool:
     """True when at least half the backup window is still ahead.
 
@@ -555,12 +467,12 @@ class Runner:
         self.job = job.job
         self.repo = job.repo
         self.mount_point = job.mount_point
-        self.status_file = job.status_file
+        self.state_file = job.state_file
         self.tag = job.tag
         self.window = job.window
         self.dry_run = dry_run
         self.repo_state = repo_state or {}
-        self.last_status = read_status(self.status_file)
+        self.last_status = read_status(self.state_file)
         self.delay = delay_from_status(self.last_status)
         self._last_restic_snapshot_id = None
 
@@ -621,7 +533,7 @@ class Runner:
     def _write_status(self, status, message, **fields):
         if not self.dry_run:
             write_status(
-                self.status_file,
+                self.state_file,
                 job=self.job.name,
                 status=status,
                 message=message,
@@ -630,7 +542,7 @@ class Runner:
             )
 
     def _check_stale_tmp(self):
-        tmp = self.status_file.with_suffix(".json.tmp")
+        tmp = self.state_file.with_suffix(".json.tmp")
         if not tmp.exists():
             return
         try:
@@ -1072,7 +984,7 @@ class Runner:
         """Mount read-only, reusing a prior mount of the same snapshot; safe across restarts."""
         config.STATE_DIR.mkdir(parents=True, exist_ok=True)
         if not self.dry_run:
-            self.status_file.touch()
+            self.state_file.touch()
             logger.debug("Status file touched")
 
         mount_point = self.mount_point

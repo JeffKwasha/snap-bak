@@ -20,7 +20,6 @@ import os
 import subprocess
 import sys
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 from snap_bak import apply
@@ -28,6 +27,7 @@ from snap_bak import config
 from snap_bak import excludes
 from snap_bak import job
 from snap_bak import snapshot as snapshot_model
+from snap_bak import todo
 
 logger = logging.getLogger(__name__)
 
@@ -301,21 +301,49 @@ def _plan(jobs: list, as_json: bool, limit: int | None) -> int:
 
 
 def _arm(jobs: list, as_json: bool) -> int:
-    """Record a one-shot request for the next scheduled run to act on.
+    """Queue the rewrite for each job's next scheduled run.
 
-    Lives in the state dir rather than config so it needs no write access to the
-    root-owned config file, and is consumed (never reused) by that run.
+    Validates before queueing. The user has just been told by `show excludes
+    --repo` what would be removed, but there is no reason to queue work that
+    provably has nothing to do — an empty repo means the store went empty or
+    retention took everything, which is a problem to notice, not a rewrite to
+    schedule. The plan is the same read-only call the dry-run already makes.
+
+    Writes to the state dir, never the config: the config is root-owned and
+    declarative, and it must never carry a request.
     """
-    config.STATE_DIR.mkdir(parents=True, exist_ok=True)
-    pending = job.arm_file()
-    armed = {
-        "jobs": [rj.job.name for rj in jobs],
-        "armed_at": datetime.now(timezone.utc).isoformat(),
-    }
-    pending.write_text(json.dumps(armed, indent=2))
-    logger.info(f"armed: the next scheduled run will apply excludes ({pending})")
+    queued, refused = [], []
+    for rj in jobs:
+        runner = job.Runner(rj)
+        p = apply.plan(runner)
+        if p.empty:
+            detail = (
+                "no snapshots hold files matching this job's excludes"
+                if not runner.repo_snapshots()
+                else "no stored file matches this job's excludes"
+            )
+            logger.error("%s: refusing to queue: %s", rj.job.name, detail)
+            refused.append({"job": rj.job.name, "reason": detail})
+            continue
+        try:
+            # The global lock is refused, not waited on: queueing during a run
+            # would race the run reading this same file.
+            with job.GlobalLock():
+                entry = todo.arm_task(rj.state_file, apply.TASK_NAME)
+            queued.append({"job": rj.job.name, **entry})
+        except ValueError as e:
+            logger.error("%s: %s", rj.job.name, e)
+            refused.append({"job": rj.job.name, "reason": str(e)})
+
+    for entry in queued:
+        logger.info(
+            "queued %s for %s; the next scheduled run will do it",
+            entry["task"], entry["job"],
+        )
     if as_json:
-        print(json.dumps({"armed": armed}, indent=2))
+        print(json.dumps({"queued": queued, "refused": refused}, indent=2))
+    if refused and not queued:
+        return config.EXIT_ERROR
     return config.EXIT_SUCCESS
 
 
@@ -326,15 +354,21 @@ def _apply_now(jobs: list, as_json: bool) -> int:
     outcome is reported rather than raised. No lock is taken — restic serializes
     on the repository's own lock, so a contended run fails instantly below and
     the answer is `--later`, which rides the next scheduled run.
+
+    A matching queue entry is cleared as the rewrite succeeds, so the queue only
+    ever holds work that has not been done.
     """
     results = []
     pruned: dict[str, config.ResolvedJob] = {}
     for rj in jobs:
         runner = job.Runner(rj)
-        outcome = apply.execute(runner, apply.plan(runner))
-        results.append(_outcome_json(rj.job.name, outcome))
-        if outcome.status == apply.APPLIED:
+        result = apply.execute(runner, apply.plan(runner))
+        if result.status == job.ResultStatus.SUCCESS:
             pruned.setdefault(runner.repo.path, rj)
+            if any(e["task"] == apply.TASK_NAME for e in todo.queued_tasks(rj.state_file)):
+                todo.clear_task(rj.state_file, apply.TASK_NAME)
+                logger.info("cleared the queued rewrite: it just ran")
+        results.append(_result_json(result))
 
     # Prune is a repo-level concern: one pass reclaims everything every rewrite
     # left unreferenced, rather than one pass per job on a shared repo.
@@ -347,7 +381,6 @@ def _apply_now(jobs: list, as_json: bool) -> int:
                 if prune.status == job.ResultStatus.RETENTION_OK
                 else "prune-failed",
                 "detail": prune.reason or "reclaimed the rewritten space",
-                "rc": None,
             }
         )
 
@@ -364,60 +397,61 @@ def _apply_now(jobs: list, as_json: bool) -> int:
     )
 
 
-def _outcome_json(job_name: str, outcome: apply.Outcome) -> dict:
-    detail = outcome.detail
-    if outcome.rc == 11:
+def _result_json(result: job.Result) -> dict:
+    detail = result.reason or ""
+    if "rc=11" in detail:
         detail = f"{detail}; {apply.LOCKED_ADVICE}"
-    return {"job": job_name, "status": outcome.status, "detail": detail, "rc": outcome.rc}
+    return {"job": result.name, "status": result.status, "detail": detail}
 
 
-def _apply_excludes_phase(runs: list, *, armed: set[str]) -> set[str]:
-    """Retroactively drop excluded files from stored snapshots, gated per job.
+def _apply_excludes_phase(runs: list) -> tuple[list, set[str]]:
+    """Run whatever work each job has queued, and say what to prune.
 
-    Returns the repos whose space the run's single prune must reclaim.
+    Returns the task results (folded into the run's own results, so a rewrite the
+    user asked for and that failed shows up in the exit code) and the repos whose
+    space the run's single prune must reclaim.
 
     Every gate is a *skip*, never a failure: removing files the user has not
-    inspected must not be able to change a backup result or the run's exit code.
-    Cheapest first:
+    inspected must not be able to change a backup result. Cheapest first:
 
-      1. armed: `apply_excludes: true`, or named by a `--later` arm
-      2. the job has excludes at all
-      3. inside the backup window (a job with no window is never time-boxed)
-      4. at least half the window remains — "ample time"
-      5. the completion stamp is not already current (nothing newer to remove)
+      1. inside the backup window (a job with no window is never time-boxed)
+      2. at least half the window remains — "ample time"
 
-    Takes Runners, not ResolvedJobs, so the only thing available here is a
-    resolved Runner's public surface — which is what made the previous version
-    confuse Job with ResolvedJob and raise AttributeError on first use.
+    The queue is the only arming mechanism, so there is no record of completed
+    work to consult and nothing accumulates here.
     """
+    results: list = []
     to_prune: set[str] = set()
     for runner in runs:
-        name = runner.job.name
-        if not (runner.job.apply_excludes or name in armed):
+        if not todo.queued_tasks(runner.state_file):
             continue
         if not (runner.job.excludes or runner.job.ignore_file):
+            logger.info("%s: queued work skipped (no excludes configured)", runner.job.name)
             continue
         if not runner.within_backup_window():
-            logger.info("%s: apply excludes skipped (outside backup window)", name)
+            logger.info("%s: queued work skipped (outside backup window)", runner.job.name)
             continue
         if not job.half_window_remaining(runner):
             logger.info(
-                "%s: apply excludes skipped (less than half the backup window remains)",
-                name,
+                "%s: queued work skipped (less than half the backup window remains)",
+                runner.job.name,
             )
             continue
-        patterns = excludes.patterns_for_job(runner.job)
-        if job.stamp_current(
-            runner.job.name, runner.repo.path, patterns, apply.newest_id(runner)
-        ):
-            logger.info("%s: apply excludes skipped (already applied)", name)
-            continue
 
-        outcome = apply.execute(runner, apply.plan(runner))
-        logger.info("%s: apply excludes %s: %s", name, outcome.status, outcome.detail)
-        if outcome.status == apply.APPLIED:
-            to_prune.add(runner.repo.path)
-    return to_prune
+        if apply.warns_on_newest(runner, apply.plan(runner)):
+            logger.warning(
+                "%s: the newest snapshot still holds excluded files, so the "
+                "backup that just ran is not applying this job's excludes",
+                runner.job.name,
+            )
+
+        result, repos = todo.dispatch(runner.state_file, runner)
+        if result is None:
+            continue
+        logger.info("%s: %s: %s", runner.job.name, result.status, result.reason)
+        results.append(result)
+        to_prune |= repos
+    return results, to_prune
 
 
 class _RefuseSelector(argparse.Action):
@@ -642,14 +676,13 @@ def _run_orchestrator(args) -> None:
             results.append(r.run())
             job.touch_global_lock()
 
-        # Phase A2 — retroactively drop excluded files from stored snapshots, for
-        # the jobs that asked for it (`apply_excludes: true`, or a `--later` arm,
-        # consumed here whatever the outcome). Its outcomes are logged rather
-        # than appended to `results`: removing data a user has not inspected must
-        # not be able to change a backup result or this run's exit code.
-        rewritten_repos = _apply_excludes_phase(
-            runners, armed=set(job.consume_pending())
-        )
+        # Phase A2 — carry out whatever work each job has queued. Runs after
+        # backups so the newest snapshot is already in the repo, which is also
+        # what makes it a check: that snapshot was taken with the job's current
+        # excludes, so if it still holds excluded files the backup path is not
+        # honouring them.
+        task_results, rewritten_repos = _apply_excludes_phase(runners)
+        results.extend(task_results)
 
         # Phase B — retention serially per job.
         forgotten_repos: set[str] = set()
@@ -667,6 +700,13 @@ def _run_orchestrator(args) -> None:
         for repo_path in sorted(rewritten_repos | forgotten_repos):
             rep = next(r for r in runners if r.repo.path == repo_path)
             results.append(rep.prune())
+
+        # Housekeeping last: only ever removes state for jobs that have left the
+        # config, and never queued work. Failure is logged, never fatal.
+        try:
+            todo.reap(cfg, {r.job.name for r in runners})
+        except OSError as e:
+            logger.warning("Could not reap stale state: %s", e)
 
         # Exit codes for monitoring: a *backup* failure is permanent; retention
         # failure alone is not (data is safe, prune retries next run). The

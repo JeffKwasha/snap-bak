@@ -236,7 +236,7 @@ integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 
 | Field | Type | Default | Constraint | Description |
 |-------|------|---------|------------|-------------|
-| `name` | string | required | `[A-Za-z0-9_-]` | Job id; must be filesystem-safe (`<state>/<name>_status.json`, restic tag). Does NOT set the mount point |
+| `name` | string | required | `[A-Za-z0-9_-]` | Job id; must be filesystem-safe (`<state>/<name>.json`, restic tag). Does NOT set the mount point |
 | `snapshot_dir` | string | required | must exist | Path to btrfs snapshot directory |
 | `source_subvolume` | string | required | — | Btrfs subvolume to snapshot; mount point = `<mount_base>/<last component>` |
 | `repo` | string | required | must reference repo.name | Repo to backup to |
@@ -250,7 +250,6 @@ integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 | `backup_window_end` | string | `null` | `HH:MM` format | Backup window end (optional) |
 | `ignore_file` | string | `""` | — | Restic exclude-from file |
 | `excludes` | list | `[]` | — | Restic exclude patterns |
-| `apply_excludes` | bool | `false` | — | Allow the normal run to apply this job's exclude patterns to **existing** backups (retroactive removal). See Excludes: Inspection & Application. Changing `excludes` alone never triggers this |
 | `tag` | string | job name | `[A-Za-z0-9_-]` | Restic tag override |
 | `restic_options` | list | `[]` | — | Extra restic CLI flags for this job; global options apply to every command, backup-only options to `backup` alone |
 
@@ -275,7 +274,8 @@ manages itself are filtered out with a warning if a config author sets them:
 
 ## Status File
 
-Per-job status stored at `/opt/snap-bak/state/<job_name>_status.json`.
+Per-job state stored at `/opt/snap-bak/state/<job_name>.json` — the last status
+plus that job's queued work.
 
 ### Schema
 
@@ -492,7 +492,8 @@ removes exactly those files from **existing** snapshots.
 2. **Snapshots are never mounted to test patterns.** Matching runs against the
    path *strings* restic stored, so no mount can race an in-flight backup.
 3. **Editing `excludes` alone changes nothing retroactively.** Removal requires
-   an explicit `apply` (`--now` / `--later`) or `apply_excludes: true` in config.
+   an explicit `apply` (`--now` / `--later`). There is no config key that
+   schedules it.
 4. **No persistent config key arms removal implicitly.** The default is `off`.
 5. **The dry-run and the run are the same plan.** `plan()` decides scope and
    `execute()` performs it; `show excludes --repo`, the `apply` dry-run, and
@@ -593,7 +594,15 @@ reported separately and is the authoritative figure.
 ### `apply excludes`
 
 Dry-run by default: prints affected snapshot IDs, projected bytes, and the exact
-`restic rewrite` command that `--now` would run. Only `--now` mutates.
+`restic rewrite` command that `--now` would run. Only `--now` and the scheduled
+run mutate.
+
+`--later` **queues** the rewrite as `rewrite-drop-excluded-files` on that job's
+state file, after checking there is genuinely something to do: a job whose repo
+has no snapshots holding excluded files is refused rather than queued. An empty
+repo means the store went empty or retention took everything, which is a
+problem to notice, not a rewrite to schedule. Queuing a task that is already
+queued is an error, not a silent no-op.
 
 Execution order (each step is separately failure-isolated):
 
@@ -641,67 +650,78 @@ run's exit code or be mistaken for a backup result.
 
 ### Arming a scheduled cleanup
 
-Two mechanisms, one execution path:
+There is exactly one arming mechanism: the queue. `--later` adds a task to that
+job's state file; the next eligible run performs it and removes the entry. There
+is no config key that schedules this, so editing `excludes` alone can never
+rewrite history.
 
 | Mechanism | Scope | Meaning |
 |-----------|-------|---------|
-| `apply_excludes: true` (job config) | persistent | the normal run may apply, when gated |
-| `--later` | one-shot | arm the next run without editing config |
+| `--later` | one-shot | the next eligible run does this, then forgets it |
 
-`--later` writes `<state>/apply_excludes_armed.json`; the next run consumes it
-once, whatever the outcome and regardless of the config key. `--now` persists
-nothing. Either way, applying twice is harmless: a snapshot with nothing to
-exclude is skipped, so repeated runs converge instead of re-uploading identical
-trees.
+`--now` performs it immediately and clears any matching queue entry.
+
+A task that fails or is delayed **keeps** its entry, so it is retried at the next
+eligible window, with `attempts` and the last restic exit code recorded so a
+persistent failure escalates in the log rather than retrying nightly in silence.
+The attempt count deliberately does not gate the retry: the window gates already
+bound how often this runs — at most once per eligible window — and the operation
+is idempotent, so re-running is safe.
+
+A task name is declared once, by the handler that implements it
+(`@todo.task("rewrite-drop-excluded-files")`), and the registry is built from
+those declarations, so a name cannot drift from the function it names. Names are
+stored verbatim in the state file and read by a human wondering what a queued
+run will do, so they read as the restic operation plus its goal.
 
 ### Run-time gate
 
-With `apply_excludes: true` (or a `--later` arm), the run applies excludes only
-when **all** hold, evaluated after backups complete, cheapest first:
+Queued work runs only when **all** hold, evaluated after backups complete,
+cheapest first:
 
-1. Armed at all — the config key, or a name in the consumed arm.
+1. The job has something queued.
 2. The job has excludes to apply.
 3. Inside the job's backup window.
 4. At least **half** the window length remains.
 5. Repo reachable and unlocked.
 6. At least one snapshot actually contains a matching file.
-7. The completion stamp is not already current.
 
 `rewrite` is metadata-scale — it rebuilds and re-uploads *tree* blobs only; file
 data blobs stay shared with the original snapshot — which is what makes a cheap
 gate sufficient. No duration estimate is needed.
 
-Phase order is **backups → apply-excludes → retention(forget) → prune**, and the
-apply phase registers its repos into the prune set alongside retention's, so a
+Phase order is **backups → queued work → retention(forget) → prune**, and the
+work phase registers its repos into the prune set alongside retention's, so a
 single prune per repo reclaims both. A repo whose job has no `backup_retention`
-is still pruned if apply made data there unreferenced. A cleanup failure logs
-loudly with the failing phase and restic exit code, and **never** changes backup
-results or the run's exit code.
+is still pruned if a task made data there unreferenced.
+
+Queued work is the only thing this phase runs, and it is the only work a user
+asked for by name, so its outcome joins the run's own results and reaches the
+exit-code ladder. A task that fails or is delayed reports non-zero; a task that
+found nothing to do reports as an ordinary skip and changes nothing. The ladder
+accumulates with `any()` over all results, so a task can never mask a backup
+outcome.
+
+A repo that is missing, locked or unreadable (restic 10/11/12) is a *temporary*
+problem and reports as `delayed` (exit 30) — it may well be fine on the next
+window. Any other restic failure reports as `failed` (exit 41), because it will
+not fix itself until the config changes.
+
+**A check, not a gate.** The backup that just ran used the job's current
+excludes, so its snapshot should hold nothing to remove. If the plan finds
+matches in the newest snapshot anyway, the run logs a warning: the backup path is
+not honouring the excludes. The rewrite still proceeds — the data ends up
+correct — but the bug gets named instead of being quietly cleaned up after.
+
+A dry run reports and returns without touching the queue at all: simulating a run
+must not consume the request the real run is waiting for.
 
 Failures are never retried by a counter. A transient repo problem (unreachable,
 locked) breaks every restic operation in the run equally, so the ordinary run
-logic already handles it and the next run simply re-evaluates the gate; the
+logic already handles it and the next eligible window simply tries again; the
 operation is idempotent, so re-running is safe. What snap-bak must not do is
 retry silently forever — hence the loud log naming the failing phase and exit
-code, and no completion stamp on failure (so the next run does try again).
-
-### Completion stamp
-
-`<state>/apply_excludes_done/<job>.json` records the job, the repo, a digest of
-the pattern set, and the newest snapshot id at apply time. While it is current,
-the run skips the scan entirely — so a persistent `apply_excludes: true` costs one
-`restic snapshots` call, not a per-snapshot `restic ls`. Adding or reordering a
-pattern changes the digest and forces a rescan, as does a new backup appearing
-after the stamp. The stamp is only written on success.
-
-**One file per job, not per repo.** Jobs routinely share one restic repo while
-carrying different `excludes` and different `ignore_file`s, so a stamp keyed only
-by repo would be overwritten by whichever job applied last. Every job would then
-read as not-current and rescan in full — the network cost the stamp exists to
-avoid, paid on every run. The job name is part of the key and of the payload.
-
-The digest joins patterns with NUL before hashing, so `["ab","c"]` and
-`["a","bc"]` cannot collide.
+code, and the retained queue entry with its attempt count.
 
 ### IO & duration
 
@@ -760,15 +780,28 @@ per-job lock would add complexity without additional protection.
 <install>/state          # owned by snap-bak: runtime state
   snap-bak.lock          # Global lock file
   throughput.json        # Per-repo transfer-rate history
-  <job_name>_status.json # Per-job status
-  apply_excludes_armed.json          # one-shot `apply excludes --later` arm
-  apply_excludes_done/<job>.json     # per-job completion stamp (digest + snapshot id)
+  <job_name>.json        # Per-job state: last status + that job's queued work
 
 <install>/excludes       # ignore_file location (root:snap-bak)
 <install>/passwords      # per-repo restic password files (owned by the admin, group snap-bak)
 <install>/cache          # restic cache (service-owned, real dir)
 <install>/.cache         # symlink -> cache; restic's implicit $HOME/.cache default
 ```
+
+One file per job, holding both that job's last status and the work queued
+against it. Keeping them together is deliberate: an entry in `queued` *is* the
+record that the work was requested, so nothing else has to remember it, and
+there is no record of completed work anywhere. An empty queue is the only thing
+that means "nothing outstanding".
+
+`write_status` rewrites the whole document on every status transition, so
+`queued` is the one key carried forward (`job._CARRIED_FORWARD_KEYS`).
+
+State for a job that has left the config is deleted once it has been gone for
+`state_retention_days` (default 90). A job still in the config is never reaped —
+its file is rewritten every run, and reaping it would reset the missed-slot
+escalation that drives priority. Queued work is never reaped: an entry is a
+request from a human.
 
 All paths are relative to the install directory (`<install>`, production
 `/opt/snap-bak`). The `restic` and `rclone` binaries are optional (rclone only
@@ -955,7 +988,9 @@ come only from root-owned config.
 - Exclude lint diagnostics (unanchored/anchored/never-matching patterns)
 - `restic ls --long` parsing (filenames with spaces, UTF-8)
 - Per-snapshot excludes table rendering + `--limit` truncation
-- `apply excludes` gate logic + completion stamp (injected clock)
+- Queued-task dispatch: arming, duplicate refusal, success clearing the entry,
+  failure retaining it with an attempt count, unknown task names
+- `apply excludes` gate logic (injected clock)
 - `apply excludes` end-to-end against a throwaway local restic repo
 - sudo-exec.py wrapper validation and path confinement
 - Failed backup handling

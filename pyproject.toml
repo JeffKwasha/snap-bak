@@ -22,6 +22,15 @@ build-backend = "setuptools.build_meta"
 [tool.pytest.ini_options]
 tmp_path_retention_policy = "none"
 
+[tool.ruff.lint.flake8-tidy-imports]
+# Tests must use pytest's tmp_path, which pytest always reaps. tempfile is
+# invisible to that and leaks a directory per test; see tests/AGENTS.md.
+# conftest.py is exempt because it must redirect state before any fixture exists.
+banned-api = { "tempfile.mkdtemp" = { msg = "use pytest's tmp_path/tmp_path_factory" }, "tempfile.mkstemp" = { msg = "use pytest's tmp_path/tmp_path_factory" } }
+
+[tool.ruff.lint.per-file-ignores]
+"tests/conftest.py" = ["TID251"]
+
 [tool.pyright]
 venvPath = "."
 venv = ".venv"

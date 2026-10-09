@@ -53,9 +53,9 @@ def init_repo(repo):
     return repo
 
 
-def backup(repo, source, *extra):
-    """Back up `source` with the job's tag, returning the new snapshot id."""
-    result = restic(repo, "backup", source, "--json", "--tag", "Test", *extra)
+def backup(repo, source, *extra, tag="Test"):
+    """Back up `source`, returning the new snapshot id."""
+    result = restic(repo, "backup", source, "--json", "--tag", tag, *extra)
     assert result.returncode == 0, result.stderr
     for line in reversed(result.stdout.splitlines()):
         try:
@@ -68,7 +68,7 @@ def backup(repo, source, *extra):
 
 
 def stored_files(repo, snapshot_id):
-    """Only the stored files/symlinks; `restic ls` also lists directories."""
+    """The files and symlinks restic stored; `restic ls` also lists directories."""
     from snap_bak import excludes
 
     result = restic(repo, "ls", "--long", snapshot_id)
@@ -80,7 +80,7 @@ def stored_files(repo, snapshot_id):
     }
 
 
-def resolved_job(tmp_path, monkeypatch, *, excludes_list, apply_excludes=False):
+def resolved_job(tmp_path, monkeypatch, *, excludes_list):
     """A ResolvedJob over a throwaway source tree and a local restic repo.
 
     Sets RESTIC_PASSWORD so the CLI's own restic subprocesses can open the repo,
@@ -106,7 +106,6 @@ def resolved_job(tmp_path, monkeypatch, *, excludes_list, apply_excludes=False):
                 "repo": "local",
                 "backup_retention": {"daily": 6},
                 "excludes": excludes_list,
-                "apply_excludes": apply_excludes,
             }
         ],
     }

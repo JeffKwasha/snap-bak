@@ -16,7 +16,6 @@ from conftest import backup, init_repo, resolved_job, restic
 from snap_bak import cli
 from snap_bak import config
 from snap_bak import excludes
-from snap_bak import job
 
 pytestmark = pytest.mark.skipif(
     shutil.which("restic") is None, reason="restic binary not available"
@@ -215,7 +214,7 @@ class TestApplyNow:
             cli._do_apply([rj], now=True, later=False, as_json=False, limit=None)
             == config.EXIT_SUCCESS
         )
-        assert "noop" in capsys.readouterr().out
+        assert "skipped" in capsys.readouterr().out
 
     def test_apply_now_noop_when_repo_has_no_snapshots(
         self, tmp_path, monkeypatch, capsys
@@ -227,7 +226,7 @@ class TestApplyNow:
             cli._do_apply([rj], now=True, later=False, as_json=False, limit=None)
             == config.EXIT_SUCCESS
         )
-        assert "noop" in capsys.readouterr().out
+        assert "skipped" in capsys.readouterr().out
 
     def test_preflight_refuses_cleanly_when_repo_missing(
         self, tmp_path, monkeypatch, capsys
@@ -238,35 +237,72 @@ class TestApplyNow:
         from snap_bak import job as job_mod
 
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
-        outcome = apply_mod.preflight(job_mod.Runner(rj))
-        assert outcome is not None
-        assert outcome.status == apply_mod.FAILED
-        assert "nothing changed" in outcome.detail
+        result = apply_mod.preflight(job_mod.Runner(rj))
+        assert result is not None
+        # A repo that is missing may well be there on the next window, so this is
+        # a temporary problem rather than a permanent one.
+        assert result.status == job_mod.ResultStatus.DELAYED
+        assert "nothing changed" in result.reason
         # restic: 10 = repository does not exist.
-        assert outcome.rc == 10
+        assert "rc=10" in result.reason
 
 
-class TestArm:
-    def test_later_writes_one_shot_arm(self, tmp_path, monkeypatch, capsys):
-        rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
+class TestQueueing:
+    def test_later_queues_the_rewrite(self, tmp_path, monkeypatch, capsys):
+        from conftest import backup, init_repo
+
+        from snap_bak import apply as apply_mod
+        from snap_bak import todo as todo_mod
+
+        rj, src, repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp", "cache"])
+        init_repo(repo)
+        backup(repo, str(src), "--exclude", "*.tmp")
+
         assert (
             cli._do_apply([rj], now=False, later=True, as_json=False, limit=None)
             == config.EXIT_SUCCESS
         )
-        arm = job.arm_file()
-        assert arm.exists()
-        assert json.loads(arm.read_text())["jobs"] == ["Test"]
+        queued = todo_mod.queued_tasks(rj.state_file)
+        assert [e["task"] for e in queued] == [apply_mod.TASK_NAME]
+
+    def test_later_refuses_when_nothing_would_be_removed(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """An empty repo means the store went empty or retention took everything.
+        That is a problem to notice, not a rewrite to schedule — and the user
+        would have seen it from `show excludes --repo` already."""
+        from conftest import init_repo
+
+        rj, _src, repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
+        init_repo(repo)
+
+        assert (
+            cli._do_apply([rj], now=False, later=True, as_json=False, limit=None)
+            == config.EXIT_ERROR
+        )
+        assert "refusing to queue" in caplog.text
+
+    def test_later_twice_is_an_error(self, tmp_path, monkeypatch, capsys):
+        from conftest import backup, init_repo
+
+        from snap_bak import todo as todo_mod
+
+        rj, src, repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp", "cache"])
+        init_repo(repo)
+        backup(repo, str(src), "--exclude", "*.tmp")
+        cli._do_apply([rj], now=False, later=True, as_json=False, limit=None)
+        capsys.readouterr()
+
+        assert (
+            cli._do_apply([rj], now=False, later=True, as_json=False, limit=None)
+            == config.EXIT_ERROR
+        )
+        assert len(todo_mod.queued_tasks(rj.state_file)) == 1
 
     def test_now_and_later_are_mutually_exclusive(self, tmp_path, monkeypatch, capsys):
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
         assert cli._do_apply([rj], now=True, later=True, as_json=False, limit=None)
         assert config.EXIT_ERROR
-
-    def test_arm_is_consumed_once(self, tmp_path, monkeypatch):
-        _rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
-
-        job.consume_pending()
-        assert job.read_pending() == []
 
 
 class TestHalfWindowRemaining:
