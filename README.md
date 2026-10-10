@@ -485,17 +485,22 @@ what the current rules actually match, and (on request) remove exactly those
 files from existing backups.
 
 ```bash
-# Lint the patterns and list live-filesystem matches — instant, local,
+# One row per exclude rule, one column per source — instant, local,
 # no network, and the default when you give no selector.
 snap-bak show excludes
 
-# Explicit selectors
-snap-bak show excludes --snaps      # per-local-snapshot table (local)
-snap-bak show excludes --repo       # what's already in restic (network)
-snap-bak show excludes --all        # everything, in one pass
+# Explicit selectors: each adds a column to the same table
+snap-bak show excludes --snaps      # a column per local btrfs snapshot (local)
+snap-bak show excludes --repo       # a column per snapshot stored in restic (network)
+snap-bak show excludes --all        # every source, in one table
 
-# One job, machine-readable, bounded output
-snap-bak show excludes --repo --job data --json --limit 50
+# Every file, not just the rule totals — a second table under the first
+snap-bak show excludes --all -v
+
+# One job, machine-readable, every column, never fitted
+snap-bak show excludes --all --job data --json
+snap-bak show excludes --all --format markdown > excludes.md
+snap-bak show excludes --all --format csv > excludes.csv
 ```
 
 `show` is always read-only — it never creates, removes, or modifies a snapshot or
@@ -533,10 +538,10 @@ numbers below are never ambiguous about which rules produced them:
   + build/cache/
 ```
 
-Without `-v` a trial lists **only** the rows its own new rules matched — the
-config's rules are already in effect, and re-listing thousands of rows they
-account for buries the answer. The totals always cover everything. `-v` lists
-every excluded path.
+A trial's new rules are marked `+` in the rule column and everything else stays
+visible. The config's own rules are already in effect, and the table exists to be
+read against them — hiding them would defeat the point. `--json` carries the same
+distinction as `added_by_trial` on each rule.
 
 **Rules are applied in order: config → working file → `-e`.** Two consequences
 worth knowing before you rely on a `!`:
@@ -567,44 +572,95 @@ against the real config.
 
 ### Reading the output
 
-Rows are grouped by the rule responsible, largest rule first, with the size
-before the path:
+One row per **exclude rule**, one column pair per **source**. That is the only
+layout that answers "is this rule working?", because a rule that drops 40k files
+from the live filesystem and 3 from what restic stored has either never been
+deployed or has stopped matching — and the difference is invisible unless the
+numbers sit next to each other:
 
 ```
-=== data (/bak/E): 3.4 GiB in 18422 file(s), 96 row(s) ===
-  build/cache/  —  41 row(s), 2.1 GiB
-         97.7 MiB  /bak/E/build/cache  [d]
+data  /bak/data
+TOTAL files   TOTAL bytes        live   snap:2026-01-22_10:00Z   restic:a1b2c3d4   exclude pattern
+────────────────────────────────────────────────────────────────────────────────────────────────
+      4223       8.1T   8 / 28.8K   8 / 28.8K     15 / 4.5G   cache
+       135       1.0M 123 / 987 B  135 / 1.0M    12 /  77 B   *.tmp
+         0         0       0 / 0     0 / 0          0 / 0     *.iso
+         3       4.5G       0 / 0     0 / 0          3 / 4.5G  + *.never-deployed
+      4361       13.1T 131 / 29.8M  143 / 1.0M    30 / 4.5G   TOTAL
 ```
 
-A matched directory is one row standing for its whole subtree — restic prunes
-rather than descending, so there is nothing to gain from listing the files
-inside it. `file(s)` counts the files that would actually be dropped, which is
-not the same as `row(s)`.
+**Every configured rule gets a row, including one that matches nothing.** The
+zero row is the finding: it is what separates "this rule is not deployed yet"
+from "this rule stopped matching". `+` marks a rule added by
+`--excludes-file` / `-e`.
 
-`--format csv` emits `bytes` as an integer so a spreadsheet can sum it, with the
-human-readable form alongside for reading:
+Each cell is `files / bytes`. A **file** is a non-directory entry restic stores:
+a regular file, a symlink, or a hardlink.
+
+- **Directories are never counted.** A matched directory reports what sits under
+  it, so the total depends on data rather than on directory layout.
+- **A symlink is one file and zero bytes**, because that is the node restic
+  keeps — `restic ls --long` reports it at size 0. The live walk and the
+  repository therefore agree on the same file.
+- **A hardlink is counted once per path**, matching restic's own `ls`, which
+  reports every hardlinked path at full size. The figure overstates what
+  `prune` reclaims by exactly the shared blocks.
+
+#### `-v` adds the file sheet
+
+```
+TOTAL    live   path (relative to the mount point)
+19.5M   19.5M   build/out.iso
+ 4.9M    4.9M   build/cache/big.bin
+  900     900   build/cache/sub/deep.bin
+```
+
+One line per file, paths **relative to the mount point** so a file present in
+three sources appears once rather than three times — which is the whole reason
+for putting the sources side by side. The file-count columns are dropped: every
+line is exactly one file. A matched directory is opened up into its contents, so
+`-v` is also how you see what is inside one.
+
+#### Output formats
+
+`--format text` is fitted to your terminal. Whole source columns are dropped
+oldest-first until the table fits, and what they held is stated underneath — a
+fitted table that looks complete would be worse than a narrow one that admits
+what it left out. Bytes are abbreviated to at most four characters (`8.7M`) so
+the value columns stay aligned.
+
+`--format markdown`, `--format csv` and `--json` **always emit every column.**
+They are not bound by a terminal, and a fit-to-width machine format is how a
+reader silently gets a subset.
 
 ```bash
-snap-bak show excludes --repo --job data --format csv -v > excluded.csv
+snap-bak show excludes --all --format csv > excludes.csv
 ```
 
-Columns: `job, rule, path, is_dir, files, bytes, bytes_human`. `--json` carries
-the same figures plus `by_rule` totals.
+CSV columns: `job, root, scope, row, rule_or_path`, then `<source>_files` /
+`<source>_bytes` per source, then `total_files`, `total_bytes`. Bytes are raw
+integers, never abbreviated. `scope` is `rule`, `file` or `note`; `row` is
+`detail` or `total`. Two jobs rarely share a snapshot set, so the header is the
+union of every job's columns — one table a spreadsheet can load.
+
+`--json` emits **one document** for the whole invocation — lint, every job,
+every source — because two JSON objects on stdout is not a JSON document:
+
+```json
+{"lint": {"issues": []},
+ "jobs": [{"job": "data", "root": "/bak/E",
+           "sources": [{"kind": "live", "label": "live", "files": 4223, "bytes": 8700000000}],
+           "rules": [{"rule": "*.tmp", "added_by_trial": false,
+                      "sources": {"live": {"files": 123, "bytes": 987}},
+                      "total_files": 123, "total_bytes": 987}],
+           "files": [], "files_omitted": 0,
+           "totals": {"rules": 4, "files": 4361, "bytes": 13000000000},
+           "notes": []}]}
+```
 
 A long scan reports progress on stderr about once a second, but only when stderr
 is a terminal or `-v` was passed — a piped or journalled run gets results rather
 than commentary.
-
-The `--snaps` / `--repo` tables put one column per snapshot, showing how many
-bytes each snapshot would drop, with a total row. `-` means "not in that
-snapshot":
-
-```
-                                      10-07Z  10-06Z  10-05Z      TOTAL
-/bak/E/build/cache                 800 MiB       -  1.2 GiB    2.0 GiB
-/bak/E/build/tmp.o                     -   12 MiB       -     12 MiB
-BYTES TO EXCLUDE                  800 MiB   12 MiB  1.2 GiB    2.0 GiB
-```
 
 To actually remove them, `apply` prints a plan first and only acts on `--now`.
 `apply` works on restic only, and prints the same plan `show excludes --repo`
@@ -744,53 +800,83 @@ key, which is always present and explicitly `null` when restic answered.
 
 ## Using snap-bak from an AI agent
 
-The operational knowledge above — how to verify a backup, which exit code means
-what, when `--now` is a bad idea, how to read the state files — ships as a
-skill, so an agent loads it only when it is actually working with backups rather
-than carrying it in every session.
+The operational knowledge — how to verify a backup is actually working, which
+exit code means what, when `--now` is a bad idea, how to read the state files and
+the journal, how to configure and edit a job safely — ships as a **skill**, so an
+agent loads it only when it is working with backups rather than carrying it in
+every session.
 
-It lives in this repo at [`.opencode/skills/snap-bak/`](.opencode/skills/snap-bak/):
-a `SKILL.md` plus `references/reference.md`, holding the full config and flag
-tables.
+The skill is [`SKILL.md`](.opencode/skills/snap-bak/SKILL.md), with the full
+config and flag tables in
+[`references/reference.md`](.opencode/skills/snap-bak/references/reference.md).
+It is plain markdown with no dependency on this repository, so it can be
+installed from a clone, from a mirror, or by pasting it into an agent's context.
 
-**opencode** picks it up automatically from a clone of this repo. To use it
-globally instead, copy it into your opencode skills directory:
+### Install it
+
+**From a clone of this repo** — opencode picks it up automatically; copy it into
+your global skills directory to use it from anywhere:
 
 ```bash
 mkdir -p ~/.config/opencode/skills
 cp -r .opencode/skills/snap-bak ~/.config/opencode/skills/
 ```
 
-**Hermes** loads skills from `~/.hermes/skills/`, where a subdirectory is the
-category the skill is listed under. Copy it into the category you want:
+**From a URL** — the better route once the repo is public:
 
 ```bash
-mkdir -p ~/.hermes/skills/devops
-cp -r .opencode/skills/snap-bak ~/.hermes/skills/devops/
-```
-
-Confirm with `/skills list`, load it with `/snap-bak`. Installed skills apply to
-new sessions — `/reset` to pick it up in the current one.
-
-Hermes can also install straight from a URL, which is the better route once this
-repo is public:
-
-```bash
+# opencode
 hermes skills install \
+  https://raw.githubusercontent.com/JeffKwasha/snap-bak/main/.opencode/skills/snap-bak/SKILL.md
+
+# Hermes, into the category you want (Hermes loads from ~/.hermes/skills/)
+mkdir -p ~/.hermes/skills/devops
+curl -fsSL -o ~/.hermes/skills/devops/snap-bak-SKILL.md \
   https://raw.githubusercontent.com/JeffKwasha/snap-bak/main/.opencode/skills/snap-bak/SKILL.md
 ```
 
-That URL 404s while the repo is private, so use the copy step above until it is
-public. If you fork or mirror it, point the URL at your own copy — the skill is
-plain markdown and has no dependency on this repository.
+The raw URL 404s while the repo is private — use the clone route until it is
+public. If you fork or mirror it, point the URL at your own copy.
 
-If you would rather not install anything, paste the `SKILL.md` into your agent's
-context — it is self-contained and deliberately short.
+**No installer at all** — paste `SKILL.md` into the agent's context. It is
+self-contained and deliberately short.
+
+Confirm with `/skills list`, load it with `/snap-bak`. Installed skills apply to
+new sessions; `/reset` picks one up in the current one.
+
+### What the agent is told to do
+
+The skill is written around one rule that is easy to get wrong: **a `0` exit
+from a *verification* command means the check ran and found nothing wrong.** It
+does not mean a backup is healthy — the same `0` covers both "verified clean" and
+"never actually looked". So the skill drives the agent through the exit-code
+ladder, and through the ordering that keeps it cheap and safe:
+
+| Admin task | What the skill says to do |
+|---|---|
+| Is this backup working? | `show excludes --repo --json`; check `notes` and the exit code before believing the numbers |
+| Change an exclude rule | `show` → trial with `--excludes-file` → read the `+` rows → edit the config → `apply excludes --later` |
+| Remove what is already stored | `apply excludes` (dry run) → `--later`, **not** `--now`, on a remote or busy repo |
+| Why did the run fail? | Exit code → state file → `journalctl`; 30 means retry, 41 means fix something |
+| Configure or edit a job | Edit `config.json` (a typo'd key is exit 2, not a silent no-op), then `--list-jobs` to confirm |
+
+### Driving it without an agent
+
+Nothing here needs the skill. Every command above is plain CLI:
+
+```bash
+snap-bak --version
+snap-bak -c /opt/snap-bak/config.json --list-jobs
+snap-bak -c /opt/snap-bak/config.json show excludes --all --json
+cat /opt/snap-bak/state/<job>.json
+journalctl -u snap-bak --since "2 days ago" --no-pager
+```
 
 ## Testing
 
 ```bash
-uv run pytest -q
+uv run pytest -q        # parallel by default; ~15-20s
+uv run pytest -q -n 0   # serial, for debugging one test
 ```
 
 Tests cover retention functions (exponential, datetimes, keeplist), snapshot

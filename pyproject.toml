@@ -3,7 +3,12 @@ name = "snap-bak"
 version = "0.1.0"
 description = "Btrfs Snapshot -> Restic Backup Orchestrator"
 requires-python = ">=3.10"
-dependencies = ["pydantic>=2.0", "python-dateutil>=2.0", "json5>=0.9"]
+dependencies = [
+    "pydantic>=2.0",
+    "python-dateutil>=2.0",
+    "json5>=0.9",
+    "rich>=13",
+]
 
 [project.scripts]
 snap-bak = "snap_bak.cli:main"
@@ -13,7 +18,10 @@ package-dir = {"" = "src"}
 packages = ["snap_bak"]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "pytest>=8",
+    "pytest-xdist>=3",
+]
 
 [build-system]
 requires = ["setuptools>=61.0"]
@@ -21,6 +29,12 @@ build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]
 tmp_path_retention_policy = "none"
+# The suite is almost entirely waiting on `restic` subprocesses (~0.7s each,
+# ~130 of them), so it is bound by process count, not by CPU inside pytest.
+# Running it on one core left 15 of 16 idle and took 1.5 minutes. `-n auto`
+# makes the plain `pytest` command finish in well under a minute, and changes
+# no test code. Use `-n 0` to run serially when debugging one test.
+addopts = "-n auto"
 
 [tool.ruff.lint.flake8-tidy-imports]
 # Tests must use pytest's tmp_path, which pytest always reaps. tempfile is

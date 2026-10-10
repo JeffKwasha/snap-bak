@@ -392,3 +392,25 @@ class TestRun:
     def test_effective_priority(self, monkeypatch, tmp_path):
         r = _runner(monkeypatch, tmp_path, missed=2)
         assert r.effective_priority() == 100 * (2 + 1)
+
+
+
+def test_a_missing_snapshot_dir_is_caught_before_anything_is_written(
+    tmp_path, monkeypatch, caplog
+):
+    """Config no longer checks `snapshot_dir` at load time, so this is the one
+    place it has to be caught: it is the only code that writes into it."""
+    import dataclasses
+
+    from conftest import resolved_job
+
+    rj, _src, _repo = resolved_job(
+        tmp_path, monkeypatch, excludes_list=["*.tmp"]
+    )
+    broken = dataclasses.replace(
+        rj, job=rj.job.model_copy(update={"snapshot_dir": tmp_path / "absent"})
+    )
+    with pytest.raises(SystemExit) as caught:
+        Runner(broken).create_snapshot()
+    assert caught.value.code == config.EXIT_CONFIG_ERROR
+    assert "Snapshot directory does not exist" in caplog.text

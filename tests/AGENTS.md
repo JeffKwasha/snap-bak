@@ -58,6 +58,22 @@ purpose: `tree` is deliberately exhaustive about which matching rules it
 exercises, which `build_source` is not. Locality is fine for fixtures used by a
 single module — duplication is only a problem for *helpers*.
 
+## Speed
+
+The suite is almost entirely waiting on `restic` subprocesses — about 130 of
+them at roughly 0.7s each, which is restic's fixed startup cost on this
+hardware, not IO. Two things follow, and both are load-bearing.
+
+**`init_repo` copies a template rather than running `restic init`.** A fresh
+repo is 8 KB and `restic init` costs ~2.7s; copying it is ~1ms. Every test
+still gets its own repo, with its own key and lock file. Do not "fix" this by
+restoring the real `init` — it was 30 invocations, and roughly two thirds of the
+suite's wall time.
+
+**`addopts = "-n auto"` in `pyproject.toml`.** The workload is process-bound, so
+one core leaves fifteen idle and the suite takes 1.5 minutes. Parallel, it is
+under 20 seconds. Use `-n 0` to run serially when debugging a single test.
+
 ## restic
 
 Anything that needs the real binary is guarded:

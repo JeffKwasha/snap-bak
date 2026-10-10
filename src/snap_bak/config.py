@@ -304,12 +304,13 @@ class Job(BaseModel):
     def _parse_interval(cls, v):
         return parse_duration(v)
 
-    @field_validator("snapshot_dir")
-    @classmethod
-    def snapshot_dir_must_exist(cls, v):
-        if not Path(v).exists():
-            raise ValueError(f"snapshot_dir does not exist: {v}")
-        return v
+    # `snapshot_dir` existence is deliberately not checked here. It looks like a
+    # config fact and is not one: it is machine state, and nothing creates this
+    # directory, so a new job's is absent until an admin makes it. Checking it
+    # made the config that would have named that job unloadable, took down every
+    # other job along with it, and blocked read-only commands that never touch
+    # it. It is checked where it is used, by `Runner.create_snapshot`. Readers
+    # (`Snapshot.scan`, `_cleanup_snapshots`) already treat it as optional.
 
     @field_validator("name", "tag")
     @classmethod

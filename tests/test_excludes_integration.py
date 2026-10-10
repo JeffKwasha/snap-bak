@@ -15,10 +15,9 @@ import os
 import shutil
 
 import pytest
-
 from conftest import backup, init_repo, restic, stored_files
 
-from snap_bak import excludes
+from snap_bak import excludes, report
 
 pytestmark = pytest.mark.skipif(
     shutil.which("restic") is None, reason="restic binary not available"
@@ -244,3 +243,94 @@ def test_restic_prune_after_rewrite_reclaims_and_stays_readable(repo, tree):
     assert len(remaining) == 1
     stored = stored_files(repo, remaining[0]["id"])
     assert any(p.endswith("keep.txt") for p in stored)
+
+
+def test_the_live_walk_and_the_repository_report_the_same_numbers(repo, tree):
+    """The report's whole premise is that two columns can be compared.
+
+    They only can if the filesystem walk and the restic listing count the same
+    things the same way — files under the same rules, bytes to the same total.
+    Before this was pinned, a symlink was 11 bytes to the walk and 0 to restic,
+    and a matched directory's nested subdirectories were counted as files by one
+    side and not the other, so two columns of the same row disagreed.
+
+    Backed up with nothing excluded, so the *live* rules being evaluated are the
+    ones whose effect both sides are asked about.
+    """
+    patterns = ["*.tmp", "cache", "**/deep.log", "file?.txt", "!file2.txt"]
+    snap = backup(repo, str(tree))
+
+    parsed = excludes.parse_patterns(patterns)
+    base = str(tree)
+
+    walked = excludes.ExclusionSet()
+    for w in excludes.walk_excluded(tree, base, parsed, attribute_rules=True):
+        walked.add(excludes.LIVE, w.path, w.size, w.is_dir, w.rule, w.files)
+
+    listing = restic(repo, "ls", "--long", snap).stdout
+    stored = excludes.ExclusionSet()
+    excludes.collect_from_listing(
+        excludes.parse_ls_long(listing), "abc12345", parsed,
+        into=stored, attribute_rules=True,
+    )
+
+    # Same rules, same numbers, from either side.
+    assert walked.by_rule() == stored.by_rule()
+    assert walked.total_files == stored.total_files
+    assert walked.total_size == stored.total_size
+    assert {w.path for w in walked.ordered_entries()} == {
+        e.path for e in stored.ordered_entries()
+    }
+
+    # And the grid they feed shows the same figure in both columns.
+    sheet = report.build(
+        "Test", base, patterns, [("live", walked), ("repo", stored)]
+    )
+    for row in sheet.rows:
+        assert row.cells[excludes.LIVE] == row.cells["abc12345"], row.label
+
+
+def test_a_symlinked_directory_is_one_file_worth_nothing(repo, tree):
+    """restic stores a link as a node of size 0 and `ls --long` reports it that
+    way. Charging it the length of its target would make the live column and the
+    repository column disagree about the same file."""
+    link = tree / "dirlink"
+    os.symlink("a/b", link, target_is_directory=True)
+    snap = backup(repo, str(tree))
+
+    found = excludes.ExclusionSet()
+    excludes.collect_from_listing(
+        excludes.parse_ls_long(restic(repo, "ls", "--long", snap).stdout),
+        "s1", excludes.parse_patterns(["dirlink"]), into=found,
+    )
+    walked = excludes.ExclusionSet()
+    for w in excludes.walk_excluded(
+        tree, str(tree), excludes.parse_patterns(["dirlink"])
+    ):
+        walked.add(excludes.LIVE, w.path, w.size, w.is_dir, w.rule, w.files)
+
+    assert walked.total_files == found.total_files == 1
+    assert walked.total_size == found.total_size == 0
+
+
+def test_a_hardlinked_pair_counts_once_per_path_in_both_columns(repo, tree):
+    """restic's `ls` reports each hardlinked path at full size, so counting once
+    per path is what keeps the two columns equal. The figure still over-states
+    what `prune` reclaims, by exactly the shared block — deliberately, because
+    agreeing with restic matters more than matching post-prune `stats` here."""
+    (tree / "hard.tmp").write_bytes(b"h" * 40)
+    os.link(tree / "hard.tmp", tree / "hard2.tmp")
+    snap = backup(repo, str(tree))
+
+    parsed = excludes.parse_patterns(["hard.tmp", "hard2.tmp"])
+    walked = excludes.ExclusionSet()
+    for w in excludes.walk_excluded(tree, str(tree), parsed):
+        walked.add(excludes.LIVE, w.path, w.size, w.is_dir, w.rule, w.files)
+    stored = excludes.ExclusionSet()
+    excludes.collect_from_listing(
+        excludes.parse_ls_long(restic(repo, "ls", "--long", snap).stdout),
+        "s1", parsed, into=stored,
+    )
+
+    assert walked.total_files == stored.total_files == 2
+    assert walked.total_size == stored.total_size == 80

@@ -21,10 +21,11 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from snap_bak import __version__, apply, config, excludes, job, todo
+from snap_bak import __version__, apply, config, excludes, job, report, todo
 from snap_bak import snapshot as snapshot_model
 
 logger = logging.getLogger(__name__)
@@ -261,51 +262,46 @@ def _patterns_for(
     return raw, excludes.parse_patterns(raw), rj.backup_root
 
 
-def _do_lint(
-    jobs: list, as_json: bool, override: PatternOverride | None = None
-) -> int:
-    """Report malformed patterns, and anchored ones that can never match.
-
-    Always run and silent when clean, so there is no `--lint` flag: it is not
-    optional, and offering it would imply that the modes skip it.
-
-    Linted against the patterns actually being evaluated, so a trial file's own
-    broken pattern is reported rather than quietly ignored.
-    """
-    found = []
-    for rj in jobs:
-        raw, _, root = _patterns_for(rj, override)
-        for issue in excludes.lint(raw, root):
-            found.append({"job": rj.job.name, **vars(issue)})
-
-    if as_json:
-        print(json.dumps({"lint": {"issues": found}}, indent=2))
-        return config.EXIT_SUCCESS
-
-    for issue in found:
-        print(f"[{issue['job']}] {issue['pattern']}: {issue['message']}")
-    if not found:
-        logger.info(f"excludes OK ({len(jobs)} job(s), nothing to report)")
-    return config.EXIT_SUCCESS
-
-
 def _scan_live(
     rj,
     attribute: bool = False,
     override: PatternOverride | None = None,
     progress=None,
-) -> tuple[excludes.ExclusionSet, str]:
-    """The live source subvolume: no mount, no restic, no writes."""
+    expand: bool = False,
+) -> tuple[excludes.ExclusionSet, excludes.ExclusionSet | None, str]:
+    """The live source subvolume: no mount, no restic, no writes.
+
+    Rows land under the `live` label rather than under no label at all, so the
+    live filesystem is a source in the same per-source map as every snapshot and
+    the report needs no special case for it.
+    """
     _, patterns, root = _patterns_for(rj, override)
     found = excludes.ExclusionSet()
-    for walked in excludes.walk_excluded(
-        Path(rj.job.source_subvolume), root, patterns,
-        attribute_rules=attribute, progress=progress,
-    ):
-        found.add(
-            None, walked.path, walked.size, walked.is_dir, walked.rule, walked.files
-        )
-    return found, root
+    detail = excludes.ExclusionSet() if expand else None
+    workers = min(8, (os.cpu_count() or 4))
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for walked in excludes.walk_excluded(
+            Path(rj.job.source_subvolume), root, patterns,
+            attribute_rules=attribute, progress=progress, expand=bool(expand),
+            pool=pool, skip=str(rj.job.snapshot_dir),
+        ):
+            if walked.detail:
+                if detail is not None:
+                    detail.add(
+                        excludes.LIVE, walked.path, walked.size, False,
+                        walked.rule, 1,
+                    )
+                continue
+            found.add(
+                excludes.LIVE, walked.path, walked.size, walked.is_dir,
+                walked.rule, walked.files,
+            )
+            if detail is not None and not walked.is_dir:
+                detail.add(
+                    excludes.LIVE, walked.path, walked.size, False,
+                    walked.rule, 1,
+                )
+    return found, detail, root
 
 
 def _scan_snaps(
@@ -313,30 +309,62 @@ def _scan_snaps(
     attribute: bool = False,
     override: PatternOverride | None = None,
     progress=None,
-) -> tuple[excludes.ExclusionSet, str]:
+    expand: bool = False,
+) -> tuple[excludes.ExclusionSet, excludes.ExclusionSet | None, str]:
     """Each local btrfs snapshot dir, labelled by its snapshot name."""
     _, patterns, root = _patterns_for(rj, override)
     found = excludes.ExclusionSet()
-    for snap in snapshot_model.Snapshot.scan(rj.job.snapshot_dir):
-        for walked in excludes.walk_excluded(
-            snap.path, root, patterns,
-            attribute_rules=attribute, progress=progress,
-        ):
-            found.add(
-                snap.name, walked.path, walked.size, walked.is_dir,
-                walked.rule, walked.files,
-            )
-    return found, root
+    detail = excludes.ExclusionSet() if expand else None
+    workers = min(8, (os.cpu_count() or 4))
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for snap in snapshot_model.Snapshot.scan(rj.job.snapshot_dir):
+            for walked in excludes.walk_excluded(
+                snap.path, root, patterns,
+                attribute_rules=attribute, progress=progress,
+                expand=bool(expand), pool=pool,
+            ):
+                if walked.detail:
+                    if detail is not None:
+                        detail.add(
+                            snap.name, walked.path, walked.size, False,
+                            walked.rule, 1,
+                        )
+                    continue
+                found.add(
+                    snap.name, walked.path, walked.size, walked.is_dir,
+                    walked.rule, walked.files,
+                )
+                if detail is not None and not walked.is_dir:
+                    detail.add(
+                        snap.name, walked.path, walked.size, False,
+                        walked.rule, 1,
+                    )
+    return found, detail, root
+
+
+def _scan_repo(rj, override: PatternOverride | None = None, expand: bool = False):
+    """What restic already stores (network, metadata only).
+
+    Returns `(rule set, detail set or None, error)`. The same plan `apply` would
+    execute, from the same `apply.plan()` call, so the table a user reads here is
+    by construction the table the rewrite acts on.
+    """
+    detail = excludes.ExclusionSet() if expand else None
+    p = apply.plan(
+        job.Runner(rj),
+        patterns=_patterns_for(rj, override)[1],
+        detail_into=detail,
+    )
+    return p.found, detail, p.query_error
 
 
 @dataclass
 class _View:
     """How one `show` invocation should be rendered.
 
-    Bundles the presentation choices so the three modes cannot drift on what
-    "text output" means — the size column, the rule grouping and the totals
-    footer have to appear consistently whether the reader asked for `--live` or
-    `--snaps`.
+    Bundles the presentation choices so the modes cannot drift on what "text
+    output" means — the column set, the unit rendering and the totals row have
+    to appear the same way whichever sources were scanned.
     """
 
     limit: int | None = None
@@ -347,6 +375,9 @@ class _View:
     # Off unless the caller asks or stderr is a terminal: a piped or journalled
     # run wants results, not a running commentary.
     progress: bool = False
+    # Console width to fit into. None detects the terminal; tests set it so their
+    # assertions do not depend on whatever terminal ran them.
+    width: int | None = None
 
     @classmethod
     def build(cls, args, override) -> "_View":
@@ -364,38 +395,14 @@ class _View:
             ),
         )
 
-    @property
-    def csv(self) -> bool:
-        return self.fmt == "csv"
-
-    def only_rules(self, rj) -> set[str] | None:
-        """Which rows to list, or None for all of them.
-
-        A trial set normally lists only what its own new rules matched: the
-        config's rules are already in effect, so re-listing thousands of rows
-        they account for buries the answer. `-v` asks for everything.
-        """
-        if self.verbose or self.override is None or not self.override.active:
-            return None
-        base = excludes.patterns_for_job(rj.job)
-        changed = self.override.changed_rules(base)
-        return changed or None
-
-    def totals_line(self, found: excludes.ExclusionSet) -> str:
-        """Bytes and files for the whole set, never just the shown rows."""
-        return (
-            f"{excludes.human_bytes(found.total_size)} in "
-            f"{found.total_files} file(s), {len(found.entries)} row(s)"
-        )
-
 
 def _progress_reporter(rj, enabled: bool):
     """A walk callback that reports progress on stderr, throttled.
 
     Only when stderr is a terminal or the caller asked for it: on a pipe or in a
-    journal, an unending stream of counts is noise, and in CSV or JSON output it
-    would corrupt the document. Written to stderr so `--format csv` piped into a
-    spreadsheet stays clean either way.
+    journal, an unending stream of counts is noise, and in any machine-readable
+    output it would corrupt the document. Written to stderr so output piped into
+    a spreadsheet or a file stays clean either way.
 
     Throttled to whole seconds, because the callback fires per excluded file and
     a 40k-file tree would otherwise emit 40k lines.
@@ -404,157 +411,22 @@ def _progress_reporter(rj, enabled: bool):
         return None
     state = {"last": 0.0}
 
-    def report(files: int, nbytes: int) -> None:
+    def report_progress(files: int, nbytes: int) -> None:
         now = time.monotonic()
         if now - state["last"] < 1.0:
             return
         state["last"] = now
         print(
             f"  scanning {rj.job.name}: {files} file(s), "
-            f"{excludes.human_bytes(nbytes)} so far...",
+            f"{report.human_bytes(nbytes)} so far...",
             file=sys.stderr,
             flush=True,
         )
 
-    return report
+    return report_progress
 
 
-def _do_live(jobs: list, view: _View) -> int:
-    """Walk each job's live source subvolume and list what the rules exclude.
-
-    Read-only, and local: nothing is mounted and restic is never invoked, so
-    this answers "what would the next backup skip?" without touching the repo.
-    """
-    scans = [
-        (rj, *_scan_live(rj, attribute=True, override=view.override,
-                          progress=_progress_reporter(rj, view.progress)))
-        for rj in jobs
-    ]
-    if view.as_json:
-        print(json.dumps({"live": [apply.payload(r.job.name, root, f) for r, f, root in scans]}, indent=2))
-        return config.EXIT_SUCCESS
-    if view.csv:
-        rows = []
-        for rj, found, _root in scans:
-            rows.extend(_csv_rows(rj, found, view))
-        print(excludes.to_csv(rows), end="")
-        return config.EXIT_SUCCESS
-
-    for rj, found, root in scans:
-        print(f"=== {rj.job.name} ({root}): {view.totals_line(found)} ===")
-        if not found.entries:
-            print("  nothing excluded by these rules")
-            continue
-        for line in excludes.format_entries(
-            found, view.limit, only_rules=view.only_rules(rj)
-        ):
-            print(line)
-        print(f"  TOTAL: {view.totals_line(found)}")
-    return config.EXIT_SUCCESS
-
-
-def _csv_rows(rj, found: excludes.ExclusionSet, view: _View) -> list[dict]:
-    """One record per excluded row, for a spreadsheet.
-
-    `bytes` stays numeric so a sum works; `bytes_human` is there for reading.
-    `files` is the count the row stands for, so a directory row carrying a
-    subtree reports the subtree's file count rather than 1.
-    """
-    only = view.only_rules(rj)
-    rows = []
-    for entry in found.ordered_entries():
-        if only is not None and entry.rule not in only:
-            continue
-        rows.append(
-            {
-                "job": rj.job.name,
-                "rule": entry.rule or "",
-                "path": entry.path,
-                "is_dir": entry.is_dir,
-                "files": entry.files,
-                "bytes": entry.size,
-                "bytes_human": excludes.human_bytes(entry.size),
-            }
-        )
-    return rows
-
-
-def _do_snaps(jobs: list, view: _View) -> int:
-    """Per-snapshot table across each job's local btrfs snapshot dirs."""
-    scans = [
-        (rj, *_scan_snaps(rj, attribute=True, override=view.override,
-                          progress=_progress_reporter(rj, view.progress)))
-        for rj in jobs
-    ]
-    if view.as_json:
-        print(json.dumps({"snaps": [apply.payload(r.job.name, root, f) for r, f, root in scans]}, indent=2))
-        return config.EXIT_SUCCESS
-    if view.csv:
-        rows = []
-        for rj, found, _root in scans:
-            rows.extend(_csv_rows(rj, found, view))
-        print(excludes.to_csv(rows), end="")
-        return config.EXIT_SUCCESS
-
-    for rj, found, root in scans:
-        print(f"=== {rj.job.name} ({root}): {view.totals_line(found)} ===")
-        if not found.per_snapshot:
-            print("  no snapshots found")
-            continue
-        print(excludes.format_table(found, view.limit))
-        print()
-        for line in excludes.format_entries(
-            found, view.limit, only_rules=view.only_rules(rj)
-        ):
-            print(line)
-        print(f"  TOTAL: {view.totals_line(found)}")
-    return config.EXIT_SUCCESS
-
-
-def _do_repo(jobs: list, view: _View) -> int:
-    """What restic already stores, per snapshot (network, metadata only).
-
-    This is the same plan `apply` would execute, from the same `plan()` call, so
-    the table a user reads here is by construction the table the rewrite acts on.
-    """
-    plans = []
-    for rj in jobs:
-        runner = job.Runner(rj)
-        p = apply.plan(runner, patterns=_patterns_for(rj, view.override)[1])
-        plans.append((rj, p))
-
-    if view.as_json:
-        print(json.dumps({"repo": [p.to_json() for _r, p in plans]}, indent=2))
-        return _plan_exit_code([p for _r, p in plans])
-    if view.csv:
-        rows = []
-        for rj, p in plans:
-            if p.query_error is not None:
-                continue
-            rows.extend(_csv_rows(rj, p.found, view))
-        print(excludes.to_csv(rows), end="")
-        return _plan_exit_code([p for _r, p in plans])
-
-    for rj, p in plans:
-        print(f"=== {p.job} ({p.root}): {view.totals_line(p.found)} ===")
-        if p.query_error is not None:
-            print(f"  {describe_query_error(p.query_error)}")
-            continue
-        if not p.found.per_snapshot:
-            print("  no snapshots matched")
-            continue
-        print(excludes.format_table(p.found, view.limit))
-        print()
-        for line in excludes.format_entries(
-            p.found, view.limit, only_rules=view.only_rules(rj)
-        ):
-            print(line)
-        print(f"  would rewrite {len(p.snapshot_ids)} snapshot(s)")
-        print(f"  TOTAL: {view.totals_line(p.found)}")
-    return _plan_exit_code([p for _r, p in plans])
-
-
-def describe_query_error(e: job.RepoQueryError) -> str:
+def _describe_query_error(e: job.RepoQueryError) -> str:
     """One sentence naming what restic said and what to do about it.
 
     An agent reading a log has no way to infer from a bare exit code whether to
@@ -575,20 +447,101 @@ def describe_query_error(e: job.RepoQueryError) -> str:
     return f"could not read repository: {reason} (restic exit {e.returncode}). {advice}"
 
 
-def _plan_exit_code(plans: list) -> int:
+def _query_error_exit(errors: list[job.RepoQueryError]) -> int:
     """Success unless a repo could not be read at all.
 
-    A plan that scanned successfully and found nothing is a success, and says so.
-    A plan that never reached the repository is not: reporting 0 there would tell
-    an operator — or an agent reading the exit code — that a backup was verified
+    A scan that succeeded and found nothing is a success, and says so. A scan
+    that never reached the repository is not: reporting 0 there would tell an
+    operator — or an agent reading the exit code — that a backup was verified
     clean when in fact nothing was checked. restic 10/11/12 mean "not now"
     (delayed, 30); anything else means the setup is wrong (failed, 41).
     """
-    if all(p.query_error is None for p in plans):
+    if not errors:
         return config.EXIT_SUCCESS
-    if any(not p.query_error.retryable for p in plans if p.query_error):
+    if any(not e.retryable for e in errors):
         return config.EXIT_PERM_FAILED
     return config.EXIT_TEMP_UNREACHABLE
+
+
+def _plan_exit_code(plans: list) -> int:
+    return _query_error_exit([p.query_error for p in plans if p.query_error])
+
+
+def _sheets(jobs: list, modes: tuple[str, ...], view: _View) -> tuple[list, list]:
+    """One report per job, plus the repository errors that decide the exit code.
+
+    Every mode is collected before anything is printed, so a run that scanned
+    live, snapshots and the repository emits a single document rather than three.
+    Two JSON objects on stdout is not a JSON document, and neither is three CSV
+    headers.
+    """
+    sheets, errors = [], []
+    for rj in jobs:
+        rules, _patterns, root = _patterns_for(rj, view.override)
+        sources, details, notes = [], [], []
+        for mode in modes:
+            progress = _progress_reporter(rj, view.progress)
+            verbose = view.verbose
+            if mode == "live":
+                found, detail, _ = _scan_live(
+                    rj, attribute=True, override=view.override,
+                    progress=progress, expand=verbose,
+                )
+                sources.append((report.KIND_LIVE, found))
+            elif mode == "snaps":
+                found, detail, _ = _scan_snaps(
+                    rj, attribute=True, override=view.override,
+                    progress=progress, expand=verbose,
+                )
+                sources.append((report.KIND_SNAPS, found))
+            else:
+                found, detail, error = _scan_repo(
+                    rj, view.override, expand=verbose
+                )
+                sources.append((report.KIND_REPO, found))
+                if error is not None:
+                    errors.append(error)
+                    notes.append(_describe_query_error(error))
+            if detail is not None:
+                details.append((mode, detail))
+        sheet = report.build(
+            rj.job.name, root, rules, sources,
+            detail_sources=details,
+            limit=view.limit,
+            marked=_trial_rules(rj, view.override),
+        )
+        sheet.notes.extend(notes)
+        sheets.append(sheet)
+    return sheets, errors
+
+
+def _trial_rules(rj, override: PatternOverride | None) -> set[str]:
+    """The rules a `--excludes-file` / `-e` trial added, for the `+` marker."""
+    if override is None or not override.active:
+        return set()
+    return override.changed_rules(excludes.patterns_for_job(rj.job))
+
+
+def _show(jobs: list, args, view: _View) -> int:
+    """Collect every selected source, then render one document."""
+    lint = []
+    for rj in jobs:
+        raw, _patterns, root = _patterns_for(rj, view.override)
+        for issue in excludes.lint(raw, root):
+            lint.append({"job": rj.job.name, **vars(issue)})
+
+    sheets, errors = _sheets(jobs, _selected_modes(args), view)
+    document = report.render(sheets, view.fmt, view.as_json, view.width, lint)
+    # One trailing newline, whatever the format: a CSV whose last line is blank
+    # reads as a record with four empty fields.
+    document = document.rstrip("\n")
+    if not view.as_json and view.fmt == "text" and lint:
+        document = "\n".join(
+            [f"[{i['job']}] {i['pattern']}: {i['message']}" for i in lint]
+            + [document]
+        )
+    print(document)
+    return _query_error_exit(errors)
 
 
 def _do_apply(jobs: list, now: bool, later: bool, as_json: bool, limit: int | None) -> int:
@@ -615,14 +568,26 @@ def _plan(jobs: list, as_json: bool, limit: int | None) -> int:
         print(json.dumps({"plan": [p.to_json() for p in plans]}, indent=2))
         return _plan_exit_code(plans)
     for p in plans:
-        print(f"=== {p.job} ({p.root}) ===")
         if p.query_error is not None:
-            print(f"  {describe_query_error(p.query_error)}")
+            print(f"=== {p.job} ({p.root}) ===")
+            print(f"  {_describe_query_error(p.query_error)}")
             continue
         if p.empty:
+            print(f"=== {p.job} ({p.root}) ===")
             print("  nothing to remove")
             continue
-        print(excludes.format_table(p.found, limit))
+        # The same report `show excludes --repo` prints, over the rules that
+        # actually matched here. A rule matching nothing is not in the plan, and
+        # is not what an approval is about.
+        print(
+            report.render(
+                [report.build(
+                    p.job, p.root,
+                    sorted({e.rule for e in p.found.entries.values() if e.rule}),
+                    [(report.KIND_REPO, p.found)],
+                )]
+            )
+        )
         print(f"  would rewrite {len(p.snapshot_ids)} snapshot(s): "
               f"{', '.join(p.snapshot_ids)}")
         print(f"  $ {' '.join(p.command)}")
@@ -638,6 +603,11 @@ def _arm(jobs: list, as_json: bool) -> int:
     retention took everything, which is a problem to notice, not a rewrite to
     schedule. The plan is the same read-only call the dry-run already makes.
 
+    Whether the repo is empty is read off the plan rather than by asking restic
+    again: the plan already listed the repository, `newest_snapshot_id` is None
+    exactly when it found none, and on a remote backend a second `restic
+    snapshots` is a second round trip — as well as a second thing that can fail.
+
     Writes to the state dir, never the config: the config is root-owned and
     declarative, and it must never carry a request.
     """
@@ -646,15 +616,15 @@ def _arm(jobs: list, as_json: bool) -> int:
         runner = job.Runner(rj)
         p = apply.plan(runner)
         if p.query_error is not None:
-            detail = describe_query_error(p.query_error)
+            detail = _describe_query_error(p.query_error)
             logger.error("%s: refusing to queue: %s", rj.job.name, detail)
             refused.append({"job": rj.job.name, "reason": detail})
             continue
         if p.empty:
             detail = (
-                "no snapshots hold files matching this job's excludes"
-                if not runner.repo_snapshots()
-                else "no stored file matches this job's excludes"
+                "the repository holds no snapshots at all"
+                if p.newest_snapshot_id is None
+                else "no snapshot holds a file matching this job's excludes"
             )
             logger.error("%s: refusing to queue: %s", rj.job.name, detail)
             refused.append({"job": rj.job.name, "reason": detail})
@@ -724,14 +694,12 @@ def _apply_now(jobs: list, as_json: bool) -> int:
         for entry in results:
             print(f"[{entry['job']}] {entry['status']}: {entry['detail']}")
 
-    # Through the same ladder a scheduled run uses, rather than a hand-rolled
-    # check: `--now` is a mutation an agent may well drive unattended, so its
-    # outcome has to be classified exactly as the orchestrator would classify it.
-    statuses = [
-        job.Result(r["job"], r["status"], reason=r["detail"]) for r in results
-    ]
-    code = exit_code(statuses)
-    return config.EXIT_ERROR if code == config.EXIT_PERM_FAILED else code
+    # Through the same ladder a scheduled run uses: `--now` is a mutation an
+    # agent may well drive unattended, so its outcome has to be classified
+    # exactly as the orchestrator classifies it — a permanent failure is 41 here
+    # and 41 in a scheduled run, not 41 and 1.
+    return exit_code([job.Result(r["job"], r["status"], reason=r["detail"])
+                      for r in results])
 
 
 def _result_json(result: job.Result) -> dict:
@@ -855,18 +823,25 @@ def excludes_parser(verb: str) -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="Machine-readable output.")
     parser.add_argument(
         "--format",
-        choices=("text", "csv"),
+        choices=report.FORMATS,
         default="text",
-        help="Output format for the row listing (default: text).",
+        help=(
+            "How to render the rule-by-source table (default: text). "
+            "text fits itself to the terminal and abbreviates bytes; "
+            "markdown and csv carry every column and every job in one table."
+        ),
     )
     parser.add_argument(
-        "--limit", type=int, default=None, help="Bound displayed rows (totals still cover all)."
+        "--limit",
+        type=int,
+        default=None,
+        help="Bound the per-file rows under -v (rule rows and totals cover all).",
     )
     parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
-        help="List every excluded path, not just those from changed rules.",
+        help="Add the per-file sheet: every excluded path, one per line.",
     )
 
     if verb == "show":
@@ -953,22 +928,11 @@ def _excludes_main(argv: list[str], config_path: str) -> None:
             _report_override(override, jobs, as_csv=args.format == "csv")
 
         view = _View.build(args, override)
-        _do_lint(jobs, args.json, override)  # always; silent when clean
-        # A `show` that cannot reach what it was asked about must not exit 0.
-        # The worst outcome for a caller is a clean report that was never
-        # actually checked, so each mode's code is accumulated, never overwritten.
-        code = config.EXIT_SUCCESS
-        for mode in _selected_modes(args):
-            if mode == "live":
-                _do_live(jobs, view)
-            elif mode == "snaps":
-                _do_snaps(jobs, view)
-            elif mode == "repo":
-                # Accumulate rather than overwrite: `--all` includes --repo, so a
-                # last-wins assignment would let an unreachable repository be
-                # reported as a clean success by the modes that ran after it.
-                code = max(code, _do_repo(jobs, view))
-        sys.exit(code)
+        # One collection pass, one document, one exit code. `--all` used to run
+        # the three modes back to back, each printing its own complete document,
+        # so a `--json` caller got three concatenated objects and a `--format
+        # csv` caller got three header rows.
+        sys.exit(_show(jobs, args, view))
 
     sys.exit(_do_apply(jobs, args.now, args.later, args.json, args.limit))
 

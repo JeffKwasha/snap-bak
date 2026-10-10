@@ -10,6 +10,7 @@ the running machine. The directory is removed on interpreter exit.
 import atexit
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 import tempfile
@@ -19,6 +20,9 @@ os.environ["SNAPBAK_STATE_DIR"] = _STATE_TMP
 atexit.register(lambda: shutil.rmtree(_STATE_TMP, ignore_errors=True))
 
 PASSWORD = "test-password"
+
+# The pristine repo `init_repo` copies from; inited on first use.
+_RESTIC_TEMPLATE = None
 
 
 def restic(repo, *args, timeout=120):
@@ -48,9 +52,27 @@ def build_source(root):
 
 
 def init_repo(repo):
-    result = restic(repo, "init")
-    assert result.returncode == 0, result.stderr
-    return repo
+    """Put an initialised restic repo at `repo`, by copying a template.
+
+    `restic init` costs ~2.7s here and produces an 8 KB directory. Nearly every
+    test inits a repo, so that single call is most of the suite's wall time —
+    which is what made this suite too slow to run on every edit.
+
+    The template is inited once per session and copied per test: ~1ms instead,
+    with each destination a real, independent repo carrying its own key and lock
+    file. Nothing is shared between tests, and no test observes the difference.
+    """
+    global _RESTIC_TEMPLATE
+    if _RESTIC_TEMPLATE is None:
+        template = pathlib.Path(_STATE_TMP) / "restic-template"
+        result = restic(str(template), "init")
+        assert result.returncode == 0, result.stderr
+        _RESTIC_TEMPLATE = template
+    repo = pathlib.Path(repo)
+    if repo.exists():
+        shutil.rmtree(repo)
+    shutil.copytree(_RESTIC_TEMPLATE, repo)
+    return str(repo)
 
 
 def backup(repo, source, *extra, tag="Test"):
@@ -91,7 +113,7 @@ def resolved_job(tmp_path, monkeypatch, *, excludes_list):
 
     src = tmp_path / "src"
     build_source(src)
-    snaps = tmp_path / "snaps"
+    snaps = src / ".snapshots"
     snaps.mkdir()
     repo = str(tmp_path / "repo")
 

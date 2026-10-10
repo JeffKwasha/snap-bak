@@ -12,12 +12,31 @@ import logging
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from conftest import backup, init_repo, resolved_job, restic
 
 import snap_bak
 from snap_bak import cli, config, excludes, job
+
+# A wide terminal by default, so a test's assertions do not depend on whatever
+# terminal happened to run it. The fitting itself has its own tests.
+WIDE = 400
+
+
+def show(capsys, jobs, *modes, view=None):
+    """Run `show excludes` down the CLI's own path; return `(exit code, stdout)`.
+
+    Goes through `_show` rather than a mode function, because that is where the
+    collection and the single-document rendering meet — a test that called a mode
+    directly would not notice `--all` emitting three documents again.
+    """
+    args = SimpleNamespace(**{m: False for m in ("all", "live", "snaps", "repo")})
+    for mode in modes:
+        setattr(args, mode, True)
+    code = cli._show(jobs, args, view or cli._View(width=WIDE))
+    return code, capsys.readouterr().out
 
 pytestmark = pytest.mark.skipif(
     shutil.which("restic") is None, reason="restic binary not available"
@@ -74,52 +93,61 @@ class TestSelectedModes:
 class TestLintOutput:
     def test_lint_silent_when_clean(self, tmp_path, monkeypatch, capsys):
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
-        assert cli._do_lint([rj], as_json=False) == config.EXIT_SUCCESS
-        out = capsys.readouterr().out
-        assert "*.tmp" not in out
+        _code, out = show(capsys, [rj], "live")
+        # Every rule gets a row, so the rule text is expected here; what must be
+        # absent is any lint complaint about it.
+        assert "anchored" not in out and "cannot match" not in out
+        assert "Test  " in out
 
     def test_lint_reports_invalid_and_anchored(self, tmp_path, monkeypatch, capsys):
         rj, _src, _repo = resolved_job(
             tmp_path, monkeypatch, excludes_list=["bad/[", "/home/user/x", "*.tmp"]
         )
-        cli._do_lint([rj], as_json=False)
-        out = capsys.readouterr().out
+        _code, out = show(capsys, [rj], "live")
         assert "bad/[" in out
         assert "/home/user/x" in out
-        assert "*.tmp" not in out
+        assert "*.tmp" not in out.split("TOTAL files")[0]
 
     def test_lint_json_structure(self, tmp_path, monkeypatch, capsys):
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["bad/["])
-        cli._do_lint([rj], as_json=True)
-        data = json.loads(capsys.readouterr().out)
+        _code, out = show(capsys, [rj], "live", view=cli._View(as_json=True))
+        data = json.loads(out)
         assert data["lint"]["issues"][0]["kind"] == "invalid"
 
 
 class TestLiveOutput:
-    def test_live_lists_excluded_with_sizes(self, tmp_path, monkeypatch, capsys):
+    def test_live_lists_a_row_per_rule(self, tmp_path, monkeypatch, capsys):
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp", "cache"])
-        assert cli._do_live([rj], cli._View()) == config.EXIT_SUCCESS
-        out = capsys.readouterr().out
-        assert "a.tmp" in out
+        code, out = show(capsys, [rj], "live")
+        assert code == config.EXIT_SUCCESS
+        assert "*.tmp" in out
         assert "cache" in out
-        assert "keep.txt" not in out
+        # keep.txt is not excluded, so it appears nowhere — not even verbosely.
+        _code, loud = show(
+            capsys, [rj], "live", view=cli._View(width=WIDE, verbose=True)
+        )
+        assert "keep.txt" not in loud
 
     def test_live_json(self, tmp_path, monkeypatch, capsys):
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
-        cli._do_live([rj], cli._View(as_json=True))
-        data = json.loads(capsys.readouterr().out)
-        entry = data["live"][0]
-        assert entry["count"] == 1
-        assert entry["entries"][0]["path"].endswith("a.tmp")
-        assert entry["total_size"] == 3
+        _code, out = show(capsys, [rj], "live", view=cli._View(as_json=True))
+        data = json.loads(out)
+        job_body = data["jobs"][0]
+        assert job_body["totals"] == {"rules": 1, "files": 1, "bytes": 3}
+        assert job_body["rules"][0]["rule"] == "*.tmp"
+        assert job_body["rules"][0]["sources"]["live"] == {"files": 1, "bytes": 3}
 
-    def test_live_limit_bounds_output_not_totals(self, tmp_path, monkeypatch, capsys):
+    def test_live_limit_bounds_the_file_sheet_not_the_totals(
+        self, tmp_path, monkeypatch, capsys
+    ):
         rj, src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
         for i in range(5):
             (src / f"f{i}.tmp").write_text("x")
-        cli._do_live([rj], cli._View(limit=2))
-        out = capsys.readouterr().out
-        assert "... 4 more" in out
+        _code, out = show(
+            capsys, [rj], "live", view=cli._View(width=WIDE, limit=2, verbose=True)
+        )
+        # build_source() already put an a.tmp there, so six files, two shown.
+        assert "4 more (totals cover all)" in out
         assert "f0.tmp" in out
 
 
@@ -128,21 +156,22 @@ class TestSnapsOutput:
         rj, src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
 
         for name in ("2026-10-05_10:00Z", "2026-10-06_10:00Z"):
-            d = src.parent / "snaps" / name
-            d.mkdir()
+            d = src / ".snapshots" / name
+            d.mkdir(parents=True)
             (d / "a.tmp").write_text("x" * 10)
             (d / "keep.txt").write_text("k")
-        cli._do_snaps([rj], cli._View())
-        out = capsys.readouterr().out
-        assert "2026-10-06_10:00Z" in out
-        assert "2026-10-05_10:00Z" in out
-        assert "BYTES TO EXCLUDE" in out
+        _code, out = show(capsys, [rj], "snaps")
+        assert "snap:2026-10-06_10:00Z" in out
+        assert "snap:2026-10-05_10:00Z" in out
+        assert "TOTAL" in out
 
-    def test_snaps_json(self, tmp_path, monkeypatch, capsys):
+    def test_snaps_json_with_no_snapshots_has_no_columns(
+        self, tmp_path, monkeypatch, capsys
+    ):
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
-        cli._do_snaps([rj], cli._View(as_json=True))
-        data = json.loads(capsys.readouterr().out)
-        assert data["snaps"][0]["snapshots"] == []
+        _code, out = show(capsys, [rj], "snaps", view=cli._View(as_json=True))
+        data = json.loads(out)
+        assert data["jobs"][0]["sources"] == []
 
 
 @contextlib.contextmanager
@@ -167,8 +196,9 @@ class TestRepoOutput:
         # unreachable-repo tests below must not swallow.
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
         with _empty_repo(rj):
-            assert cli._do_repo([rj], cli._View()) == config.EXIT_SUCCESS
-            assert "no snapshots matched" in capsys.readouterr().out
+            code, out = show(capsys, [rj], "repo")
+            assert code == config.EXIT_SUCCESS
+            assert "*.tmp  " in out or out.rstrip().endswith("*.tmp")
 
     def test_repo_shows_stored_matches(self, tmp_path, monkeypatch, capsys):
         # Back up with only *.tmp excluded, so `cache` is still stored; the
@@ -176,10 +206,10 @@ class TestRepoOutput:
         rj, src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp", "cache"])
         init_repo(str(tmp_path / "repo"))
         backup(str(tmp_path / "repo"), src, "--exclude", "*.tmp")
-        cli._do_repo([rj], cli._View())
-        out = capsys.readouterr().out
+        code, out = show(capsys, [rj], "repo")
+        assert code == config.EXIT_SUCCESS
         assert "cache" in out
-        assert "BYTES TO EXCLUDE" in out
+        assert "restic:" in out
 
 
 class TestApplyDryRun:
@@ -271,6 +301,29 @@ class TestApplyNow:
         assert "could not read repository" in out
         assert "skipped" not in out, "an unread repo is not a clean skip"
 
+    def test_a_permanent_rewrite_failure_is_41_not_1(self, tmp_path, monkeypatch, capsys):
+        """`--now` is a mutation an agent may drive unattended, and the scheduled
+        run reports a permanent failure as 41. Reporting the same failure as 1
+        here would make the two disagree about whether retrying could ever help,
+        and the comment above the line used to claim they could not."""
+        rj, src, _repo = resolved_job(
+            tmp_path, monkeypatch, excludes_list=["*.tmp", "cache"]
+        )
+        init_repo(str(tmp_path / "repo"))
+        backup(str(tmp_path / "repo"), src, "--exclude", "*.tmp")
+
+        def boom(self, cmd, timeout=None):
+            # Let the scan through; only the rewrite itself fails.
+            if "rewrite" not in cmd:
+                return real(self, cmd, timeout=timeout)
+            raise subprocess.CalledProcessError(1, "restic")
+
+        real = job.Runner.run_command
+        monkeypatch.setattr(job.Runner, "run_command", boom)
+        assert cli._do_apply(
+            [rj], now=True, later=False, as_json=False, limit=None
+        ) == config.EXIT_PERM_FAILED
+
     def test_preflight_refuses_cleanly_when_repo_missing(
         self, tmp_path, monkeypatch, capsys
     ):
@@ -325,6 +378,44 @@ class TestQueueing:
             == config.EXIT_ERROR
         )
         assert "refusing to queue" in caplog.text
+        assert "no snapshots at all" in caplog.text
+
+    def test_later_says_which_of_the_two_empty_states_it_is(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """An empty repo and a repo holding nothing excludable are different
+        problems, and the refusal has to distinguish them — so the answer comes
+        off the plan rather than off a second query that could fail."""
+        rj, src, repo = resolved_job(
+            tmp_path, monkeypatch, excludes_list=["*.tmp", "cache"]
+        )
+        init_repo(repo)
+        backup(repo, str(src), "--exclude", "*.tmp", "--exclude", "cache")
+
+        assert (
+            cli._do_apply([rj], now=False, later=True, as_json=False, limit=None)
+            == config.EXIT_ERROR
+        )
+        assert "no snapshot holds a file matching" in caplog.text
+        assert "no snapshots at all" not in caplog.text
+
+    def test_later_reads_the_repository_once(self, tmp_path, monkeypatch):
+        """`plan()` already listed the snapshots. Asking again is a second
+        network round trip on a remote backend — and a second thing that can
+        fail, in a path built to report failures cleanly rather than raise."""
+        calls = []
+        real = job.Runner.repo_snapshots
+
+        def counted(self):
+            calls.append(self)
+            return real(self)
+
+        rj, _src, repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
+        init_repo(repo)
+        monkeypatch.setattr(job.Runner, "repo_snapshots", counted)
+
+        cli._do_apply([rj], now=False, later=True, as_json=False, limit=None)
+        assert len(calls) == 1
 
     def test_later_twice_is_an_error(self, tmp_path, monkeypatch, capsys):
         from conftest import backup, init_repo
@@ -402,20 +493,22 @@ class TestUnreachableRepoReporting:
         rj = self._unreachable(tmp_path / "broken", monkeypatch)
         # 30 (delayed), not 41: restic 10/11/12 are environmental and may well
         # be fine on the next run.
-        assert cli._do_repo([rj], cli._View()) == config.EXIT_TEMP_UNREACHABLE
-        out = capsys.readouterr().out
+        code, out = show(capsys, [rj], "repo")
+        assert code == config.EXIT_TEMP_UNREACHABLE
         assert "could not read repository" in out
-        assert "no snapshots matched" not in out, "must not read as a clean result"
+        assert "not shown" not in out, "must not read as a clean result"
 
     def test_json_carries_the_error_rather_than_a_silent_empty(
         self, tmp_path, monkeypatch, capsys
     ):
         rj = self._unreachable(tmp_path / "broken", monkeypatch)
-        cli._do_repo([rj], cli._View(as_json=True))
-        body = json.loads(capsys.readouterr().out)["repo"][0]
-        assert body["snapshot_ids"] == []
-        assert body["query_error"]["returncode"] == 10
-        assert body["query_error"]["retryable"] is True
+        _code, out = show(capsys, [rj], "repo", view=cli._View(as_json=True))
+        data = json.loads(out)
+        body = data["jobs"][0]
+        # No sources, because nothing could be read — which is exactly why the
+        # exit code, not the emptiness, is what says so.
+        assert body["sources"] == []
+        assert body["notes"] and "could not read repository" in body["notes"][0]
 
     def test_apply_dry_run_reports_it_too(self, tmp_path, monkeypatch, capsys):
         """The dry-run is what a user approves, so it must not print
@@ -442,7 +535,7 @@ class TestUnreachableRepoReporting:
         monkeypatch.setattr(
             job.Runner, "repo_snapshots", lambda self: (_ for _ in ()).throw(caught.value)
         )
-        assert cli._do_repo([rj], cli._View()) == config.EXIT_PERM_FAILED
+        assert show(capsys, [rj], "repo")[0] == config.EXIT_PERM_FAILED
 
     def test_one_broken_repo_does_not_hide_a_healthy_one(
         self, tmp_path, monkeypatch, capsys
@@ -456,15 +549,12 @@ class TestUnreachableRepoReporting:
         backup(repo, str(src), "--exclude", "*.tmp")
         bad = self._unreachable(tmp_path / "broken", monkeypatch)
 
-        codes = {id(good): cli._do_repo([good], cli._View())}
-        assert codes[id(good)] == config.EXIT_SUCCESS
-        out = capsys.readouterr().out
+        code, out = show(capsys, [good], "repo")
+        assert code == config.EXIT_SUCCESS
         assert "cache" in out, "the healthy repo must still be reported"
 
-        assert cli._do_repo([good, bad], cli._View()) == (
-            config.EXIT_TEMP_UNREACHABLE
-        )
-        out = capsys.readouterr().out
+        code, out = show(capsys, [good, bad], "repo")
+        assert code == config.EXIT_TEMP_UNREACHABLE
         assert "could not read repository" in out
         assert "cache" in out, "a broken repo must not suppress the healthy one"
 
@@ -613,87 +703,144 @@ class TestShowRefusesWhatApplyRefuses:
 
 
 class TestOutputPresentation:
-    def _job(self, tmp_path, monkeypatch):
-        """A job whose stored snapshot holds data its current rules exclude.
+    """The report is a grid, so these are about the grid rather than a listing."""
 
-        The backup deliberately used *fewer* excludes than the job now has, so
-        the rows exist to be reported: that is the whole situation `show` and
+    def _job(self, tmp_path, monkeypatch):
+        """A job whose repo stores something the current rules would exclude.
+
+        Backed up with only `*.tmp` excluded, so `cache` is still stored and the
+        current rules now also exclude it — which is what `apply` removes. The
+        rows exist to be reported: that is the whole situation `show` and
         `apply` exist for.
         """
         rj, src, repo = resolved_job(
             tmp_path, monkeypatch, excludes_list=["*.tmp", "cache"]
         )
-        from conftest import backup, init_repo
-
         init_repo(repo)
-        backup(repo, str(src), "--exclude", "*.tmp")  # cache/ stays stored
+        backup(repo, str(src), "--exclude", "*.tmp")
         return rj
 
-    def test_rows_are_grouped_by_rule_with_a_subtotal(
+    def test_a_row_per_rule_largest_first_with_a_total(
         self, tmp_path, monkeypatch, capsys
     ):
         rj = self._job(tmp_path, monkeypatch)
-        cli._do_live([rj], cli._View())
-        out = capsys.readouterr().out
-        assert "*.tmp  —" in out or "cache  —" in out
-        assert "TOTAL:" in out
-        assert "file(s)" in out
+        _code, out = show(capsys, [rj], "live")
+        rows = [line for line in out.splitlines() if "*.tmp" in line or "cache" in line]
+        assert len(rows) == 2
+        # cache holds 100 B and *.tmp one 3 B file, so the bigger rule leads.
+        assert "cache" in rows[0] and "*.tmp" in rows[1]
+        assert out.rstrip().splitlines()[-1].rstrip().endswith("TOTAL")
 
-    def test_csv_has_numeric_bytes_and_a_header(self, tmp_path, monkeypatch, capsys):
+    def test_a_rule_matching_nothing_still_gets_a_row(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A zero row is the finding: it separates "not deployed yet" from
+        "stopped matching", which a report that omits it cannot express."""
+        rj, _src, _repo = resolved_job(
+            tmp_path, monkeypatch, excludes_list=["*.tmp", "*.never"]
+        )
+        _code, out = show(capsys, [rj], "live")
+        row = next(line for line in out.splitlines() if "*.never" in line)
+        assert row.split()[-1] == "*.never"
+        assert row.split()[:3] == ["0", "0", "0"], "three zeros, then the label"
+
+    def test_csv_has_one_header_numeric_bytes_and_every_source(
+        self, tmp_path, monkeypatch, capsys
+    ):
         import csv
         import io
 
-        rj = self._job(tmp_path, monkeypatch)
-        cli._do_live([rj], cli._View(fmt="csv"))
-        records = list(csv.DictReader(io.StringIO(capsys.readouterr().out)))
+        rj, src, _repo = resolved_job(
+            tmp_path, monkeypatch, excludes_list=["*.tmp", "cache"]
+        )
+        (src / "cache" / "deep.bin").write_bytes(b"z" * 40)
+        assert (src / "cache" / "deep.bin").exists()
+        _code, out = show(
+            capsys, [rj], "live", "snaps", view=cli._View(fmt="csv")
+        )
+        lines = out.splitlines()
+        # One header, not one per mode: three of them would not import.
+        assert sum(1 for line in lines if line.startswith("job,")) == 1
+        records = list(csv.DictReader(io.StringIO(out)))
 
-        assert records, "the fixture must store something the rules exclude"
-        assert {"job", "rule", "path", "is_dir", "files", "bytes"} <= set(records[0])
+        assert records, "the fixture must exclude something"
+        assert {"job", "scope", "rule_or_path", "live_files", "live_bytes",
+                "total_files", "total_bytes"} <= set(records[0])
         for r in records:
-            # Numeric, so a spreadsheet can sum it; the human form is alongside
-            # for reading.
-            int(r["bytes"])
-            int(r["files"])
-            assert r["bytes_human"]
-        assert any(r["rule"] == "cache" for r in records)
+            # Numeric, so a spreadsheet can sum it. Bytes are never abbreviated
+            # in a machine-readable format.
+            int(r["live_bytes"])
+            int(r["live_files"])
+        assert any(r["rule_or_path"] == "cache" for r in records)
 
     def test_csv_suppresses_the_prose_diff_header(self, tmp_path, monkeypatch, capsys):
         """A prose header would corrupt the first CSV record."""
         trial = tmp_path / "w.ignore"
         trial.write_text("*.iso\n")
         rj = self._job(tmp_path, monkeypatch)
-        cli._do_live(
+        _code, out = show(
+            capsys,
             [rj],
-            cli._View(fmt="csv", override=cli.PatternOverride(str(trial))),
+            "live",
+            view=cli._View(fmt="csv", override=cli.PatternOverride(str(trial))),
         )
-        out = capsys.readouterr().out
         assert "trial pattern set" not in out, "the diff header is prose"
-        # Every line must be a record, header or data - nothing else mixed in.
         for line in out.splitlines():
             assert line.startswith(("job,", rj.job.name)), line
 
-    def test_verbose_lists_every_row_not_only_the_trial_ones(
+    def test_trial_rules_are_marked_rather_than_the_rest_hidden(
         self, tmp_path, monkeypatch, capsys
     ):
+        """The matrix exists to be read against, so a trial's rules are flagged
+        `+` and the config's own rows stay visible — hiding them would defeat
+        the one thing the grid is for."""
         trial = tmp_path / "w.ignore"
         trial.write_text("*.iso\n")
         rj = self._job(tmp_path, monkeypatch)
-        ov = cli.PatternOverride(str(trial))
+        _code, out = show(
+            capsys, [rj], "live",
+            view=cli._View(override=cli.PatternOverride(str(trial))),
+        )
+        assert "+ *.iso" in out
+        assert "*.tmp" in out, "the config's own rules are still shown"
 
-        cli._do_live([rj], cli._View(override=ov))
-        quiet = capsys.readouterr().out
-        cli._do_live([rj], cli._View(override=ov, verbose=True))
-        loud = capsys.readouterr().out
+    def test_verbose_adds_a_file_sheet_underneath(self, tmp_path, monkeypatch, capsys):
+        rj = self._job(tmp_path, monkeypatch)
+        _code, quiet = show(capsys, [rj], "live")
+        _code, loud = show(
+            capsys, [rj], "live", view=cli._View(width=WIDE, verbose=True)
+        )
+        assert "path (relative to the mount point)" not in quiet
+        assert "path (relative to the mount point)" in loud
+        # Paths are relative to the mount point, so the same file in two sources
+        # lines up instead of appearing under two different names.
+        assert "cache/big.bin" in loud
+        # No listed file is left in stored-path form, so the same file lines up
+        # across sources instead of appearing once per mount-point prefix. The
+        # job header legitimately shows the root, so check the rows only.
+        _header, _, rows = loud.partition("path (relative to the mount point)")
+        assert rows, "the file sheet is missing"
+        assert all("/bak/" not in line for line in rows.splitlines()[1:])
 
-        # The config's own rule matches nothing here, so -v must show strictly more.
-        assert len(loud.splitlines()) >= len(quiet.splitlines())
-        # Totals are unaffected by the listing restriction, in both cases.
-        assert "TOTAL:" in quiet and "TOTAL:" in loud
+    def test_verbose_opens_a_matched_directory_into_its_files(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        rj = self._job(tmp_path, monkeypatch)
+        _code, out = show(
+            capsys, [rj], "live", view=cli._View(width=WIDE, verbose=True)
+        )
+        # `cache` matched as one directory row; verbosely its contents are listed.
+        assert "cache/big.bin" in out
+        rule_row = next(line for line in out.splitlines() if "cache" in line
+                        and "*.tmp" not in line)
+        assert "1 /" in rule_row, "still one file in the rule table"
 
-    def test_only_rules_is_none_without_a_trial(self, tmp_path, monkeypatch):
+    def test_nothing_is_marked_without_a_trial(self, tmp_path, monkeypatch):
+        """With no trial there is nothing to mark, and every rule is shown
+        unmarked — a `+` on a config rule would be a lie."""
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
-        assert cli._View().only_rules(rj) is None
-        assert cli._View(verbose=True).only_rules(rj) is None
+        assert cli._trial_rules(rj, None) == set()
+        assert cli._trial_rules(rj, cli.PatternOverride()) == set()
 
 
 class TestFileTotalsAreFree:
@@ -711,7 +858,7 @@ class TestFileTotalsAreFree:
         for w in ex.walk_excluded(
             root, "/bak/x", ex.parse_patterns(["cache"]), attribute_rules=True
         ):
-            found.add(None, w.path, w.size, w.is_dir, w.rule, w.files)
+            found.add(ex.LIVE, w.path, w.size, w.is_dir, w.rule, w.files)
 
         assert len(found.entries) == 1, "one row for the directory"
         assert found.total_files == 7, "seven files beneath it"
@@ -730,7 +877,7 @@ class TestFileTotalsAreFree:
             root, "/bak/x", ex.parse_patterns(["cache", "*.tmp"]),
             attribute_rules=True,
         ):
-            found.add(None, w.path, w.size, w.is_dir, w.rule, w.files)
+            found.add(ex.LIVE, w.path, w.size, w.is_dir, w.rule, w.files)
         by_path = {e.path: e.files for e in found.entries.values()}
         assert by_path["/bak/x/cache"] == 1
         assert by_path["/bak/x/top.tmp"] == 1
@@ -782,7 +929,7 @@ class TestTrialNegation:
         self, tmp_path, monkeypatch
     ):
         """The bound on the above: nothing later applies beneath a pruned dir."""
-        rj, src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["cache"])
+        rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["cache"])
         trial = cli.PatternOverride(
             None, ["!cache/keep", "!cache/big.bin", "!cache"]
         )

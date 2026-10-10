@@ -584,10 +584,13 @@ cover the whole set.
 | `--repo` | files stored in restic snapshots | **network** (`restic snapshots` + `restic ls` per snapshot) |
 | `--all` | every selector above | includes the network path |
 
-`--limit N` bounds displayed rows/columns; **totals always cover the full set**
-so a truncated table never understates. `--json` emits the same data
-structurally, for agents: one schema for every mode, so `show --live` reports
-empty `snapshots` / `per_snapshot` rather than omitting the keys.
+A selector adds a **column**, not a separate report: the same table is rendered
+from whichever sources were scanned, and one invocation emits exactly one
+document. Two JSON objects on stdout is not a JSON document, and three CSV
+headers is not a table.
+
+`--limit N` bounds the per-file rows under `-v`; rule rows and every total cover
+the full set.
 
 ### Pattern matching
 
@@ -652,23 +655,93 @@ can never match that root —
 the common authoring mistake of writing `/home/user/x` when the root is
 `/bak/data`.
 
-### `--snaps` / `--repo` table
+### The report
 
-Rows are matched files, one column per snapshot, cell = bytes that snapshot
-would drop, `-` when absent. The final row totals per snapshot and overall.
-A directory that matches appears as one row carrying its whole subtree, and
-its contents are not listed separately (restic prunes rather than descends).
+One row per **exclude rule**, one column pair (`files / bytes`) per **source**,
+with a total row. This is the layout the whole feature exists for: a rule that
+drops 40k files from the live filesystem and 3 from what restic stored has either
+never been deployed or has stopped matching, and the difference is invisible
+unless both numbers are on one page.
 
 ```
-                                      10-07Z  10-06Z  10-05Z      TOTAL
-/bak/E/build/cache                 800 MiB       -  1.2 GiB    2.0 GiB
-/bak/E/build/tmp.o                     -   12 MiB       -     12 MiB
-BYTES TO EXCLUDE                  800 MiB   12 MiB  1.2 GiB    2.0 GiB
+TOTAL files   TOTAL bytes        live   snap:2026-01-22_10:00Z   restic:a1b2c3d4   exclude pattern
+───────────────────────────────────────────────────────────────────────────────────────────────
+      4223       8.1T    8 / 28.8K   8 / 28.8K     15 / 4.5G   cache
+       135       1.0M  123 / 987 B  135 / 1.0M    12 /  77 B   *.tmp
+         0         0        0 / 0     0 / 0          0 / 0     *.iso
+         3       4.5G        0 / 0     0 / 0          3 / 4.5G  + *.never-deployed
+      4361       13.1T 131 / 29.8M  143 / 1.0M    30 / 4.5G   TOTAL
 ```
 
-Sizes are raw (uncompressed) apparent sizes. Actual reclaimed space differs:
-restic compresses, dedupes, and repacks, so the post-prune `stats` delta is
-reported separately and is the authoritative figure.
+**Every configured rule gets a row, including one that matches nothing.** The
+zero row is the finding: it is what separates "not deployed yet" from "stopped
+matching", and a report that omits it cannot express either. A rule added by a
+trial is marked `+` rather than the config's own rules being hidden — the table
+exists to be read against them.
+
+### What counts as a file
+
+A file is a **non-directory entry restic stores**: a regular file, a symlink, or
+a hardlink. Established against restic 0.19.1 (see `docs/verification.md`):
+
+| Kind | Counted as a file | Bytes |
+|------|-------------------|-------|
+| regular file | yes | `lstat` size, matching `restic ls --long` |
+| symlink | yes | **0** — the node restic stores, reported at 0 by `restic ls --long` |
+| hardlink | yes, once per path | full size per path, matching restic's own `ls` |
+| directory | **never** | 0 |
+
+Consequences that are load-bearing:
+
+- **A symlink priced by `lstat` would make `--live` and `--repo` disagree** about
+  the same file: `lstat` reports the length of the *target path*, which is not a
+  payload restic holds.
+- **A hardlink is counted once per path**, which is what keeps the two columns
+  equal — `restic ls` reports every hardlinked path at full size. The figure
+  therefore overstates what `prune` reclaims by exactly the shared blocks. The
+  post-prune `stats` delta remains the authoritative reclaimed figure.
+- **A directory is never a file**, so a matched empty directory reports 0 and a
+  matched populated one reports its subtree. Counting directories would make the
+  total depend on layout rather than on data.
+
+`restic ls --long` renders a symlink as `path -> target`, with Go's capital-`L`
+mode. The arrow is part of the rendered line, not the name, so it is split off —
+otherwise a symlink matches no pattern and silently never appears in a `--repo`
+report at all.
+
+### `-v`: the file sheet
+
+A second table, one line per excluded file, paths **relative to the mount point**
+— relative, because that is the only form in which a file present in three
+sources appears once instead of three times, which is the entire point of putting
+the sources side by side. The file-count columns are dropped: every line is
+exactly one file.
+
+A matched directory is opened up into its contents, which costs nothing extra on
+the `--repo` path (the listing already holds every path) and one traversal on the
+walk path (`_subtree_totals` reports each file as it counts it). Expanded files
+are attributed to the rule that matched the **directory**, because restic pruned
+it and no pattern ever reached them.
+
+### Output formats
+
+| Format | Columns | Units | Fitted |
+|--------|---------|-------|--------|
+| `text` (default) | fitted to the terminal, oldest dropped first | abbreviated to ≤4 chars | yes |
+| `markdown` | every column | abbreviated | no |
+| `csv` | union of every job's columns | raw integers | no |
+| `--json` | every column | raw integers | no |
+
+Only the console is fitted. Whole source columns are dropped — never truncated
+mid-number — and what they held is stated underneath, so a fitted table never
+reads as a complete one. A terminal's row per source is `files / bytes`; the
+console puts the numeric columns before the rule or path, which are the columns
+of unbounded width and may be folded at the right without disturbing a number.
+
+`--format csv` emits one header for the whole invocation, built as the union of
+every job's source columns: two jobs rarely share a snapshot set, and a header
+per job is not a table any importer accepts. `--json` emits **one** document
+holding the lint results, every job and every source.
 
 ### `apply excludes`
 
@@ -873,6 +946,7 @@ per-job lock would add complexity without additional protection.
     config.py            # config loading + models
     excludes.py          # restic exclusion-engine port + inspection
     job.py               # backup engine
+    report.py            # the rule-by-source report and its renderings
     restic.py            # restic command building
     snapshot.py          # snapshot domain model
   sudo-exec.py            # sudo wrapper (root:root 0755)
@@ -950,17 +1024,17 @@ unaffected.
 | Flag | Description |
 |------|-------------|
 | *(always run)* | Static pattern diagnostics — silent when clean, so no flag |
-| `--live` | Match against the live filesystem (default) |
-| `--snaps` | Match against every local btrfs snapshot, as a per-snapshot table |
-| `--repo` | Match against files stored in restic snapshots (network) |
-| `--all` | Every selector above |
+| `--live` | Add the live filesystem as a column (default) |
+| `--snaps` | Add a column per local btrfs snapshot |
+| `--repo` | Add a column per snapshot stored in restic (network) |
+| `--all` | Every selector above, in one table |
 | `--excludes-file PATH` | Add a working pattern file's rules, same syntax as `ignore_file` |
 | `-e, --exclude PATTERN` | Add one rule, repeatable |
-| `--format text\|csv` | Row listing format; `csv` emits numeric `bytes` for summing |
-| `-v, --verbose` | List every excluded path, not only a trial's own rules |
+| `--format text\|csv\|markdown` | How to render the grid; only `text` is fitted to the terminal |
+| `-v, --verbose` | Add the per-file sheet under the rule table |
 | `--job NAME` | Restrict to one job |
-| `--json` | Machine-readable output |
-| `--limit N` | Bound displayed rows/columns; totals still cover everything |
+| `--json` | Machine-readable output; one document for the whole invocation |
+| `--limit N` | Bound the per-file rows under `-v`; rule rows and totals cover everything |
 
 With no selector, `show` runs `--live`: the mode that is local and instant, so
 the common case costs nothing.

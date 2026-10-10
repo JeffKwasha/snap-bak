@@ -46,8 +46,9 @@ snap-bak show excludes --snaps
 snap-bak show excludes --repo --json
 ```
 
-Add `--job NAME` to scope to one job, and `--limit N` to bound rows (totals
-still cover everything).
+Add `--job NAME` to scope to one job. `--all` puts every source in one table;
+`--limit N` bounds the per-file rows under `-v` (rule rows and totals always
+cover everything).
 
 Step 4 is the one that answers "is my backup working". If it exits 0 with
 `count: 0`, the stored data genuinely holds nothing your excludes would drop.
@@ -127,16 +128,24 @@ experiment. Do not work around this; the refusal is the correct behaviour.
 
 **Read the output this way:**
 
-- Rows are grouped by the rule responsible, largest rule first, size before the
-  path.
-- A matched directory is one row standing for its whole subtree — restic prunes
-  rather than descending, so listing the files inside it adds nothing.
-- `file(s)` is the count of files that would actually be dropped. It is **not**
-  the same as `row(s)`: one directory row can stand for 2000 files.
-- The file count costs nothing extra: the traversal that prices a matched
-  directory already visits every file beneath it.
-- `--format csv` gives numeric `bytes` for summing plus `bytes_human` for
-  reading; columns `job, rule, path, is_dir, files, bytes, bytes_human`.
+- One row per **exclude rule**, one `files / bytes` column pair per **source**
+  (`live`, `snap:<name>`, `restic:<short id>`). The layout exists so sources can
+  be compared — a rule dropping 40k files live but 3 from restic has either not
+  been deployed or has stopped matching.
+- **A rule matching nothing still gets a `0 / 0` row.** That zero row is the
+  finding, not noise. Do not filter it out when summarising.
+- `+` marks a rule added by `--excludes-file` / `-e`.
+- **A file is a non-directory entry restic stores.** Directories are never
+  counted; a matched directory reports what is under it. A symlink is one file
+  and **zero bytes** (restic reports the node at 0). A hardlink is counted once
+  per path, so hardlinked data is over-stated by exactly the shared blocks.
+- `-v` adds a second table: one line per file, paths **relative to the mount
+  point**, no file-count columns.
+- **Only `--format text` is fitted to the terminal**; when it drops columns it
+  says so underneath. `--format markdown`, `--format csv` and `--json` always
+  carry every column — never present a fitted view as the whole picture.
+- `--format csv` gives raw integers; `--json` gives one document for the whole
+  invocation.
 - A long scan prints progress to stderr about once a second, only on a terminal
   or with `-v`.
 
@@ -172,34 +181,32 @@ problem that does not exist.
 
 ### Reading JSON output
 
-Every `show`/`apply` mode emits the same keys, so you can rely on them being
-present:
+`--json` emits **one** document for the whole invocation. Two JSON objects on
+stdout is not a JSON document.
 
 ```json
-{
-  "repo": [{
-    "job": "data",
-    "root": "/bak/E",
-    "snapshots": ["10-07Z", "10-06Z"],
-    "entries": [{"path": "/bak/E/build/cache", "size": 1073741824,
-                 "is_dir": true, "per_snapshot": {"10-07Z": 838860800}}],
-    "per_snapshot_totals": {"10-07Z": 838860800, "10-06Z": 1288490188},
-    "count": 1,
-    "total_size": 2127497984,
-    "snapshot_ids": ["a1b2c3d4"],
-    "command": ["restic", "rewrite", "a1b2c3d4", "--forget"],
-    "query_error": null
-  }]
-}
+{"lint": {"issues": []},
+ "jobs": [{
+   "job": "data", "root": "/bak/E",
+   "sources": [{"kind": "repo", "label": "a1b2c3d4",
+                "files": 12, "bytes": 77}],
+   "rules": [{"rule": "*.tmp", "added_by_trial": false,
+              "sources": {"restic:a1b2c3d4": {"files": 12, "bytes": 77}},
+              "total_files": 12, "total_bytes": 77}],
+   "files": [{"path": "build/cache/a.tmp",
+              "sources": {"restic:a1b2c3d4": 77}, "total_bytes": 77}],
+   "files_omitted": 0,
+   "totals": {"rules": 4, "files": 4361, "bytes": 13000000000},
+   "notes": []
+ }]}
 ```
 
-- `total_size` is reclaimable only if you also prune. Rewriting alone frees
-  nothing; `prune` is what repacks and reclaims, and on rclone backends that is
-  real network I/O lasting minutes to hours.
-- **`query_error` is the field to check first on any repo-scoped output.** It is
-  always present, explicitly `null` when restic answered. Non-null means the
-  repository was never read, so `snapshots: []` and `count: 0` in that same
-  object mean *unknown*, not *clean*. `retryable: true` maps to exit 30.
+- **`notes` is the field to check first on any repo-scoped output.** It is
+  always present, empty when restic answered. Non-empty means the repository was
+  **never read**, so an empty `sources` list and zero totals mean *unknown*, not
+  *clean*. `retryable: true` in the message maps to exit 30.
+- `files_omitted` counts per-file rows dropped by `--limit`; the totals still
+  cover everything.
 
 ## Excludes: what they do and don't
 
@@ -241,7 +248,63 @@ snap-bak -j data              # one job
 ```
 
 Run order is backups → queued work → retention → prune. A run that skips
-uploads because nothing changed is normal and still exits 0.
+uploads because nothing changed is normal and still exits 0. The systemd timer
+does this nightly; a bare `snap-bak` is the same thing and takes the global lock,
+so do not start one while a scheduled run is in progress.
+
+## Configuring and editing a job
+
+The config is `/opt/snap-bak/config.json`, **root-owned and declarative**. It
+must never carry a request — queued work lives in the state file, never in the
+config.
+
+```bash
+snap-bak --list-jobs                        # the real job names
+snap-bak -c /path/to/other.json --list-jobs # a candidate config, before installing it
+```
+
+- **A typo'd or unknown config key is exit 2, not a silent no-op.** That is
+  deliberate. If you see exit 2 naming `Extra inputs are not permitted`, the key
+  you added is not real — check against `references/reference.md` for the correct
+  name. Do not "work around" it by removing the key; the rule you meant to add
+  is not in force.
+- Never `chmod` the config or the password files so a less-privileged process
+  can read them. snap-bak already runs a sudo wrapper (`sudo-exec.py`) for the
+  privileged work; config and password files are root/group-owned by design.
+- After any edit: `--list-jobs` to confirm it still loads, then
+  `show excludes` on that job to confirm the rules are what you meant.
+- Never hand-edit `/opt/snap-bak/state/<job>.json`. It is rewritten atomically
+  by the tool, and an edit races the next run.
+
+## Reading the logs
+
+The systemd unit is the source of truth for what happened; the state file only
+holds the last status.
+
+```bash
+journalctl -u snap-bak --since "2 days ago" --no-pager
+journalctl -u snap-bak -n 200 --no-pager            # the tail, for one run
+journalctl -u snap-bak -p err --since "7 days ago"  # only what failed
+```
+
+Read them in this order, because each answers a question the next one needs:
+
+| Question | Where |
+|---|---|
+| Did the run happen, and when? | `journalctl -u snap-bak -u snap-bak.timer` |
+| What did this job end on? | `state/<job>.json` — `last_status`, `last_run` |
+| What is outstanding? | `state/<job>.json` — `queued` (an entry **is** the request) |
+| Why did it end that way? | the journal, around that timestamp |
+| What is on the remote? | `show excludes --repo --json` |
+
+**Correlate rather than infer.** A `0-byte upload` and a `skipped: nothing
+changed` are both normal, and neither is proof that the backup is empty —
+`skip_snapshot_if_idle` suppresses a snapshot whenever the source has not
+changed. A quiet run is only as healthy as the timestamp says it is.
+
+When a run exits 30, the journal will name restic's own code (10 repo does not
+exist, 11 locked, 12 bad password). That code is the actionable part; the wrapper
+maps it to the exit code, so quoting the exit code alone loses it.
 
 ## Pitfalls
 
@@ -253,6 +316,11 @@ uploads because nothing changed is normal and still exits 0.
   with `show excludes` and the state file.
 - **Do not hand-edit state files.** `/opt/snap-bak/state/<job>.json` is written
   atomically by the tool; editing it races the next run.
+- **Do not read a fitted table as the whole report.** Only `--format text`
+  drops columns to fit a terminal, and it says so underneath. Use `--json` or
+  `--format markdown` when the complete set matters.
+- **Do not filter out the all-zero rows** in a `show excludes` report. A rule
+  that matched nothing anywhere is the answer to "why is this rule not working".
 - **A mistyped config key is now a hard error (exit 2), not a silent no-op.**
   This is deliberate. If you see exit 2 naming `Extra inputs are not permitted`,
   the key you added is not real — check for an old field name.
@@ -268,9 +336,10 @@ After changing anything, confirm with a read-only command and read the exit
 code rather than trusting the absence of output:
 
 ```bash
-snap-bak -c /opt/snap-bak/config.json show excludes --repo --job NAME --json
-# expect: exit 0, "query_error": null
-# a non-null query_error means the repo was never read — fix that first
+snap-bak -c /opt/snap-bak/config.json show excludes --all --job NAME --json
+# expect: exit 0, and notes: [] on every job
+# a non-empty notes means the repo was never read — fix that first, because
+# zero sources then means "unknown", not "clean"
 ```
 
 For the full reference — every config key, every subcommand flag, and the

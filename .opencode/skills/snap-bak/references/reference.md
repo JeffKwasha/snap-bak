@@ -36,7 +36,7 @@ Read-only. Never creates, removes, or modifies a snapshot or a local file.
 | `-e, --exclude PATTERN` | Add one rule, repeatable |
 | `-j, --job NAME` | Scope to one job |
 | `--json` | Machine-readable |
-| `--format text\|csv` | Row listing format (default: text) |
+| `--format text\|csv\|markdown` | How to render the grid; only `text` is fitted to the terminal |
 | `-v, --verbose` | List every excluded path, not just the trial's new rules |
 | `--limit N` | Bound displayed rows. Totals still cover every match |
 
@@ -96,19 +96,76 @@ rewrite of real backups.
 
 ### Output
 
-Text output groups rows by the rule responsible, largest rule first, with the
-size before the path and a per-rule subtotal. A matched directory is one row
-standing for its subtree — restic prunes rather than descending.
+One row per **exclude rule**, one `files / bytes` column pair per **source**,
+plus a total row. Every configured rule gets a row, including one that matches
+nothing — that zero row is what distinguishes "not deployed yet" from "stopped
+matching". `+` marks a rule added by `--excludes-file` / `-e`.
 
-`--format csv` columns: `job, rule, path, is_dir, files, bytes, bytes_human`.
-`bytes` is numeric so a spreadsheet can sum it. The prose diff header is
-suppressed under CSV, since it would corrupt the first record.
+```
+TOTAL files   TOTAL bytes        live   snap:2026-01-22_10:00Z   restic:a1b2c3d4   exclude pattern
+───────────────────────────────────────────────────────────────────────────────────────────
+      4223       8.1T    8 / 28.8K   8 / 28.8K     15 / 4.5G   cache
+       135       1.0M  123 / 987 B  135 / 1.0M    12 /  77 B   *.tmp
+         0         0        0 / 0     0 / 0          0 / 0     *.iso
+      4361       13.1T 131 / 29.8M  143 / 1.0M    30 / 4.5G   TOTAL
+```
 
-`--json` carries `total_files` (files that would be dropped, not row count) and
-`by_rule` totals; each entry has `rule` (null when unattributed) and `files`.
+Source labels: `live`, `snap:<btrfs snapshot name>`, `restic:<short id>`.
+
+**What counts as a file** — a non-directory entry restic stores:
+
+| Kind | Files | Bytes |
+|------|-------|-------|
+| regular file | 1 | `lstat` size |
+| symlink | 1 | **0** — restic reports the node at 0 |
+| hardlink | 1, once per path | full size per path, matching restic's `ls` |
+| directory | **0** | 0 |
+
+Hardlinked data is therefore counted once per path, over-stating what `prune`
+reclaims by exactly the shared blocks. The post-prune `stats` delta is the
+authoritative reclaimed figure.
+
+`-v` adds a second table, one line per excluded file, paths **relative to the
+mount point**, with the file-count columns dropped (each line is one file). A
+matched directory is opened up into its contents.
+
+| Format | Columns | Bytes | Fitted to terminal |
+|--------|---------|-------|--------------------|
+| `text` (default) | fitted, oldest dropped first | ≤4 chars (`8.7M`) | yes |
+| `markdown` | every column | abbreviated | no |
+| `csv` | union across jobs, one header | raw integers | no |
+| `--json` | every column | raw integers | no |
+
+Only the console is fitted. Dropped columns are reported underneath with what
+they held, so a fitted table never reads as a complete one.
+
+`--format csv` columns: `job, root, scope, row, rule_or_path`, then
+`<source>_files` / `<source>_bytes` per source, then `total_files`,
+`total_bytes`. `scope` is `rule`, `file` or `note`; `row` is `detail` or `total`.
+The prose diff header is suppressed under CSV, since it would corrupt the first
+record.
+
+`--json` emits **one** document for the whole invocation:
+
+```json
+{"lint": {"issues": []},
+ "jobs": [{"job": "data", "root": "/bak/E",
+           "sources": [{"kind": "repo", "label": "a1b2c3d4", "files": 12, "bytes": 77}],
+           "rules": [{"rule": "*.tmp", "added_by_trial": false,
+                      "sources": {"restic:a1b2c3d4": {"files": 12, "bytes": 77}},
+                      "total_files": 12, "total_bytes": 77}],
+           "files": [], "files_omitted": 0,
+           "totals": {"rules": 4, "files": 4361, "bytes": 13000000000},
+           "notes": []}]}
+```
+
+`notes` is where an unreadable repository is reported. **It is the field to
+check first on any repo-scoped output.** A non-empty `notes` means the repository
+was never read, so zero columns and `count: 0` mean *unknown*, not *clean*. The
+exit code says so too: 30 rather than 0.
 
 Scan progress goes to stderr about once a second, only when stderr is a terminal
-or `-v` was passed, and never while emitting `--json` or `--format csv`.
+or `-v` was passed, and never while emitting a machine-readable format.
 
 ## Exit codes
 

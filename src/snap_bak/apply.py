@@ -27,7 +27,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 
-from snap_bak import excludes, job, restic, todo
+from snap_bak import excludes, job, report, restic, todo
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +145,11 @@ class Plan:
         return body
 
 
-def plan(runner, patterns: list[excludes.Pattern] | None = None) -> Plan:
+def plan(
+    runner,
+    patterns: list[excludes.Pattern] | None = None,
+    detail_into: excludes.ExclusionSet | None = None,
+) -> Plan:
     """Scan this job's stored snapshots and decide what a rewrite would remove.
 
     Read-only. Executes no restic command that can mutate, creates, or delete
@@ -192,7 +196,10 @@ def plan(runner, patterns: list[excludes.Pattern] | None = None) -> Plan:
         except Exception as e:
             logger.error("%s: cannot list snapshot %s: %s", runner.job.name, label, e)
             continue
-        excludes.collect_from_listing(listing, label, parsed, into=found)
+        excludes.collect_from_listing(
+            listing, label, parsed, into=found,
+            attribute_rules=True, detail_into=detail_into,
+        )
         # Only snapshots that actually hold a match are rewritten. Restic lists
         # newest-first, and entries are keyed by path, so this must be a
         # per-snapshot membership test: asking whether any *path* is named like
@@ -253,11 +260,11 @@ def execute(runner, p: Plan) -> job.Result:
         "%s: %d excluded path(s) (%s across %d snapshot(s))",
         p.job,
         len(p.found.entries),
-        excludes.human_bytes(p.total_size),
+        report.human_bytes(p.total_size),
         len(p.snapshot_ids),
     )
     for entry in p.found.ordered_entries()[:20]:
-        logger.info("  would remove: %s (%s)", entry.path, excludes.human_bytes(entry.size))
+        logger.info("  would remove: %s (%s)", entry.path, report.human_bytes(entry.size))
     if len(p.found.entries) > 20:
         logger.info("  ... and %d more", len(p.found.entries) - 20)
 
@@ -303,7 +310,7 @@ def execute(runner, p: Plan) -> job.Result:
         name,
         job.ResultStatus.SUCCESS,
         f"rewrote {len(p.snapshot_ids)} snapshot(s), "
-        f"{excludes.human_bytes(p.total_size)} excluded",
+        f"{report.human_bytes(p.total_size)} excluded",
     )
 
 

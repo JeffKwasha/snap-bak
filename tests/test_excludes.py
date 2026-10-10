@@ -9,6 +9,8 @@ inspection mode report the wrong files.
 """
 
 
+import os
+
 import pytest
 
 from snap_bak import excludes
@@ -208,13 +210,14 @@ LIST_CASES = [
 @pytest.mark.parametrize("patterns,path,match,child", LIST_CASES)
 def test_list_match(patterns, path, match, child):
     parsed = excludes.parse_patterns(patterns)
-    assert excludes.list_match(parsed, path) == (match, child)
+    matched, rule = excludes.list_match(parsed, path)
+    assert matched is match
+    if match:
+        assert rule is not None
+    else:
+        assert rule is None
 
 
-# Negation of a `**` pattern: a matched directory is re-included, and since
-# restic's ChildMatch answers True for any relative pattern, children may still
-# match too. These are the shapes users rely on when re-including a subdir of an
-# excluded tree (see the `excluded` cases below for the match-only behaviour).
 @pytest.mark.parametrize("patterns,path,expected", [
     (["**/cache", "!cache/keep"], "/bak/home/x/cache", True),
     (["**/cache", "!cache/keep"], "/bak/home/x/cache/keep", False),
@@ -223,7 +226,7 @@ def test_list_match(patterns, path, match, child):
     (["!cache"], "/bak/home/x/cache", False),
 ])
 def test_list_match_negation_with_double_wildcard(patterns, path, expected):
-    matched, _child = excludes.list_match(excludes.parse_patterns(patterns), path)
+    matched, _rule = excludes.list_match(excludes.parse_patterns(patterns), path)
     assert matched is expected
 
 
@@ -543,6 +546,34 @@ def test_walk_does_not_descend_into_excluded_directory(tmp_path):
     assert paths == ["/bak/E/cache"]
 
 
+def test_walk_skip_prunes_snapshot_directory(tmp_path):
+    """The snapshot directory inside the source subvolume is pruned from the
+    live walk — restic backs up the source, not its own snapshots."""
+    root = _make_tree(tmp_path / "src")
+    snaps = root / ".snapshots"
+    snaps.mkdir()
+    (snaps / "snap1").mkdir()
+    (snaps / "snap1" / "file.txt").write_text("x" * 100)
+    (snaps / "snap2").mkdir()
+    (snaps / "snap2" / "file.txt").write_text("y" * 200)
+    base = "/bak/E"
+    skip = f"{base}/.snapshots"
+    paths = [
+        w.path
+        for w in excludes.walk_excluded(
+            root, base, excludes.parse_patterns([]), skip=skip
+        )
+    ]
+    assert paths == []
+    paths_no_skip = [
+        w.path
+        for w in excludes.walk_excluded(
+            root, base, excludes.parse_patterns(["*"])
+        )
+    ]
+    assert f"{base}/.snapshots" in paths_no_skip
+
+
 def test_subtree_size_counts_nested_files_not_symlink_targets(tmp_path):
     root = tmp_path / "d"
     (root / "sub").mkdir(parents=True)
@@ -550,11 +581,38 @@ def test_subtree_size_counts_nested_files_not_symlink_targets(tmp_path):
     (root / "sub" / "b").write_bytes(b"y" * 20)
     link = root / "link"
     link.symlink_to(root / "a")
-    link_len = link.lstat().st_size  # the link's own size, not its target's
 
-    # a(10) + sub/b(20) + the symlink's own length. If the symlink were
-    # followed, `a` would be counted twice (40 + link_len) instead.
-    assert excludes._subtree_size(root) == 30 + link_len
+    # a(10) + sub/b(20), and nothing for the symlink. A link is stored as a link
+    # node worth zero bytes — `restic ls --long` reports it at 0 — so charging it
+    # `lstat`'s size would make the live walk and the repository report
+    # different bytes for the same file. It is still counted as a file below.
+    assert excludes._subtree_size(root) == 30
+
+
+def test_subtree_counts_a_symlinked_directory_as_one_file(tmp_path):
+    # `os.walk` files a symlink to a directory under `dirs`, not `names`, so a
+    # naive count loses it entirely. restic stores it as a node like any other.
+    root = tmp_path / "d"
+    (root / "real").mkdir(parents=True)
+    (root / "real" / "a").write_bytes(b"x" * 10)
+    (root / "link").symlink_to(root / "real")
+
+    files = list(excludes._subtree_files(root))
+    assert sum(s for _p, s in files) == 10
+    assert len(files) == 2  # real/a, and the link itself
+
+
+def test_hardlinks_are_counted_once_per_path(tmp_path):
+    # restic's own `ls` reports every hardlinked path at full size, so counting
+    # once per path is what keeps the local walk and the repository agreeing.
+    root = tmp_path / "d"
+    root.mkdir()
+    (root / "a").write_bytes(b"x" * 10)
+    os.link(root / "a", root / "b")
+
+    files = list(excludes._subtree_files(root))
+    assert sum(s for _p, s in files) == 20
+    assert len(files) == 2
 
 
 def test_walk_excluded_empty_patterns_returns_nothing(tmp_path):
@@ -659,8 +717,8 @@ def test_walk_does_not_follow_symlinked_dirs(tmp_path):
 
 
 def test_walk_excludes_symlinked_dir_by_name_without_descending(tmp_path):
-    """A pattern matching the link's own name excludes the link, priced by its
-    own length — the target's contents stay out of the report."""
+    """A pattern matching the link's own name excludes the link, and the
+    target's contents stay out of the report entirely."""
     root = tmp_path / "src"
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -672,24 +730,31 @@ def test_walk_excludes_symlinked_dir_by_name_without_descending(tmp_path):
     found = list(
         excludes.walk_excluded(root, "/bak/x", excludes.parse_patterns(["cache"]))
     )
-    assert [(w.path, w.size, w.is_dir) for w in found] == [
-        ("/bak/x/cache", len(str(outside)), False)
+    # Reported as the link it is: one file, zero bytes, not a directory. restic
+    # stores it as a link node and `restic ls --long` reports it at size 0.
+    assert [(w.path, w.size, w.is_dir, w.files) for w in found] == [
+        ("/bak/x/cache", 0, False, 1)
     ]
 
 
-def test_walk_prices_matched_symlink_by_its_own_size(tmp_path):
+def test_walk_prices_a_matched_symlink_at_zero(tmp_path):
+    """A symlink's `lstat` size is the length of its target path, which restic
+    does not store: `restic ls --long` reports the node at 0. Pricing it any
+    other way makes the live walk and the repository disagree about the same
+    file, which is the one thing the report exists to rule out."""
     root = tmp_path / "src"
     root.mkdir()
     target = tmp_path / "big.tmp"
     target.write_bytes(b"x" * 5000)
     link = root / "alias.tmp"
     link.symlink_to(target)
+    assert link.lstat().st_size > 0, "precondition: lstat does see a size"
 
     found = list(
         excludes.walk_excluded(root, "/bak/x", excludes.parse_patterns(["*.tmp"]))
     )
-    assert [(w.path, w.size, w.is_dir) for w in found] == [
-        ("/bak/x/alias.tmp", len(str(target)), False)
+    assert [(w.path, w.size, w.is_dir, w.files) for w in found] == [
+        ("/bak/x/alias.tmp", 0, False, 1)
     ]
 
 
@@ -779,111 +844,6 @@ def test_collect_from_listing_tracks_each_snapshot():
     # appears in both. Space actually reclaimed is reported separately, from
     # `restic stats`, which accounts for packing, compression and dedup.
     assert result.total_size == 20
-
-
-# --- rendering -----------------------------------------------------------
-
-
-def test_human_bytes():
-    assert excludes.human_bytes(0) == "0 B"
-    assert excludes.human_bytes(512) == "512 B"
-    assert excludes.human_bytes(1024) == "1.0 KiB"
-    assert excludes.human_bytes(1536) == "1.5 KiB"
-    assert excludes.human_bytes(1024**3) == "1.0 GiB"
-
-
-def test_human_bytes_edge_cases():
-    assert excludes.human_bytes(1024**5) == "1.0 PiB"
-    assert excludes.human_bytes(1024**6) == "1024.0 PiB"
-    # One decimal above 1 KiB: 1 MiB - 1 B displays as "1.0 MiB".
-    assert excludes.human_bytes(1024**2 - 1) == "1.0 MiB"
-
-
-def test_format_table_totals_cover_everything():
-    listing = [
-        ("/bak/E/a.tmp", 1024, False),
-        ("/bak/E/b.tmp", 2048, False),
-        ("/bak/E/keep", 99, False),
-    ]
-    patterns = excludes.parse_patterns(["*.tmp"])
-    result = excludes.collect_from_listing(listing, "s1", patterns)
-    result = excludes.collect_from_listing(listing, "s2", patterns, into=result)
-    table = excludes.format_table(result, limit=1)
-    lines = table.splitlines()
-    totals = lines[-2] if lines[-1].startswith("...") else lines[-1]
-    assert totals.startswith("BYTES TO EXCLUDE")
-    # 1 KiB + 2 KiB per snapshot, then the total. --limit bounds the displayed
-    # rows only, never the totals.
-    cells = totals[len("BYTES TO EXCLUDE"):].split()
-    assert cells == ["3.0", "KiB", "3.0", "KiB", "6.0", "KiB"]
-    assert "... 1 more" in table
-    assert "b.tmp" not in table
-
-
-def test_format_table_marks_absent_with_dash():
-    """A path missing from a snapshot shows '-', not 0 B, so 'not here' stays
-    distinguishable from 'present but empty'."""
-    result = excludes.ExclusionSet()
-    result.add("s1", "/bak/E/only-s1", 10, False)
-    result.add("s2", "/bak/E/only-s2", 20, False)
-    lines = excludes.format_table(result).splitlines()
-    # Snapshot columns are newest-first; the TOTAL column comes last.
-    assert lines[0].split() == ["s2", "s1", "TOTAL"]
-    assert "only-s1" in lines[1] and "-" in lines[1]
-    assert "only-s2" in lines[2] and "-" in lines[2]
-
-
-def test_format_table_empty_set_is_still_valid():
-    # Nothing excluded and no snapshots: nothing to render. Callers print their
-    # own "nothing to remove" line, so an empty string is the honest answer.
-    assert excludes.format_table(excludes.ExclusionSet()) == ""
-
-
-def test_format_entries_limits_with_note():
-    result = excludes.ExclusionSet()
-    for i in range(5):
-        result.add(None, f"/bak/E/f{i}", 1, False)
-    out = excludes.format_entries(result, limit=2, rules=False)
-    assert len(out) == 3
-    assert out[-1] == "... 3 more"
-
-
-def test_format_entries_groups_by_rule_and_leads_with_size():
-    """Size before the path, because the reader's question is what it costs."""
-    result = excludes.ExclusionSet()
-    result.add(None, "/bak/E/a.tmp", 2048, False, "*.tmp")
-    result.add(None, "/bak/E/b.tmp", 1024, False, "*.tmp")
-    result.add(None, "/bak/E/cache", 4096, True, "cache")
-    out = "\n".join(excludes.format_entries(result))
-
-    assert "*.tmp" in out and "cache" in out
-    # Every row starts with its size once indented under its rule.
-    assert "  4.0 KiB  /bak/E/cache  [d]" in out
-    assert "  2.0 KiB  /bak/E/a.tmp  [-]" in out
-    # The bigger rule is listed first.
-    assert out.index("cache") < out.index("*.tmp")
-
-
-def test_format_entries_can_restrict_to_changed_rules():
-    """A trial set lists only what its own rules matched, so the config's
-    existing thousands of rows do not bury the answer."""
-    result = excludes.ExclusionSet()
-    result.add(None, "/bak/E/old.tmp", 10, False, "*.tmp")
-    result.add(None, "/bak/E/new.iso", 20, False, "*.iso")
-    out = "\n".join(excludes.format_entries(result, only_rules={"*.iso"}))
-    assert "new.iso" in out
-    assert "old.tmp" not in out
-
-
-def test_by_rule_totals():
-    result = excludes.ExclusionSet()
-    result.add(None, "/bak/E/a.tmp", 10, False, "*.tmp")
-    result.add(None, "/bak/E/b.tmp", 20, False, "*.tmp")
-    result.add(None, "/bak/E/cache", 40, True, "cache")
-    totals = {t.rule: (t.files, t.bytes) for t in result.by_rule()}
-    assert totals == {"*.tmp": (2, 30), "cache": (1, 40)}
-    # Largest first.
-    assert next(t.rule for t in result.by_rule()) == "cache"
 
 
 # --- patterns digest (completion stamp) ---------------------------------

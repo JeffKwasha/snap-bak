@@ -195,14 +195,23 @@ class TestJobValidators:
                 repo="r",
             )
 
-    def test_missing_snapshot_dir_rejected(self, tmp_path):
-        with pytest.raises(ValidationError):
-            Job(
-                name="ok",
-                snapshot_dir=tmp_path / "nope",
-                source_subvolume=tmp_path,
-                repo="r",
-            )
+    def test_a_missing_snapshot_dir_still_loads(self, tmp_path):
+        """`snapshot_dir` is machine state, not config shape.
+
+        Nothing creates this directory, so a new job's is absent until an admin
+        makes it. Validating it at load time made the config that would have
+        named that job unloadable, took down every other job with it, and
+        blocked read-only commands that never touch it. It is checked where it
+        is used, by `Runner.create_snapshot` — which names the job and says what
+        is actually wrong.
+        """
+        job = Job(
+            name="ok",
+            snapshot_dir=tmp_path / "nope",
+            source_subvolume=tmp_path,
+            repo="r",
+        )
+        assert job.snapshot_dir == tmp_path / "nope"
 
     def test_snapshot_interval_minimum(self, tmp_path):
         with pytest.raises(ValidationError):
