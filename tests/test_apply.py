@@ -23,7 +23,6 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from pathlib import Path
 
 import pytest
 from conftest import backup, init_repo, resolved_job, restic, stored_files

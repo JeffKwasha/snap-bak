@@ -8,13 +8,11 @@ decides exclusions with that engine, so any divergence would make every
 inspection mode report the wrong files.
 """
 
-import os
 
 import pytest
 
 from snap_bak import excludes
 from snap_bak.excludes import BadPatternError
-
 
 # --- restic matchTests (filter_test.go) ------------------------------------
 
@@ -519,8 +517,8 @@ def _make_tree(root):
 def test_walk_excluded_uses_backup_root_paths(tmp_path):
     root = _make_tree(tmp_path / "src")
     found = dict(
-        (p, (size, is_dir))
-        for p, size, is_dir in excludes.walk_excluded(
+        (w.path, (w.size, w.is_dir))
+        for w in excludes.walk_excluded(
             root, "/bak/data", excludes.parse_patterns(["*.tmp", "cache"])
         )
     )
@@ -537,8 +535,8 @@ def test_walk_does_not_descend_into_excluded_directory(tmp_path):
     listed individually (restic prunes rather than descending)."""
     root = _make_tree(tmp_path / "src")
     paths = [
-        p
-        for p, _size, _is_dir in excludes.walk_excluded(
+        w.path
+        for w in excludes.walk_excluded(
             root, "/bak/E", excludes.parse_patterns(["cache"])
         )
     ]
@@ -581,7 +579,9 @@ def test_walk_excluded_trailing_slash_root(tmp_path):
     found = list(
         excludes.walk_excluded(tmp_path, "/bak/x/", excludes.parse_patterns(["*.tmp"]))
     )
-    assert found == [("/bak/x/d.tmp", 3, False)]
+    assert [(w.path, w.size, w.is_dir) for w in found] == [
+        ("/bak/x/d.tmp", 3, False)
+    ]
 
 
 def test_walk_excluded_does_not_follow_symlinked_dirs(tmp_path):
@@ -672,7 +672,9 @@ def test_walk_excludes_symlinked_dir_by_name_without_descending(tmp_path):
     found = list(
         excludes.walk_excluded(root, "/bak/x", excludes.parse_patterns(["cache"]))
     )
-    assert found == [("/bak/x/cache", len(str(outside)), False)]
+    assert [(w.path, w.size, w.is_dir) for w in found] == [
+        ("/bak/x/cache", len(str(outside)), False)
+    ]
 
 
 def test_walk_prices_matched_symlink_by_its_own_size(tmp_path):
@@ -686,7 +688,9 @@ def test_walk_prices_matched_symlink_by_its_own_size(tmp_path):
     found = list(
         excludes.walk_excluded(root, "/bak/x", excludes.parse_patterns(["*.tmp"]))
     )
-    assert found == [("/bak/x/alias.tmp", len(str(target)), False)]
+    assert [(w.path, w.size, w.is_dir) for w in found] == [
+        ("/bak/x/alias.tmp", len(str(target)), False)
+    ]
 
 
 def test_walk_prunes_excluded_directory_even_with_negated_child(tmp_path):
@@ -700,8 +704,8 @@ def test_walk_prunes_excluded_directory_even_with_negated_child(tmp_path):
     (root / "top.txt").write_text("t")
 
     found = dict(
-        (p, (size, is_dir))
-        for p, size, is_dir in excludes.walk_excluded(
+        (w.path, (w.size, w.is_dir))
+        for w in excludes.walk_excluded(
             root, "/bak/x", excludes.parse_patterns(["**/cache", "!cache/keep"])
         )
     )
@@ -839,9 +843,47 @@ def test_format_entries_limits_with_note():
     result = excludes.ExclusionSet()
     for i in range(5):
         result.add(None, f"/bak/E/f{i}", 1, False)
-    out = excludes.format_entries(result, limit=2)
+    out = excludes.format_entries(result, limit=2, rules=False)
     assert len(out) == 3
     assert out[-1] == "... 3 more"
+
+
+def test_format_entries_groups_by_rule_and_leads_with_size():
+    """Size before the path, because the reader's question is what it costs."""
+    result = excludes.ExclusionSet()
+    result.add(None, "/bak/E/a.tmp", 2048, False, "*.tmp")
+    result.add(None, "/bak/E/b.tmp", 1024, False, "*.tmp")
+    result.add(None, "/bak/E/cache", 4096, True, "cache")
+    out = "\n".join(excludes.format_entries(result))
+
+    assert "*.tmp" in out and "cache" in out
+    # Every row starts with its size once indented under its rule.
+    assert "  4.0 KiB  /bak/E/cache  [d]" in out
+    assert "  2.0 KiB  /bak/E/a.tmp  [-]" in out
+    # The bigger rule is listed first.
+    assert out.index("cache") < out.index("*.tmp")
+
+
+def test_format_entries_can_restrict_to_changed_rules():
+    """A trial set lists only what its own rules matched, so the config's
+    existing thousands of rows do not bury the answer."""
+    result = excludes.ExclusionSet()
+    result.add(None, "/bak/E/old.tmp", 10, False, "*.tmp")
+    result.add(None, "/bak/E/new.iso", 20, False, "*.iso")
+    out = "\n".join(excludes.format_entries(result, only_rules={"*.iso"}))
+    assert "new.iso" in out
+    assert "old.tmp" not in out
+
+
+def test_by_rule_totals():
+    result = excludes.ExclusionSet()
+    result.add(None, "/bak/E/a.tmp", 10, False, "*.tmp")
+    result.add(None, "/bak/E/b.tmp", 20, False, "*.tmp")
+    result.add(None, "/bak/E/cache", 40, True, "cache")
+    totals = {t.rule: (t.files, t.bytes) for t in result.by_rule()}
+    assert totals == {"*.tmp": (2, 30), "cache": (1, 40)}
+    # Largest first.
+    assert next(t.rule for t in result.by_rule()) == "cache"
 
 
 # --- patterns digest (completion stamp) ---------------------------------

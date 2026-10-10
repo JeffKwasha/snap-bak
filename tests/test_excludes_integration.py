@@ -89,8 +89,8 @@ def test_matcher_agrees_with_what_restic_actually_excludes(repo, tree):
     # neither. That is the property the whole feature rests on.
     all_files = {str(p) for p in tree.rglob("*") if p.is_file() or p.is_symlink()}
     excluded = {
-        path
-        for path, _size, _is_dir in excludes.walk_excluded(
+        w.path
+        for w in excludes.walk_excluded(
             tree, str(tree), excludes.parse_patterns(patterns)
         )
     }

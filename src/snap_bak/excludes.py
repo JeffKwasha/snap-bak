@@ -666,10 +666,30 @@ class ExcludedEntry:
     path: str
     is_dir: bool
     size: int = 0
+    # The pattern text responsible, when attribution was requested. A directory
+    # row is attributed to the rule that matched the directory itself, not to
+    # whatever happened to match the files inside it.
+    rule: str | None = None
+    # Files this row accounts for: 1 for a file, the subtree's count for a
+    # matched directory. Kept on the row so a per-row CSV can carry it, rather
+    # than only having the set-wide total.
+    files: int = 1
 
     @property
     def sort_key(self) -> tuple:
         return (not self.is_dir, self.path)
+
+
+@dataclass
+class RuleTotals:
+    """What one exclude rule accounts for: how much, and under which rule."""
+
+    rule: str
+    files: int = 0
+    bytes: int = 0
+
+    def to_json(self) -> dict:
+        return {"rule": self.rule, "files": self.files, "bytes": self.bytes}
 
 
 @dataclass
@@ -679,14 +699,41 @@ class ExclusionSet:
     entries: dict[str, ExcludedEntry] = field(default_factory=dict)
     # snapshot label -> {entry path: bytes}
     per_snapshot: dict[str, dict[str, int]] = field(default_factory=dict)
+    # Whether `add` should attribute each row to the rule that matched it.
+    # Off by default because it costs a match per entry, and callers that only
+    # render a flat list do not need it.
+    attribute_rules: bool = False
+    _file_count: int = field(default=0)
 
-    def add(self, snapshot: str | None, path: str, size: int, is_dir: bool) -> None:
+    def add(
+        self,
+        snapshot: str | None,
+        path: str,
+        size: int,
+        is_dir: bool,
+        rule: str | None = None,
+        is_file: int | bool = True,
+    ) -> None:
+        """Record one excluded path.
+
+        `is_file` is the number of files this row accounts for, so it accepts an
+        int: a directory row is priced by walking its subtree and reports how
+        many files that walk found. Pass 1 for an ordinary file. Counting such a
+        row as a single "file" is what makes a total-files figure mean "files
+        that would be dropped" rather than "files that would be listed".
+        """
         entry = self.entries.get(path)
         if entry is None:
-            entry = self.entries[path] = ExcludedEntry(path, is_dir)
+            entry = self.entries[path] = ExcludedEntry(
+                path, is_dir, rule=rule, files=0
+            )
         elif is_dir:
             entry.is_dir = True
+        elif entry.rule is None:
+            entry.rule = rule
         entry.size += size
+        entry.files += is_file
+        self._file_count += is_file
         if snapshot is not None:
             self.per_snapshot.setdefault(snapshot, {})
             self.per_snapshot[snapshot][path] = (
@@ -708,24 +755,67 @@ class ExclusionSet:
     def total_size(self) -> int:
         return sum(e.size for e in self.entries.values())
 
+    @property
+    def total_files(self) -> int:
+        """Files that would be dropped.
+
+        Free to report: every traversal that produces byte totals has already
+        visited each file it counted, so this needs no extra IO. Counted during
+        the walk rather than derived from `len(entries)`, because one directory
+        row stands for a whole subtree.
+        """
+        return self._file_count
+
+    def by_rule(self) -> list[RuleTotals]:
+        """Totals per exclude rule, largest first, unattributed rows last.
+
+        A row with no rule (attribution was off, or only a negation decided the
+        outcome) is grouped under `None` rather than being silently dropped —
+        bytes that cannot be explained are the ones worth noticing.
+        """
+        totals: dict[str | None, RuleTotals] = {}
+        for entry in self.entries.values():
+            t = totals.get(entry.rule)
+            if t is None:
+                t = totals[entry.rule] = RuleTotals(entry.rule or "(unattributed)")
+            # A directory row is a subtree: report it as one entry, since the
+            # per-path row is what the reader sees.
+            t.files += 1
+            t.bytes += entry.size
+        return sorted(totals.values(), key=lambda t: (-t.bytes, t.rule))
+
     def ordered_entries(self) -> list[ExcludedEntry]:
         return sorted(self.entries.values(), key=lambda e: e.sort_key)
+
+
+def _subtree_totals(root: Path) -> tuple[int, int]:
+    """(bytes, files) beneath `root`. Symlinks are not followed.
+
+    Used to price a matched directory as one row. Symlinks are counted by their
+    own size and never traversed, matching how the walk classifies them.
+
+    Both numbers come from one traversal: a caller wanting a file total alongside
+    the byte total must not pay for a second walk of the subtree, which on a
+    large excluded directory is the expensive part.
+    """
+    total = 0
+    files = 0
+    for dirpath, _dirs, names in os.walk(root, followlinks=False):
+        for name in names:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                continue
+            files += 1
+    return total, files
 
 
 def _subtree_size(root: Path) -> int:
     """Total apparent size of every file beneath `root` (symlinks not followed).
 
-    Used to price a matched directory as one row. Symlinks are counted by their
-    own size and never traversed, matching how the walk classifies them.
+    Kept as a named single-purpose wrapper: several callers want only the bytes.
     """
-    total = 0
-    for dirpath, _dirs, files in os.walk(root, followlinks=False):
-        for name in files:
-            try:
-                total += os.lstat(os.path.join(dirpath, name)).st_size
-            except OSError:
-                continue
-    return total
+    return _subtree_totals(root)[0]
 
 
 def _claiming_directory(matched_dirs: Sequence[str], path: str) -> str | None:
@@ -749,12 +839,56 @@ def _claiming_directory(matched_dirs: Sequence[str], path: str) -> str | None:
 # --------------------------------------------------------------------------
 
 
+@dataclass
+class WalkedPath:
+    """One excluded path found by a filesystem walk.
+
+    A record rather than a bare tuple because the walk now also reports which
+    rule matched and how many files the row stands for, and unpacking a growing
+    tuple at three call sites was getting unreadable.
+    """
+
+    path: str
+    size: int
+    is_dir: bool
+    rule: str | None = None
+    # Files this row accounts for. 1 for a file, the subtree's file count for a
+    # matched directory. Always >= 1, so `None` (unknown) is distinguishable
+    # from a genuinely empty directory.
+    files: int = 1
+
+    def as_tuple(self) -> tuple[str, int, bool]:
+        """The (path, size, is_dir) triple older callers expect."""
+        return self.path, self.size, self.is_dir
+
+
+def _rule_matching(patterns: Sequence[Pattern], path: str) -> str | None:
+    """The rule text that matches `path` on its own, for attributing a row.
+
+    Answered per rule rather than from the combined verdict, because several
+    rules can match one path and the reader needs to see which one the bytes are
+    being charged to. Negated rules are skipped: a `!` rule never *causes* an
+    exclusion, it only withholds one.
+    """
+    strs = split_path(path)
+    for p in patterns:
+        if p.is_negated:
+            continue
+        try:
+            if _match_parts(p, strs):
+                return p.original
+        except BadPatternError:
+            continue
+    return None
+
+
 def walk_excluded(
     root: Path,
     backup_root: str,
     patterns: Sequence[Pattern],
-) -> Iterator[tuple[str, int, bool]]:
-    """Yield (backup-time path, size, is_dir) for everything excluded under `root`.
+    attribute_rules: bool = False,
+) -> Iterator[WalkedPath]:
+    """Yield every excluded path under `root`, with its size and rule.
 
     `backup_root` is the mount-point path restic saw at backup time (e.g.
     `/bak/data`); every candidate is rewritten onto it, so results describe
@@ -765,13 +899,17 @@ def walk_excluded(
     prunes an excluded directory rather than descending into it. Symlinks are
     never followed: restic stores a link as a link.
 
+    The subtree walk that prices a matched directory already visits every file
+    beneath it, so the file count comes free from the same traversal rather than
+    costing a second pass.
+
     Unreadable directories and vanished files are skipped, not fatal — an
     inspection must survive a source subvolume it cannot read.
     """
     root = Path(root)
     base = clean_path(backup_root)
 
-    def scan(directory: Path, rel: str) -> Iterator[tuple[str, int, bool]]:
+    def scan(directory: Path, rel: str) -> Iterator[WalkedPath]:
         try:
             with os.scandir(directory) as it:
                 entries = sorted(it, key=lambda e: e.name)
@@ -792,8 +930,19 @@ def walk_excluded(
                 continue
             if is_dir:
                 if hit:
-                    # One row for the directory, bytes = whole subtree.
-                    yield child_path, _subtree_size(Path(entry.path)), True
+                    # One row for the directory, bytes = whole subtree. The
+                    # pricing walk visits every file beneath it, so the file
+                    # count comes out of the same traversal.
+                    size, files = _subtree_totals(Path(entry.path))
+                    yield WalkedPath(
+                        child_path,
+                        size,
+                        True,
+                        _rule_matching(patterns, child_path)
+                        if attribute_rules
+                        else None,
+                        files,
+                    )
                     continue
                 yield from scan(Path(entry.path), child_rel)
             elif hit:
@@ -803,7 +952,13 @@ def walk_excluded(
                     size = entry.stat(follow_symlinks=False).st_size
                 except OSError:
                     continue
-                yield child_path, size, False
+                yield WalkedPath(
+                    child_path,
+                    size,
+                    False,
+                    _rule_matching(patterns, child_path) if attribute_rules else None,
+                    1,
+                )
 
     yield from scan(root, "")
 
@@ -843,6 +998,7 @@ def collect_from_listing(
     snapshot: str,
     patterns: Sequence[Pattern],
     into: ExclusionSet | None = None,
+    attribute_rules: bool = False,
 ) -> ExclusionSet:
     """Filter a stored file listing through `patterns`, accumulating an ExclusionSet.
 
@@ -853,17 +1009,26 @@ def collect_from_listing(
     Two passes, so the result does not depend on listing order: first find the
     directories that match (these prune their subtrees), then credit each path
     to the shallowest directory claiming it, or make it a row of its own.
+
+    Unlike the filesystem walk, every file in the listing is already in hand, so
+    the file total is exact and free — each path credited to a matched directory
+    counts as one file that would be dropped.
     """
     result = into if into is not None else ExclusionSet()
+    result.attribute_rules = attribute_rules
     items = list(paths)
 
     matched_dirs: list[str] = []
+    dir_rules: dict[str, str | None] = {}
     for path, _size, is_dir in items:
         if not is_dir:
             continue
         try:
             if excluded(patterns, path):
                 matched_dirs.append(path)
+                dir_rules.setdefault(
+                    path, _rule_matching(patterns, path) if attribute_rules else None
+                )
         except BadPatternError:
             # restic rejects the pattern; --lint reports that separately.
             continue
@@ -871,15 +1036,24 @@ def collect_from_listing(
     for path, size, is_dir in items:
         parent = _claiming_directory(matched_dirs, path)
         if parent is not None:
-            # Inside an excluded directory: the directory's row carries it.
-            result.add(snapshot, parent, size, False)
+            # Inside an excluded directory: the directory's row carries it, and
+            # it counts as a real file so the total reflects files dropped.
+            result.add(
+                snapshot, parent, size, False, dir_rules.get(parent), True
+            )
             continue
         try:
             hit = excluded(patterns, path)
         except BadPatternError:
             continue
         if hit:
-            result.add(snapshot, path, size, is_dir)
+            result.add(
+                snapshot,
+                path,
+                size,
+                is_dir,
+                _rule_matching(patterns, path) if attribute_rules else None,
+            )
     return result
 
 
@@ -973,17 +1147,77 @@ def format_table(exclusions: ExclusionSet, limit: int | None = None) -> str:
     return "\n".join(lines)
 
 
-def format_entries(exclusions: ExclusionSet, limit: int | None = None) -> list[str]:
-    """Excluded paths as a plain list (the `--live` presentation).
+def format_entries(
+    exclusions: ExclusionSet,
+    limit: int | None = None,
+    rules: bool = True,
+    only_rules: set[str] | None = None,
+) -> list[str]:
+    """Excluded paths grouped by the rule responsible, largest rule first.
 
-    `limit` bounds the list, with a trailing note for what was withheld.
+    Size precedes the path: the reader's question is "what does this cost", and
+    a column of bytes answers it without arithmetic on the reader's part.
+
+    `only_rules` restricts the *listing* to rows attributed to those rules. The
+    totals are unaffected, so a non-verbose report of what a trial changes still
+    carries the full cost. `rules=False` gives the older flat path list.
     """
     entries = exclusions.ordered_entries()
+    if only_rules is not None:
+        entries = [e for e in entries if e.rule in only_rules]
+
     shown = entries[:limit] if limit else entries
-    out = [e.path for e in shown]
-    if limit and len(entries) > limit:
-        out.append(f"... {len(entries) - limit} more")
+    if not rules:
+        out = [e.path for e in shown]
+        if limit and len(entries) > limit:
+            out.append(f"... {len(entries) - limit} more")
+        return out
+
+    size_width = max(9, *(len(human_bytes(e.size)) for e in shown)) if shown else 9
+    out: list[str] = []
+    grouped: dict[str | None, list[ExcludedEntry]] = {}
+    for entry in shown:
+        grouped.setdefault(entry.rule, []).append(entry)
+
+    for rule, rows in sorted(
+        grouped.items(), key=lambda kv: -sum(e.size for e in kv[1])
+    ):
+        label = rule if rule is not None else "(no single rule matched)"
+        subtotal = sum(e.size for e in rows)
+        out.append(
+            f"  {label}  —  {len(rows)} row(s), "
+            f"{human_bytes(subtotal)}"
+        )
+        for entry in rows:
+            kind = "d" if entry.is_dir else "-"
+            out.append(
+                f"      {human_bytes(entry.size).rjust(size_width)}  "
+                f"{entry.path}  [{kind}]"
+            )
+        if limit and len(entries) > limit:
+            out.append(f"      ... {len(entries) - limit} more (totals cover all)")
+            break
     return out
+
+
+def to_csv(rows: list[dict]) -> str:
+    """Render records as CSV.
+
+    Byte counts are emitted as raw integers rather than human strings, so a
+    spreadsheet can sum them; `bytes_human` is alongside for reading. Paths may
+    contain commas and quotes, so they go through the csv module rather than a
+    join.
+    """
+    import csv
+    import io
+
+    if not rows:
+        return ""
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(rows[0]))
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue()
 
 
 def patterns_digest(patterns: Sequence[str]) -> str:

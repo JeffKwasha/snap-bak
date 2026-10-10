@@ -20,6 +20,7 @@ import logging
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from snap_bak import __version__, apply, config, excludes, job, todo
@@ -165,7 +166,72 @@ def _selected_jobs(cfg: config.Config, name: str | None, path: str) -> list:
     return chosen
 
 
-def _patterns_for(rj) -> tuple[list[str], list[excludes.Pattern], str]:
+class PatternOverride:
+    """A trial pattern set for one `show` invocation, and how it differs.
+
+    Lets a working file be evaluated against the real config without editing it.
+    `--excludes-file` and `--exclude` accept exactly the syntax the config's own
+    `ignore_file` uses, so a pattern can be copied between them unchanged; both
+    are added to the config's patterns rather than replacing them, because the
+    question being asked is "what would these *extra* rules exclude, and what
+    would they cost".
+
+    Order is preserved and meaningful: restic applies `!` negation in sequence,
+    and config patterns come first so an added rule cannot accidentally re-
+    include something the config excludes.
+    """
+
+    def __init__(
+        self,
+        excludes_file: str | None = None,
+        extra: list[str] | None = None,
+    ):
+        self.excludes_file = excludes_file
+        self.extra = list(extra or [])
+
+    @property
+    def active(self) -> bool:
+        return bool(self.excludes_file or self.extra)
+
+    def apply(self, config_patterns: list[str]) -> list[str]:
+        """The patterns to evaluate: config rules, then the trial's own."""
+        added: list[str] = []
+        if self.excludes_file:
+            added.extend(excludes.read_pattern_file(self.excludes_file))
+        added.extend(self.extra)
+        return list(config_patterns) + added
+
+    def diff(self, config_patterns: list[str]) -> dict:
+        """Which of the effective patterns are not in the config's set.
+
+        Set difference on the pattern text, so an edited rule reads as one
+        removal and one addition rather than a change nobody can see. Returns
+        config patterns too, because "you are running against these" is the fact
+        a caller most needs to be able to print.
+        """
+        effective = self.apply(config_patterns)
+        added = [p for p in effective if p not in config_patterns]
+        removed = [p for p in config_patterns if p not in effective]
+        return {
+            "excludes_file": self.excludes_file,
+            "effective": effective,
+            "config": list(config_patterns),
+            "added": added,
+            "removed": removed,
+        }
+
+    def changed_rules(self, config_patterns: list[str]) -> set[str]:
+        """The rule texts a caller would want called out: the additions.
+
+        Removals cannot match anything, so they appear in the diff header and
+        never as output rows.
+        """
+        return set(self.diff(config_patterns)["added"])
+
+
+def _patterns_for(
+    rj, override: PatternOverride | None = None
+) -> tuple[list[str], list[excludes.Pattern], str]:
     """The job's pattern list, parsed, plus the path prefix restic stored.
 
     Every mode goes through here: they must all answer the same question
@@ -173,18 +239,25 @@ def _patterns_for(rj) -> tuple[list[str], list[excludes.Pattern], str]:
     same way and match them against the same path basis.
     """
     raw = excludes.patterns_for_job(rj.job)
+    if override is not None and override.active:
+        raw = override.apply(raw)
     return raw, excludes.parse_patterns(raw), rj.backup_root
 
 
-def _do_lint(jobs: list, as_json: bool) -> int:
+def _do_lint(
+    jobs: list, as_json: bool, override: PatternOverride | None = None
+) -> int:
     """Report malformed patterns, and anchored ones that can never match.
 
     Always run and silent when clean, so there is no `--lint` flag: it is not
     optional, and offering it would imply that the modes skip it.
+
+    Linted against the patterns actually being evaluated, so a trial file's own
+    broken pattern is reported rather than quietly ignored.
     """
     found = []
     for rj in jobs:
-        raw, _, root = _patterns_for(rj)
+        raw, _, root = _patterns_for(rj, override)
         for issue in excludes.lint(raw, root):
             found.append({"job": rj.job.name, **vars(issue)})
 
@@ -199,82 +272,206 @@ def _do_lint(jobs: list, as_json: bool) -> int:
     return config.EXIT_SUCCESS
 
 
-def _scan_live(rj) -> tuple[excludes.ExclusionSet, str]:
+def _scan_live(
+    rj, attribute: bool = False, override: PatternOverride | None = None
+) -> tuple[excludes.ExclusionSet, str]:
     """The live source subvolume: no mount, no restic, no writes."""
-    _, patterns, root = _patterns_for(rj)
+    _, patterns, root = _patterns_for(rj, override)
     found = excludes.ExclusionSet()
-    for path, size, is_dir in excludes.walk_excluded(
-        Path(rj.job.source_subvolume), root, patterns
+    for walked in excludes.walk_excluded(
+        Path(rj.job.source_subvolume), root, patterns, attribute_rules=attribute
     ):
-        found.add(None, path, size, is_dir)
+        found.add(
+            None, walked.path, walked.size, walked.is_dir, walked.rule, walked.files
+        )
     return found, root
 
 
-def _scan_snaps(rj) -> tuple[excludes.ExclusionSet, str]:
+def _scan_snaps(
+    rj, attribute: bool = False, override: PatternOverride | None = None
+) -> tuple[excludes.ExclusionSet, str]:
     """Each local btrfs snapshot dir, labelled by its snapshot name."""
-    _, patterns, root = _patterns_for(rj)
+    _, patterns, root = _patterns_for(rj, override)
     found = excludes.ExclusionSet()
     for snap in snapshot_model.Snapshot.scan(rj.job.snapshot_dir):
-        for path, size, is_dir in excludes.walk_excluded(snap.path, root, patterns):
-            found.add(snap.name, path, size, is_dir)
+        for walked in excludes.walk_excluded(
+            snap.path, root, patterns, attribute_rules=attribute
+        ):
+            found.add(
+                snap.name, walked.path, walked.size, walked.is_dir,
+                walked.rule, walked.files,
+            )
     return found, root
 
 
-def _do_live(jobs: list, limit: int | None, as_json: bool) -> int:
+@dataclass
+class _View:
+    """How one `show` invocation should be rendered.
+
+    Bundles the presentation choices so the three modes cannot drift on what
+    "text output" means — the size column, the rule grouping and the totals
+    footer have to appear consistently whether the reader asked for `--live` or
+    `--snaps`.
+    """
+
+    limit: int | None = None
+    as_json: bool = False
+    fmt: str = "text"
+    verbose: bool = False
+    override: PatternOverride | None = None
+
+    @property
+    def csv(self) -> bool:
+        return self.fmt == "csv"
+
+    def only_rules(self, rj) -> set[str] | None:
+        """Which rows to list, or None for all of them.
+
+        A trial set normally lists only what its own new rules matched: the
+        config's rules are already in effect, so re-listing thousands of rows
+        they account for buries the answer. `-v` asks for everything.
+        """
+        if self.verbose or self.override is None or not self.override.active:
+            return None
+        base = excludes.patterns_for_job(rj.job)
+        changed = self.override.changed_rules(base)
+        return changed or None
+
+    def totals_line(self, found: excludes.ExclusionSet) -> str:
+        """Bytes and files for the whole set, never just the shown rows."""
+        return (
+            f"{excludes.human_bytes(found.total_size)} in "
+            f"{found.total_files} file(s), {len(found.entries)} row(s)"
+        )
+
+
+def _do_live(jobs: list, view: _View) -> int:
     """Walk each job's live source subvolume and list what the rules exclude.
 
     Read-only, and local: nothing is mounted and restic is never invoked, so
     this answers "what would the next backup skip?" without touching the repo.
     """
-    scans = [(rj, *_scan_live(rj)) for rj in jobs]
-    if as_json:
+    scans = [(rj, *_scan_live(rj, attribute=True, override=view.override))
+             for rj in jobs]
+    if view.as_json:
         print(json.dumps({"live": [apply.payload(r.job.name, root, f) for r, f, root in scans]}, indent=2))
         return config.EXIT_SUCCESS
+    if view.csv:
+        rows = []
+        for rj, found, _root in scans:
+            rows.extend(_csv_rows(rj, found, view))
+        print(excludes.to_csv(rows), end="")
+        return config.EXIT_SUCCESS
+
     for rj, found, root in scans:
-        print(f"=== {rj.job.name} ({root}): {len(found.entries)} excluded, "
-              f"{excludes.human_bytes(found.total_size)} ===")
+        print(f"=== {rj.job.name} ({root}): {view.totals_line(found)} ===")
         if not found.entries:
+            print("  nothing excluded by these rules")
             continue
-        for line in excludes.format_entries(found, limit):
-            print(f"  {line}")
+        for line in excludes.format_entries(
+            found, view.limit, only_rules=view.only_rules(rj)
+        ):
+            print(line)
+        print(f"  TOTAL: {view.totals_line(found)}")
     return config.EXIT_SUCCESS
 
 
-def _do_snaps(jobs: list, limit: int | None, as_json: bool) -> int:
+def _csv_rows(rj, found: excludes.ExclusionSet, view: _View) -> list[dict]:
+    """One record per excluded row, for a spreadsheet.
+
+    `bytes` stays numeric so a sum works; `bytes_human` is there for reading.
+    `files` is the count the row stands for, so a directory row carrying a
+    subtree reports the subtree's file count rather than 1.
+    """
+    only = view.only_rules(rj)
+    rows = []
+    for entry in found.ordered_entries():
+        if only is not None and entry.rule not in only:
+            continue
+        rows.append(
+            {
+                "job": rj.job.name,
+                "rule": entry.rule or "",
+                "path": entry.path,
+                "is_dir": entry.is_dir,
+                "files": entry.files,
+                "bytes": entry.size,
+                "bytes_human": excludes.human_bytes(entry.size),
+            }
+        )
+    return rows
+
+
+def _do_snaps(jobs: list, view: _View) -> int:
     """Per-snapshot table across each job's local btrfs snapshot dirs."""
-    scans = [(rj, *_scan_snaps(rj)) for rj in jobs]
-    if as_json:
+    scans = [(rj, *_scan_snaps(rj, attribute=True, override=view.override))
+             for rj in jobs]
+    if view.as_json:
         print(json.dumps({"snaps": [apply.payload(r.job.name, root, f) for r, f, root in scans]}, indent=2))
         return config.EXIT_SUCCESS
+    if view.csv:
+        rows = []
+        for rj, found, _root in scans:
+            rows.extend(_csv_rows(rj, found, view))
+        print(excludes.to_csv(rows), end="")
+        return config.EXIT_SUCCESS
+
     for rj, found, root in scans:
-        print(f"=== {rj.job.name} ({root}) ===")
+        print(f"=== {rj.job.name} ({root}): {view.totals_line(found)} ===")
         if not found.per_snapshot:
             print("  no snapshots found")
             continue
-        print(excludes.format_table(found, limit))
+        print(excludes.format_table(found, view.limit))
+        print()
+        for line in excludes.format_entries(
+            found, view.limit, only_rules=view.only_rules(rj)
+        ):
+            print(line)
+        print(f"  TOTAL: {view.totals_line(found)}")
     return config.EXIT_SUCCESS
 
 
-def _do_repo(jobs: list, limit: int | None, as_json: bool) -> int:
+def _do_repo(jobs: list, view: _View) -> int:
     """What restic already stores, per snapshot (network, metadata only).
 
     This is the same plan `apply` would execute, from the same `plan()` call, so
     the table a user reads here is by construction the table the rewrite acts on.
     """
-    plans = [apply.plan(job.Runner(rj)) for rj in jobs]
-    if as_json:
-        print(json.dumps({"repo": [p.to_json() for p in plans]}, indent=2))
-        return _plan_exit_code(plans)
-    for p in plans:
-        print(f"=== {p.job} ({p.root}) ===")
+    plans = []
+    for rj in jobs:
+        runner = job.Runner(rj)
+        p = apply.plan(runner, patterns=_patterns_for(rj, view.override)[1])
+        plans.append((rj, p))
+
+    if view.as_json:
+        print(json.dumps({"repo": [p.to_json() for _r, p in plans]}, indent=2))
+        return _plan_exit_code([p for _r, p in plans])
+    if view.csv:
+        rows = []
+        for rj, p in plans:
+            if p.query_error is not None:
+                continue
+            rows.extend(_csv_rows(rj, p.found, view))
+        print(excludes.to_csv(rows), end="")
+        return _plan_exit_code([p for _r, p in plans])
+
+    for rj, p in plans:
+        print(f"=== {p.job} ({p.root}): {view.totals_line(p.found)} ===")
         if p.query_error is not None:
             print(f"  {describe_query_error(p.query_error)}")
             continue
         if not p.found.per_snapshot:
             print("  no snapshots matched")
             continue
-        print(excludes.format_table(p.found, limit))
-    return _plan_exit_code(plans)
+        print(excludes.format_table(p.found, view.limit))
+        print()
+        for line in excludes.format_entries(
+            p.found, view.limit, only_rules=view.only_rules(rj)
+        ):
+            print(line)
+        print(f"  would rewrite {len(p.snapshot_ids)} snapshot(s)")
+        print(f"  TOTAL: {view.totals_line(p.found)}")
+    return _plan_exit_code([p for _r, p in plans])
 
 
 def describe_query_error(e: job.RepoQueryError) -> str:
@@ -525,12 +722,25 @@ class _RefuseSelector(argparse.Action):
     `apply` removes files from what restic stored. A selector aimed at the live
     filesystem or the local snapshots is a mistake worth naming, not an
     unrecognized-flag mystery — and never something to silently discard.
+
+    A trial pattern set is refused for a different reason: rewriting real
+    backups against rules the deployment does not use would remove data on the
+    strength of an experiment. The trial belongs to `show`, and `apply` acts on
+    what is actually configured.
     """
 
-    def __init__(self, option_strings, dest, **kwargs):
-        super().__init__(option_strings, dest, nargs=0, **kwargs)
+    def __init__(self, option_strings, dest, nargs=None, **kwargs):
+        super().__init__(option_strings, dest, nargs=nargs, **kwargs)
 
     def __call__(self, parser, namespace, values, option_string=None):
+        if option_string in ("--excludes-file", "-e", "--exclude"):
+            parser.error(
+                f"{option_string} tries the rewrite against a trial pattern set, "
+                "but `apply excludes` rewrites real backups and must use the "
+                "rules the job is actually configured with. Review the trial "
+                "with `snap-bak show excludes --excludes-file ...`, then edit "
+                "the config's ignore_file and apply against the real config."
+            )
         parser.error(
             f"{option_string} inspects the live filesystem or the local snapshots, "
             "but `apply excludes` only removes files from restic. To inspect what "
@@ -564,7 +774,19 @@ def excludes_parser(verb: str) -> argparse.ArgumentParser:
     parser.add_argument("-j", "--job", default=None)
     parser.add_argument("--json", action="store_true", help="Machine-readable output.")
     parser.add_argument(
+        "--format",
+        choices=("text", "csv"),
+        default="text",
+        help="Output format for the row listing (default: text).",
+    )
+    parser.add_argument(
         "--limit", type=int, default=None, help="Bound displayed rows (totals still cover all)."
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="List every excluded path, not just those from changed rules.",
     )
 
     if verb == "show":
@@ -576,6 +798,28 @@ def excludes_parser(verb: str) -> argparse.ArgumentParser:
             "--repo", action="store_true", help="Match files already in restic (network)."
         )
         parser.add_argument("--all", action="store_true", help="Every selector.")
+        parser.add_argument(
+            "--excludes-file",
+            metavar="PATH",
+            default=None,
+            help=(
+                "Evaluate this pattern file's rules in addition to the job's. "
+                "Same syntax as a job's ignore_file: one restic exclude pattern "
+                "per line, '#' comments, '!' negation. The config is not "
+                "modified, and this cannot remove the job's own rules."
+            ),
+        )
+        parser.add_argument(
+            "-e",
+            "--exclude",
+            action="append",
+            default=[],
+            metavar="PATTERN",
+            help=(
+                "Add one restic exclude pattern, in the same syntax the "
+                "excludes file uses. Repeatable; added after --excludes-file."
+            ),
+        )
     else:
         parser.add_argument(
             "--now", action="store_true", help="Execute the rewrite now."
@@ -583,9 +827,19 @@ def excludes_parser(verb: str) -> argparse.ArgumentParser:
         parser.add_argument(
             "--later", action="store_true", help="Arm the next scheduled run."
         )
-        for refused in ("--live", "--snaps", "--all"):
+        for refused in (
+            "--live",
+            "--snaps",
+            "--all",
+            "--excludes-file",
+            "-e",
+            "--exclude",
+        ):
             parser.add_argument(
-                refused, action=_RefuseSelector, help=argparse.SUPPRESS
+                refused,
+                nargs=0 if refused.startswith("--") else 1,
+                action=_RefuseSelector,
+                help=argparse.SUPPRESS,
             )
     return parser
 
@@ -603,24 +857,88 @@ def _excludes_main(argv: list[str], config_path: str) -> None:
     jobs = _selected_jobs(config.Config.load(Path(cfg_path)), args.job, cfg_path)
 
     if verb == "show":
-        _do_lint(jobs, args.json)  # always; silent when clean
+        override = PatternOverride(
+            getattr(args, "excludes_file", None), getattr(args, "exclude", None)
+        )
+        if override.active:
+            missing = _missing_trial_file(override, jobs)
+            if missing:
+                logger.error(
+                    "Cannot read the trial excludes file: %s. A job's own "
+                    "ignore_file needs read access to the snap-bak group; a "
+                    "trial file must be readable by whoever runs this command.",
+                    missing,
+                )
+                sys.exit(config.EXIT_ERROR)
+            _report_override(override, jobs, as_csv=args.format == "csv")
+
+        view = _View(
+            limit=args.limit,
+            as_json=args.json,
+            fmt=args.format,
+            verbose=args.verbose,
+            override=override,
+        )
+        _do_lint(jobs, args.json, override)  # always; silent when clean
         # A `show` that cannot reach what it was asked about must not exit 0.
         # The worst outcome for a caller is a clean report that was never
         # actually checked, so each mode's code is accumulated, never overwritten.
         code = config.EXIT_SUCCESS
         for mode in _selected_modes(args):
             if mode == "live":
-                _do_live(jobs, args.limit, args.json)
+                _do_live(jobs, view)
             elif mode == "snaps":
-                _do_snaps(jobs, args.limit, args.json)
+                _do_snaps(jobs, view)
             elif mode == "repo":
                 # Accumulate rather than overwrite: `--all` includes --repo, so a
                 # last-wins assignment would let an unreachable repository be
                 # reported as a clean success by the modes that ran after it.
-                code = max(code, _do_repo(jobs, args.limit, args.json))
+                code = max(code, _do_repo(jobs, view))
         sys.exit(code)
 
     sys.exit(_do_apply(jobs, args.now, args.later, args.json, args.limit))
+
+
+def _missing_trial_file(override: PatternOverride, jobs: list) -> str | None:
+    """The trial pattern file that cannot be read, if any."""
+    if not override.excludes_file:
+        return None
+    try:
+        excludes.read_pattern_file(override.excludes_file)
+    except OSError as e:
+        return f"{override.excludes_file} ({e.strerror or e})"
+    return None
+
+
+def _report_override(
+    override: PatternOverride, jobs: list, as_csv: bool = False
+) -> None:
+    """Print how the trial pattern set differs from the config, per job.
+
+    Printed before the report rather than buried in it: the whole risk of a
+    trial is acting on numbers that came from a different rule set, so which
+    rules those were belongs at the top.
+
+    Suppressed under `--format csv`, since a CSV consumer is piping this into a
+    spreadsheet and a prose header would corrupt the first record. The same
+    facts remain in the `added`/`removed` lists a `--json` caller can read.
+    """
+    for rj in jobs:
+        base = excludes.patterns_for_job(rj.job)
+        d = override.diff(base)
+        if (not d["added"] and not d["removed"]) or as_csv:
+            continue
+        print(f"=== {rj.job.name}: trial pattern set ===")
+        if override.excludes_file:
+            print(f"  from: {override.excludes_file}")
+        for rule in d["added"]:
+            print(f"  + {rule}")
+        for rule in d["removed"]:
+            # Removed rules cannot match anything, so they are named here and
+            # never appear as result rows.
+            print(f"  - {rule}  (matches nothing; listed for completeness)")
+        if not d["added"]:
+            print("  no new rules, so nothing extra would be excluded")
 
 
 def _selected_modes(args) -> tuple[str, ...]:
@@ -640,7 +958,18 @@ def _main_parser() -> argparse.ArgumentParser:
     """The normal-run argument parser (also handles --list-jobs)."""
     parser = argparse.ArgumentParser(
         description="Btrfs Snapshot -> Restic Backup Orchestrator",
-        epilog="Config: %(default)s | Env: SNAPBAK_CONFIG_FILE, SNAPBAK_JOB",
+        epilog=(
+            "Subcommands (run with no subcommand for a normal backup run):\n"
+            "  show excludes [SELECTOR]   inspect exclude patterns; read-only.\n"
+            "                             --live (default, local) --snaps (local)\n"
+            "                             --repo (network) --all\n"
+            "                             --excludes-file PATH  try a working\n"
+            "                             pattern file against the real config\n"
+            "  apply excludes [--now|--later]\n"
+            "                           rewrite excluded files out of restic\n"
+            "\n"
+            "Config: see -c, or SNAPBAK_CONFIG_FILE / SNAPBAK_JOB"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(

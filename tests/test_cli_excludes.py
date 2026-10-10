@@ -98,7 +98,7 @@ class TestLintOutput:
 class TestLiveOutput:
     def test_live_lists_excluded_with_sizes(self, tmp_path, monkeypatch, capsys):
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp", "cache"])
-        assert cli._do_live([rj], limit=None, as_json=False) == config.EXIT_SUCCESS
+        assert cli._do_live([rj], cli._View()) == config.EXIT_SUCCESS
         out = capsys.readouterr().out
         assert "a.tmp" in out
         assert "cache" in out
@@ -106,7 +106,7 @@ class TestLiveOutput:
 
     def test_live_json(self, tmp_path, monkeypatch, capsys):
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
-        cli._do_live([rj], limit=None, as_json=True)
+        cli._do_live([rj], cli._View(as_json=True))
         data = json.loads(capsys.readouterr().out)
         entry = data["live"][0]
         assert entry["count"] == 1
@@ -117,7 +117,7 @@ class TestLiveOutput:
         rj, src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
         for i in range(5):
             (src / f"f{i}.tmp").write_text("x")
-        cli._do_live([rj], limit=2, as_json=False)
+        cli._do_live([rj], cli._View(limit=2))
         out = capsys.readouterr().out
         assert "... 4 more" in out
         assert "f0.tmp" in out
@@ -132,7 +132,7 @@ class TestSnapsOutput:
             d.mkdir()
             (d / "a.tmp").write_text("x" * 10)
             (d / "keep.txt").write_text("k")
-        cli._do_snaps([rj], limit=None, as_json=False)
+        cli._do_snaps([rj], cli._View())
         out = capsys.readouterr().out
         assert "2026-10-06_10:00Z" in out
         assert "2026-10-05_10:00Z" in out
@@ -140,7 +140,7 @@ class TestSnapsOutput:
 
     def test_snaps_json(self, tmp_path, monkeypatch, capsys):
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
-        cli._do_snaps([rj], limit=None, as_json=True)
+        cli._do_snaps([rj], cli._View(as_json=True))
         data = json.loads(capsys.readouterr().out)
         assert data["snaps"][0]["snapshots"] == []
 
@@ -167,7 +167,7 @@ class TestRepoOutput:
         # unreachable-repo tests below must not swallow.
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
         with _empty_repo(rj):
-            assert cli._do_repo([rj], limit=None, as_json=False) == config.EXIT_SUCCESS
+            assert cli._do_repo([rj], cli._View()) == config.EXIT_SUCCESS
             assert "no snapshots matched" in capsys.readouterr().out
 
     def test_repo_shows_stored_matches(self, tmp_path, monkeypatch, capsys):
@@ -176,7 +176,7 @@ class TestRepoOutput:
         rj, src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp", "cache"])
         init_repo(str(tmp_path / "repo"))
         backup(str(tmp_path / "repo"), src, "--exclude", "*.tmp")
-        cli._do_repo([rj], limit=None, as_json=False)
+        cli._do_repo([rj], cli._View())
         out = capsys.readouterr().out
         assert "cache" in out
         assert "BYTES TO EXCLUDE" in out
@@ -401,7 +401,7 @@ class TestUnreachableRepoReporting:
         rj = self._unreachable(tmp_path / "broken", monkeypatch)
         # 30 (delayed), not 41: restic 10/11/12 are environmental and may well
         # be fine on the next run.
-        assert cli._do_repo([rj], limit=None, as_json=False) == config.EXIT_TEMP_UNREACHABLE
+        assert cli._do_repo([rj], cli._View()) == config.EXIT_TEMP_UNREACHABLE
         out = capsys.readouterr().out
         assert "could not read repository" in out
         assert "no snapshots matched" not in out, "must not read as a clean result"
@@ -410,7 +410,7 @@ class TestUnreachableRepoReporting:
         self, tmp_path, monkeypatch, capsys
     ):
         rj = self._unreachable(tmp_path / "broken", monkeypatch)
-        cli._do_repo([rj], limit=None, as_json=True)
+        cli._do_repo([rj], cli._View(as_json=True))
         body = json.loads(capsys.readouterr().out)["repo"][0]
         assert body["snapshot_ids"] == []
         assert body["query_error"]["returncode"] == 10
@@ -441,7 +441,7 @@ class TestUnreachableRepoReporting:
         monkeypatch.setattr(
             job.Runner, "repo_snapshots", lambda self: (_ for _ in ()).throw(caught.value)
         )
-        assert cli._do_repo([rj], limit=None, as_json=False) == config.EXIT_PERM_FAILED
+        assert cli._do_repo([rj], cli._View()) == config.EXIT_PERM_FAILED
 
     def test_one_broken_repo_does_not_hide_a_healthy_one(
         self, tmp_path, monkeypatch, capsys
@@ -455,12 +455,12 @@ class TestUnreachableRepoReporting:
         backup(repo, str(src), "--exclude", "*.tmp")
         bad = self._unreachable(tmp_path / "broken", monkeypatch)
 
-        codes = {id(good): cli._do_repo([good], limit=None, as_json=False)}
+        codes = {id(good): cli._do_repo([good], cli._View())}
         assert codes[id(good)] == config.EXIT_SUCCESS
         out = capsys.readouterr().out
         assert "cache" in out, "the healthy repo must still be reported"
 
-        assert cli._do_repo([good, bad], limit=None, as_json=False) == (
+        assert cli._do_repo([good, bad], cli._View()) == (
             config.EXIT_TEMP_UNREACHABLE
         )
         out = capsys.readouterr().out

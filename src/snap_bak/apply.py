@@ -65,6 +65,11 @@ def payload(job_name: str, root: str, found: excludes.ExclusionSet) -> dict:
         },
         "count": len(found.entries),
         "total_size": found.total_size,
+        # `files` counts files that would be dropped, which is not the same as
+        # `count`: one directory row stands for a whole subtree. `by_rule`
+        # answers "which rule is responsible for what".
+        "total_files": found.total_files,
+        "by_rule": [t.to_json() for t in found.by_rule()],
     }
 
 
@@ -80,6 +85,12 @@ def entries_json(found: excludes.ExclusionSet) -> list[dict]:
             "path": e.path,
             "size": e.size,
             "is_dir": e.is_dir,
+            # Null rather than omitted when attribution was not requested, so
+            # the key set does not depend on which mode produced the document.
+            "rule": e.rule,
+            # Files this row stands for: 1, or the subtree's count for a
+            # matched directory.
+            "files": e.files,
             "per_snapshot": {
                 s: found.size_in_of(e.path, s)
                 for s in found.per_snapshot
@@ -134,12 +145,16 @@ class Plan:
         return body
 
 
-def plan(runner) -> Plan:
+def plan(runner, patterns: list[excludes.Pattern] | None = None) -> Plan:
     """Scan this job's stored snapshots and decide what a rewrite would remove.
 
     Read-only. Executes no restic command that can mutate, creates, or delete
     anything; the only restic calls are `snapshots` and `ls --long`, both
     metadata.
+
+    `patterns` lets `show` evaluate a trial rule set against stored data without
+    the config being touched. `execute` never passes it, so a rewrite can only
+    ever act on the patterns the job is configured with.
 
     An unreachable or locked repository is recorded on the returned `Plan` as
     `query_error` rather than raised. Raising would abort the whole command when
@@ -151,11 +166,11 @@ def plan(runner) -> Plan:
     A snapshot that dies *mid-scan* is the opposite case and stays non-fatal: a
     target we failed to see is not removed, which is the safe direction.
     """
-    patterns = excludes.patterns_for_job(runner.job)
-    parsed = excludes.parse_patterns(patterns)
+    raw = excludes.patterns_for_job(runner.job)
+    parsed = patterns if patterns is not None else excludes.parse_patterns(raw)
     root = str(runner.mount_point)
 
-    invalid = excludes.validate_patterns(patterns)
+    invalid = excludes.validate_patterns(raw)
     if invalid or not parsed:
         # restic would reject these, so there is nothing coherent to plan.
         return Plan(runner.job.name, root, excludes.ExclusionSet())
