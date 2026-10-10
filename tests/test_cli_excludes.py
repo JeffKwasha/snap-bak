@@ -749,3 +749,54 @@ class TestFileTotalsAreFree:
         """restic applies `!` negation in sequence, so position can matter."""
         ov = cli.PatternOverride(None, ["!keep", "*.a", "!keep2", "*.b"])
         assert ov.apply([]) == ["!keep", "*.a", "!keep2", "*.b"]
+
+
+class TestTrialNegation:
+    """How a trial pattern set interacts with the config's own rules.
+
+    Prune semantics beneath an excluded directory are restic's own and already
+    pinned in test_excludes.py against the golden suite. What is new here is the
+    *override plumbing* placing a trial's rules after the config's, and so these
+    pin the two consequences of that ordering - which cut in opposite directions.
+    """
+
+    def test_a_trial_negation_cancels_a_config_rule_of_the_same_target(
+        self, tmp_path, monkeypatch
+    ):
+        """Negation is sequential and the trial runs last, so it wins.
+
+        Verified against `restic backup`: `--exclude cache --exclude '!cache'`
+        stores the directory. Documented because it is the opposite of the
+        intuition that a trial can only tighten.
+        """
+        rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["cache"])
+        baseline = cli._scan_live(rj, attribute=True)[0]
+        assert baseline.entries, "the fixture must exclude something"
+
+        after = cli._scan_live(
+            rj, attribute=True, override=cli.PatternOverride(None, ["!cache"])
+        )[0]
+        assert after.entries == {}, "the trial's negation cancels the config's rule"
+
+    def test_a_trial_cannot_reach_inside_a_directory_it_excluded(
+        self, tmp_path, monkeypatch
+    ):
+        """The bound on the above: nothing later applies beneath a pruned dir."""
+        rj, src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["cache"])
+        trial = cli.PatternOverride(
+            None, ["!cache/keep", "!cache/big.bin", "!cache"]
+        )
+        found = cli._scan_live(rj, attribute=True, override=trial)[0]
+        # Negating the directory itself restores it wholesale; the two rules
+        # naming things inside it contributed nothing, because pruning meant they
+        # were never evaluated against those paths.
+        assert found.entries == {}, "cancelled at the directory, as restic does"
+
+    def test_dedup_preserves_rule_order(self):
+        """dict.fromkeys, not a set: negation is order-sensitive.
+
+        A set would silently reorder the user's rules and change what they
+        match. The order of the negated pairs is what makes this observable.
+        """
+        ov = cli.PatternOverride(None, ["!keep", "*.a", "!keep2", "*.b"])
+        assert ov.apply([]) == ["!keep", "*.a", "!keep2", "*.b"]

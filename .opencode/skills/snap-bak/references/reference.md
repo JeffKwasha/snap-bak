@@ -45,16 +45,40 @@ them. They take the same syntax an `ignore_file` uses, so a rule moves between
 the two unchanged. The config is never modified. An unreadable trial file exits
 1 rather than silently falling back to the config's rules.
 
+Effective order is `config → --excludes-file → -e`, with duplicates dropped
+keeping first occurrence (`dict.fromkeys`, not a `set`: restic applies `!`
+negation sequentially, so `['**','!keep']` and `['!keep','**']` give opposite
+answers and a set would silently reorder the user's rules).
+
+Two consequences, verified against `restic backup`:
+
+- A trial's `!` **does** cancel a config rule naming the same target
+  (`cache` then `!cache` stores the directory). Negation is sequential and the
+  trial runs last. A trial cannot *reorder*, though; the order above is fixed.
+- A trial's `!` cannot reach **inside** a directory an earlier pattern already
+  matched. Once `node_modules/` matched, both `!node_modules/keepme/` and
+  `!node_modules/keepme/vital.js` were ignored and nothing under it stored. The
+  negation that works names the directory itself, after the exclusion
+  (`logs/` then `!logs/`, which does restore the directory and its contents).
+  To keep one file out of a wholesale-excluded directory, exclude that file
+  directly rather than its parent.
+
 Without `-v`, a trial lists only rows attributed to its own added rules.
 Totals are unaffected.
 
 Cost, measured on an 80k-file tree: `--live` ~4.7s with a normal pattern set,
-~56s with 40 `**` patterns. `--repo` is one `restic ls --long` per stored
+**~56s with 40 `**` patterns** — pattern count multiplies path count, so `**`
+rules are the cost driver. `--repo` is one `restic ls --long` per stored
 snapshot (~1.8s each locally).
 
 **Do not prune the repo listing by listing subdirectories instead of the whole
 tree.** Each restic invocation costs ~0.75s before doing any work; 200 pruned
-`ls <snap>:<subdir>` calls measured 150s against 1.8s for one full listing.
+`ls <snap>:<subdir>` calls measured 150s against 1.8s for one full listing
+(84x slower). On rclone that fixed cost is a network round trip.
+
+Neither `restic backup --dry-run` nor `find` is a substitute: `--dry-run` reports
+only what it **kept**, never an excluded path, and `find` has no equivalent for
+`!` negation.
 
 ### `apply excludes`
 

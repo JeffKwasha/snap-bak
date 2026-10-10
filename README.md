@@ -538,6 +538,29 @@ config's rules are already in effect, and re-listing thousands of rows they
 account for buries the answer. The totals always cover everything. `-v` lists
 every excluded path.
 
+**Rules are applied in order: config → working file → `-e`.** Two consequences
+worth knowing before you rely on a `!`:
+
+- **A trial's `!` does override a config rule of the same target.** `-e
+  '!cache'` cancels a configured `cache`. This is restic's sequential negation,
+  and matches what `restic backup` would store.
+- **But it cannot reach *inside* a directory that was already matched.** That
+  pattern matches first and restic never descends, so a later `!` naming a path
+  beneath it — `!node_modules/keepme/` or even `!node_modules/keepme/vital.js` —
+  has nothing to act on. Verified against `restic backup`: once `node_modules/`
+  matched, both were ignored and nothing under it was stored.
+
+  The negation that works is one naming the **directory itself**, in the same
+  file and after the exclusion:
+
+  ```
+  logs/            # exclude the directory
+  !logs/           # then re-include the directory, and everything in it
+  ```
+
+  To keep one file out of a directory that is excluded wholesale, exclude that
+  file directly instead of excluding its parent.
+
 `apply` refuses `--excludes-file` and `-e` and says why: rewriting real backups
 against rules the deployment does not use would remove data on the strength of
 an experiment. Review the trial with `show`, then edit the config and apply

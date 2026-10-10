@@ -86,6 +86,35 @@ snap-bak apply excludes --job data --later  # queue for the next run
 
 Ad-hoc rules work too: `-e '*.iso' -e 'build/cache/'`, repeatable.
 
+**Rule order is `config → --excludes-file → -e`.** Two things follow, and they
+cut in opposite directions — both verified against `restic backup`, not assumed:
+
+- **A trial's `!` DOES cancel a config rule of the same target.** `-e '!cache'`
+  against a configured `cache` re-includes the directory. Negation is sequential
+  and the trial runs after the config, so it wins. What a trial cannot do is
+  *reorder* rules.
+- **But it cannot reach INSIDE a directory that was already matched.** That
+  pattern matches first and restic never descends, so a later `!` naming a path
+  beneath it — `!node_modules/keepme/` or even `!node_modules/keepme/vital.js` —
+  has nothing to act on. Once `node_modules/` matched, both were ignored and
+  nothing under it was stored.
+
+The negation that works names the **directory itself**, in the same file and
+after the exclusion:
+
+```
+logs/            # exclude the directory
+!logs/           # then re-include the directory and everything in it
+```
+
+To keep one file out of a directory excluded wholesale, exclude that file
+directly rather than its parent.
+
+If a user expects `-e '!something/inner'` to rescue a path inside an excluded
+directory, say plainly that it cannot, and point at the directory-level form.
+Do not work around it: this is restic's prune behaviour, and snap-bak matches it
+deliberately so the report agrees with what restic would actually do.
+
 Without `-v`, a trial lists only rows its **new** rules matched — the config's
 rules already apply and would bury the answer. Totals always cover everything, so
 the cost of the whole change is still shown. `-v` lists every excluded path.
@@ -119,10 +148,15 @@ experiment. Do not work around this; the refusal is the correct behaviour.
 | `--live` with a normal pattern set | ~4.7s |
 | `--live` with 40 `**` patterns | ~56s |
 | One `restic ls --long` per snapshot | ~1.8s each |
+| 200 pruned `restic ls <snap>:<subdir>` calls | ~150s |
 
-`--repo` issues one `restic ls --long` per stored snapshot. Do not try to
-"optimise" this by listing subdirectories instead: each restic call costs ~0.75s
-before any work, so 200 pruned calls took 150s where one full listing took 1.8s.
+**`**` patterns are the cost driver, not the tree size** — pattern count
+multiplies path count. Many `**` rules in an ignore file is the thing to watch.
+
+**Never try to prune the `--repo` listing** by listing subdirectories instead of
+the whole tree. It is 84x slower: each restic invocation costs ~0.75s before
+doing any work, so N pruned calls lose to one full listing at any N above two,
+and on rclone that fixed cost is a network round trip.
 
 ## Exit codes
 
