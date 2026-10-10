@@ -734,3 +734,18 @@ class TestFileTotalsAreFree:
         assert by_path["/bak/x/cache"] == 1
         assert by_path["/bak/x/top.tmp"] == 1
         assert found.total_files == 2
+
+    def test_a_rule_named_twice_is_one_rule(self, tmp_path):
+        """Named on the command line *and* in the working file: one rule the
+        user wrote twice, not two additions."""
+        trial = tmp_path / "work.ignore"
+        trial.write_text("*.iso\nbuild/cache/\n")
+        ov = cli.PatternOverride(str(trial), ["*.iso"])
+        effective = ov.apply(["*.tmp"])
+        assert effective == ["*.tmp", "*.iso", "build/cache/"]
+        assert ov.diff(["*.tmp"])["added"] == ["*.iso", "build/cache/"]
+
+    def test_deduplication_does_not_reorder_negated_rules(self):
+        """restic applies `!` negation in sequence, so position can matter."""
+        ov = cli.PatternOverride(None, ["!keep", "*.a", "!keep2", "*.b"])
+        assert ov.apply([]) == ["!keep", "*.a", "!keep2", "*.b"]

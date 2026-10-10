@@ -195,12 +195,22 @@ class PatternOverride:
         return bool(self.excludes_file or self.extra)
 
     def apply(self, config_patterns: list[str]) -> list[str]:
-        """The patterns to evaluate: config rules, then the trial's own."""
+        """The patterns to evaluate: config rules, then the trial's own.
+
+        Deduplicated on the pattern text, keeping first occurrence. A rule named
+        both on the command line and in the working file is one rule the user
+        wrote twice, and listing it twice in the diff header would read as two
+        separate additions. Order is otherwise untouched: restic applies `!`
+        negation in sequence, so a rule's position can matter and nothing here
+        may reorder it.
+        """
         added: list[str] = []
         if self.excludes_file:
             added.extend(excludes.read_pattern_file(self.excludes_file))
         added.extend(self.extra)
-        return list(config_patterns) + added
+        seen: set[str] = set()
+        unique = [p for p in added if not (p in seen or seen.add(p))]
+        return list(config_patterns) + unique
 
     def diff(self, config_patterns: list[str]) -> dict:
         """Which of the effective patterns are not in the config's set.
