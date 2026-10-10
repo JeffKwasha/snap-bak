@@ -32,22 +32,35 @@ Read-only. Never creates, removes, or modifies a snapshot or a local file.
 | `--snaps` | Match local btrfs snapshots (local, instant) |
 | `--repo` | Match files already stored in restic (network, metadata only) |
 | `--all` | All three, in one pass |
+| `--excludes-file PATH` | Add a working pattern file's rules to the job's |
+| `-e, --exclude PATTERN` | Add one rule, repeatable |
 | `-j, --job NAME` | Scope to one job |
 | `--json` | Machine-readable |
+| `--format text\|csv` | Row listing format (default: text) |
+| `-v, --verbose` | List every excluded path, not just the trial's new rules |
 | `--limit N` | Bound displayed rows. Totals still cover every match |
 
-Patterns are linted on **every** invocation and print nothing when clean, so
-there is no `--lint` flag to remember. Lint findings go to stderr; `--json` emits
-a `{"lint": {"issues": [...]}}` document.
+`--excludes-file` and `-e` **add to** the job's patterns rather than replacing
+them. They take the same syntax an `ignore_file` uses, so a rule moves between
+the two unchanged. The config is never modified. An unreadable trial file exits
+1 rather than silently falling back to the config's rules.
 
-Cost: `--live` and `--snaps` are local and instant. `--repo` reaches the network
-for metadata only, and on a large repository issues one `restic ls --long` per
-stored snapshot, so it can take a while.
+Without `-v`, a trial lists only rows attributed to its own added rules.
+Totals are unaffected.
+
+Cost, measured on an 80k-file tree: `--live` ~4.7s with a normal pattern set,
+~56s with 40 `**` patterns. `--repo` is one `restic ls --long` per stored
+snapshot (~1.8s each locally).
+
+**Do not prune the repo listing by listing subdirectories instead of the whole
+tree.** Each restic invocation costs ~0.75s before doing any work; 200 pruned
+`ls <snap>:<subdir>` calls measured 150s against 1.8s for one full listing.
 
 ### `apply excludes`
 
-Restic-only. Refuses `--live`, `--snaps` and `--all`, because those name places
-it never removes files from.
+Restic-only. Refuses `--live`, `--snaps`, `--all`, `--excludes-file` and
+`-e`, each with an explanation — a trial rule set must never be able to drive a
+rewrite of real backups.
 
 | Flag | Meaning |
 |------|---------|
@@ -58,6 +71,22 @@ it never removes files from.
 | `--json` | Machine-readable |
 
 `--now` and `--later` are mutually exclusive.
+
+### Output
+
+Text output groups rows by the rule responsible, largest rule first, with the
+size before the path and a per-rule subtotal. A matched directory is one row
+standing for its subtree — restic prunes rather than descending.
+
+`--format csv` columns: `job, rule, path, is_dir, files, bytes, bytes_human`.
+`bytes` is numeric so a spreadsheet can sum it. The prose diff header is
+suppressed under CSV, since it would corrupt the first record.
+
+`--json` carries `total_files` (files that would be dropped, not row count) and
+`by_rule` totals; each entry has `rule` (null when unattributed) and `files`.
+
+Scan progress goes to stderr about once a second, only when stderr is a terminal
+or `-v` was passed, and never while emitting `--json` or `--format csv`.
 
 ## Exit codes
 

@@ -1,6 +1,6 @@
 ---
 name: snap-bak
-description: Operate and verify the snap-bak backup tool (btrfs snapshots + restic) on a host. Use when asked to run, check, troubleshoot, or validate backups; interpret snap-bak logs or exit codes; inspect, test, or apply exclude patterns; or verify that a backup is actually working. Triggers - snap-bak, restic, btrfs snapshot, backup verification, excludes, ignore_file, "are my backups working", "why did my backup fail", disk space not being reclaimed.
+description: Operate and verify the snap-bak backup tool (btrfs snapshots + restic) on a host. Use when asked to run, check, troubleshoot, or validate backups; interpret snap-bak logs or exit codes; inspect, test, trial, or apply exclude patterns, including with a working or alternate excludes file; or verify that a backup is actually working. Triggers - snap-bak, restic, btrfs snapshot, backup verification, excludes, ignore_file, --excludes-file, "are my backups working", "why did my backup fail", "which files would be excluded", disk space not being reclaimed.
 version: 1.0.0
 tags: [backups, restic, btrfs, sysadmin, linux, operations]
 category: devops
@@ -36,10 +36,10 @@ Do these in order, cheapest first. All are read-only.
 # 1. Is the config even valid? (exit 2 = bad config, fix that first)
 snap-bak -c /opt/snap-bak/config.json --list-jobs
 
-# 2. Are the exclude patterns sane, and what do they match on disk? (local, instant)
+# 2. Are the exclude patterns sane, and what do they match on disk? (local)
 snap-bak show excludes
 
-# 3. What would a backup skip, per local snapshot? (local, instant)
+# 3. What would a backup skip, per local snapshot? (local)
 snap-bak show excludes --snaps
 
 # 4. What is already stored in restic? (NETWORK - metadata only)
@@ -59,6 +59,70 @@ For full per-run detail, read the state file and the journal:
 cat /opt/snap-bak/state/<job>.json     # last status + anything queued
 journalctl -u snap-bak --since "2 days ago" --no-pager
 ```
+
+## Working out an exclude change
+
+The deployment order is **live → snaps → repo → apply**. Each step is cheaper
+and safer than the one after it, and `show` is read-only at every step.
+
+Change nothing to try a rule out. `--excludes-file` takes a working file in the
+same syntax the job's `ignore_file` uses — one restic pattern per line, `#`
+comments, `!` negation — and adds it to the job's own rules:
+
+```bash
+# 1. trial it locally, against the real config
+snap-bak show excludes --live --job data --excludes-file ~/work.ignore
+
+# 2. then against local snapshots (per-snapshot cost)
+snap-bak show excludes --snaps --job data --excludes-file ~/work.ignore
+
+# 3. then against what restic actually stores
+snap-bak show excludes --repo --job data --excludes-file ~/work.ignore
+
+# 4. satisfied: put the rules in the config's ignore_file, then
+snap-bak apply excludes --job data          # dry-run
+snap-bak apply excludes --job data --later  # queue for the next run
+```
+
+Ad-hoc rules work too: `-e '*.iso' -e 'build/cache/'`, repeatable.
+
+Without `-v`, a trial lists only rows its **new** rules matched — the config's
+rules already apply and would bury the answer. Totals always cover everything, so
+the cost of the whole change is still shown. `-v` lists every excluded path.
+
+A diff header prints the added and removed rules first, so a report is never
+ambiguous about which rules produced it.
+
+`apply` **refuses** `--excludes-file` and `-e`. Rewriting real backups against
+rules the deployment does not use would remove data on the strength of an
+experiment. Do not work around this; the refusal is the correct behaviour.
+
+**Read the output this way:**
+
+- Rows are grouped by the rule responsible, largest rule first, size before the
+  path.
+- A matched directory is one row standing for its whole subtree — restic prunes
+  rather than descending, so listing the files inside it adds nothing.
+- `file(s)` is the count of files that would actually be dropped. It is **not**
+  the same as `row(s)`: one directory row can stand for 2000 files.
+- The file count costs nothing extra: the traversal that prices a matched
+  directory already visits every file beneath it.
+- `--format csv` gives numeric `bytes` for summing plus `bytes_human` for
+  reading; columns `job, rule, path, is_dir, files, bytes, bytes_human`.
+- A long scan prints progress to stderr about once a second, only on a terminal
+  or with `-v`.
+
+**Cost, measured on an 80k-file tree:**
+
+| Operation | Time |
+|-----------|------|
+| `--live` with a normal pattern set | ~4.7s |
+| `--live` with 40 `**` patterns | ~56s |
+| One `restic ls --long` per snapshot | ~1.8s each |
+
+`--repo` issues one `restic ls --long` per stored snapshot. Do not try to
+"optimise" this by listing subdirectories instead: each restic call costs ~0.75s
+before any work, so 200 pruned calls took 150s where one full listing took 1.8s.
 
 ## Exit codes
 
@@ -117,10 +181,8 @@ present:
 `ignore_file` and per-job `excludes` decide what a **future** backup skips.
 They do not touch data already in restic — restic retention prunes whole
 snapshots, never a file subset. Editing `excludes` therefore never changes
-history.
-
-To remove already-stored files, use `apply excludes`. This is restic-only and
-never modifies the live filesystem or local snapshots.
+history. Removing already-stored files is a separate, explicit operation —
+see "Working out an exclude change" above for the whole flow, and:
 
 ```bash
 snap-bak apply excludes --job data             # dry-run: plan only
@@ -136,9 +198,10 @@ Pick deliberately:
   restic 11 and exit 30; the answer is `--later`, not a retry loop. An
   unreadable repository is **not** reported as "skipped: nothing to do" — it
   exits 30, because unknown is not the same as clean.
-- **`--later`** queues the work in the job's state file. The next run performs
-  it only when it is inside the backup window with at least half the window
-  remaining, and removes the entry when done. This is the default choice.
+- **`--later`** queues the work in the job's state file
+  (`/opt/snap-bak/state/<job>.json`, under `queued`), and the next run that has
+  enough window time left, after all backup work is done, carries it out and
+  then forgets it. This is the default choice.
 - No `--now`/`--later` = dry-run. Always do this first.
 
 `apply` refuses `--live`, `--snaps` and `--all` with an explanation. Those name

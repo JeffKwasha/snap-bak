@@ -502,6 +502,77 @@ snap-bak show excludes --repo --job data --json --limit 50
 a local file. Patterns are linted on every invocation and print **nothing** when
 they are clean, so there is no `--lint` flag to remember.
 
+### Trying a change before you make it
+
+`--excludes-file` and `-e` evaluate a **working** pattern set against the real
+config without editing it, so you can work out what to change before anything is
+deployed:
+
+```bash
+# A working file, same syntax as the job's own ignore_file
+snap-bak show excludes --live --excludes-file ~/work.ignore
+snap-bak show excludes --repo --job data --excludes-file ~/work.ignore
+
+# Or ad-hoc rules, repeatable
+snap-bak show excludes --live -e '*.iso' -e 'build/cache/'
+```
+
+Both take exactly the syntax an `ignore_file` uses — one restic exclude pattern
+per line, `#` comments, `!` negation — so a rule can be copied between them
+unchanged. They **add to** the job's own rules rather than replacing them, since
+the question is "what would these extra rules exclude, and what would they
+cost".
+
+A diff header names what the trial added and removed before the report, so the
+numbers below are never ambiguous about which rules produced them:
+
+```
+=== data: trial pattern set ===
+  from: /home/me/work.ignore
+  + *.iso
+  + build/cache/
+```
+
+Without `-v` a trial lists **only** the rows its own new rules matched — the
+config's rules are already in effect, and re-listing thousands of rows they
+account for buries the answer. The totals always cover everything. `-v` lists
+every excluded path.
+
+`apply` refuses `--excludes-file` and `-e` and says why: rewriting real backups
+against rules the deployment does not use would remove data on the strength of
+an experiment. Review the trial with `show`, then edit the config and apply
+against the real config.
+
+### Reading the output
+
+Rows are grouped by the rule responsible, largest rule first, with the size
+before the path:
+
+```
+=== data (/bak/E): 3.4 GiB in 18422 file(s), 96 row(s) ===
+  build/cache/  —  41 row(s), 2.1 GiB
+         97.7 MiB  /bak/E/build/cache  [d]
+```
+
+A matched directory is one row standing for its whole subtree — restic prunes
+rather than descending, so there is nothing to gain from listing the files
+inside it. `file(s)` counts the files that would actually be dropped, which is
+not the same as `row(s)`.
+
+`--format csv` emits `bytes` as an integer so a spreadsheet can sum it, with the
+human-readable form alongside for reading:
+
+```bash
+snap-bak show excludes --repo --job data --format csv -v > excluded.csv
+```
+
+Columns: `job, rule, path, is_dir, files, bytes, bytes_human`. `--json` carries
+the same figures plus `by_rule` totals.
+
+A long scan reports progress on stderr about once a second, but only when stderr
+is a terminal or `-v` was passed — a piped or journalled run gets results rather
+than commentary.
+
 The `--snaps` / `--repo` tables put one column per snapshot, showing how many
 bytes each snapshot would drop, with a total row. `-` means "not in that
 snapshot":
