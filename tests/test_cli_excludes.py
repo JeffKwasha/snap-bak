@@ -285,9 +285,10 @@ class TestApplyNow:
         # A repo that is missing may well be there on the next window, so this is
         # a temporary problem rather than a permanent one.
         assert result.status == job_mod.ResultStatus.DELAYED
-        assert "nothing changed" in result.reason
+        reason = result.reason or ""
+        assert "nothing changed" in reason
         # restic: 10 = repository does not exist.
-        assert "rc=10" in result.reason
+        assert "rc=10" in reason
 
 
 class TestQueueing:
@@ -765,9 +766,8 @@ class TestTrialNegation:
     ):
         """Negation is sequential and the trial runs last, so it wins.
 
-        Verified against `restic backup`: `--exclude cache --exclude '!cache'`
-        stores the directory. Documented because it is the opposite of the
-        intuition that a trial can only tighten.
+        The opposite of the intuition that a trial can only tighten, so it is
+        pinned explicitly.
         """
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["cache"])
         baseline = cli._scan_live(rj, attribute=True)[0]

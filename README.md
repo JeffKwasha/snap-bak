@@ -542,13 +542,12 @@ every excluded path.
 worth knowing before you rely on a `!`:
 
 - **A trial's `!` does override a config rule of the same target.** `-e
-  '!cache'` cancels a configured `cache`. This is restic's sequential negation,
-  and matches what `restic backup` would store.
+  '!cache'` cancels a configured `cache`, because negation is sequential and the
+  trial's rules are evaluated last.
 - **But it cannot reach *inside* a directory that was already matched.** That
   pattern matches first and restic never descends, so a later `!` naming a path
   beneath it — `!node_modules/keepme/` or even `!node_modules/keepme/vital.js` —
-  has nothing to act on. Verified against `restic backup`: once `node_modules/`
-  matched, both were ignored and nothing under it was stored.
+  has nothing to act on.
 
   The negation that works is one naming the **directory itself**, in the same
   file and after the exclusion:

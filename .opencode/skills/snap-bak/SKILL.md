@@ -87,7 +87,7 @@ snap-bak apply excludes --job data --later  # queue for the next run
 Ad-hoc rules work too: `-e '*.iso' -e 'build/cache/'`, repeatable.
 
 **Rule order is `config → --excludes-file → -e`.** Two things follow, and they
-cut in opposite directions — both verified against `restic backup`, not assumed:
+cut in opposite directions:
 
 - **A trial's `!` DOES cancel a config rule of the same target.** `-e '!cache'`
   against a configured `cache` re-includes the directory. Negation is sequential
@@ -96,8 +96,7 @@ cut in opposite directions — both verified against `restic backup`, not assume
 - **But it cannot reach INSIDE a directory that was already matched.** That
   pattern matches first and restic never descends, so a later `!` naming a path
   beneath it — `!node_modules/keepme/` or even `!node_modules/keepme/vital.js` —
-  has nothing to act on. Once `node_modules/` matched, both were ignored and
-  nothing under it was stored.
+  has nothing to act on.
 
 The negation that works names the **directory itself**, in the same file and
 after the exclusion:
@@ -141,22 +140,14 @@ experiment. Do not work around this; the refusal is the correct behaviour.
 - A long scan prints progress to stderr about once a second, only on a terminal
   or with `-v`.
 
-**Cost, measured on an 80k-file tree:**
+**Cost model for `--repo`:** one `restic ls --long` per stored snapshot, and
+that is the right shape. Do not "optimise" it into `restic ls <snap>:<subdir>`
+calls that skip excluded directories — each restic invocation costs ~0.75s
+before doing any work, so N pruned calls lose to one full listing at any N above
+two, and on rclone that fixed cost is a network round trip.
 
-| Operation | Time |
-|-----------|------|
-| `--live` with a normal pattern set | ~4.7s |
-| `--live` with 40 `**` patterns | ~56s |
-| One `restic ls --long` per snapshot | ~1.8s each |
-| 200 pruned `restic ls <snap>:<subdir>` calls | ~150s |
-
-**`**` patterns are the cost driver, not the tree size** — pattern count
-multiplies path count. Many `**` rules in an ignore file is the thing to watch.
-
-**Never try to prune the `--repo` listing** by listing subdirectories instead of
-the whole tree. It is 84x slower: each restic invocation costs ~0.75s before
-doing any work, so N pruned calls lose to one full listing at any N above two,
-and on rclone that fixed cost is a network round trip.
+`--live` cost scales with **file count x pattern count**. `**` rules are what
+inflate the pattern side; the expansion of each is resolved once and reused.
 
 ## Exit codes
 

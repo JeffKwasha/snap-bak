@@ -545,25 +545,22 @@ named both on the command line and in the file is one rule, announced once. Not
 a plain `set`: restic applies `!` negation sequentially, so order changes
 answers and a set would silently reorder the user's rules.
 
-Two consequences, both worth stating because they are easy to assume otherwise.
-Both verified against `restic backup` rather than reasoned about, and they cut
-in opposite directions:
+Two consequences, which are easy to assume otherwise and cut in opposite
+directions:
 
 - **A trial's `!` does override a config rule naming the same target.**
-  `--exclude cache --exclude '!cache'` stores the directory; so does a config
-  `cache` plus a trial `!cache`. Negation is sequential, and the trial's rules
-  are evaluated after the config's, so they win. What a trial cannot do is
+  Negation is sequential and the trial's rules are evaluated after the config's,
+  so `-e '!cache'` cancels a configured `cache`. What a trial cannot do is
   *reorder* — the effective order is fixed at `config → file → -e`.
 - **A trial's `!` cannot reach *inside* a directory an earlier pattern already
   matched.** Those patterns run first and prune the directory, so restic never
   descends and the later `!` has nothing to act on — the same prune semantics as
-  any other walk (see *Pattern matching*). Once `node_modules/` matched, both
-  `!node_modules/keepme/` and `!node_modules/keepme/vital.js` were ignored and
-  nothing under it was stored. The negation that works is one naming the
-  **directory itself**, in the same file and after the exclusion (`logs/` then
-  `!logs/`, which does restore the directory and its contents). To keep one file
-  out of a directory excluded wholesale, exclude that file directly rather than
-  its parent.
+  any other walk (see *Pattern matching*). Both `!node_modules/keepme/` and
+  `!node_modules/keepme/vital.js` are therefore ignored once `node_modules/`
+  matches. The negation that works is one naming the **directory itself**, in the
+  same file and after the exclusion (`logs/` then `!logs/`, which does restore
+  the directory and its contents). To keep one file out of a directory excluded
+  wholesale, exclude that file directly rather than its parent.
 
 So a trial set is not strictly "tightening only": it can cancel a rule outright,
 and it can never reach beneath a pruned directory.
@@ -596,23 +593,13 @@ empty `snapshots` / `per_snapshot` rather than omitting the keys.
 
 `src/snap_bak/excludes.py` is a faithful port of restic's own exclusion engine
 (`internal/filter`, matching restic 0.19.1) so listings agree with what restic
-would do.
+would do. restic's documentation of pattern syntax is the authority.
 
-**Where the rules come from.** restic's documentation (`doc/040_backup.rst`,
-"Excluding files") is the authority for **syntax** and covers it well:
-`filepath.Match` per segment, `**` as a complete path component, patterns
-matched on complete path components, a leading `/` anchoring at the root, **a
-trailing `/` being ignored** (so `foo/` ≡ `foo` — it is *not* a
-directories-only marker, and this was confirmed against `restic backup`), blank
-and `#` lines dropped, `$VAR` expansion with `$$` for a literal dollar, and
-`~` deliberately *not* expanded.
-
-It says nothing at all about **negation**. The word does not appear in the
-backup documentation, nor does any statement of what happens when a directory
-matches. Everything below about `!` and about pruning was therefore established
-by experiment against `restic backup` rather than read, and is pinned by
-`tests/test_excludes.py` against restic's own golden cases plus the CLI
-integration test. Do not go looking for a citation that does not exist.
+Negation and prune behaviour are **not** documented upstream — restic describes
+pattern syntax and says nothing about `!` or about what a matched directory does
+to later rules. Those rules below are therefore the volatile kind: a restic
+release may change them, and the port is expected to follow rather than to be
+argued with. See `docs/verification.md` for what was established and when.
 
 Ported semantics:
 
@@ -620,12 +607,16 @@ Ported semantics:
   `[^a]`, `\` escapes. Deliberately **not** Python `fnmatch`.
 - A pattern with no leading `/` matches at **any** path offset (`Trash` matches
   `/bak/home/Trash/x`); a leading `/` anchors to the root.
-- `**` matches any number of intermediate directories.
-- `!` prefix negates, evaluated in order (last match wins). Verified: with
-  `--exclude '*' --exclude '!keep.txt'`, restic stores only `keep.txt`.
+- A **trailing `/` is ignored**: `foo/` ≡ `foo`. It is not a directories-only
+  marker, so `foo/` also matches a *file* named `foo`.
+- `**` must be a complete path component (`foo/**/bar`, not `foo**`), and
+  matches any number of intermediate directories.
+- `!` prefix negates. Negation is sequential and the **last match wins**:
+  `--exclude '*' --exclude '!keep.txt'` keeps only `keep.txt`.
 - Patterns are `filepath.Clean`ed, so `/foo/../bar` ≡ `/bar`.
 - `ignore_file` lines are trimmed; blanks and `#` comments dropped; `$VAR` is
-  expanded and `$$` yields a literal `$`.
+  expanded and `$$` yields a literal `$`. `~` is **not** expanded — use
+  `$HOME`.
 
 Errors during inspection are reported but never fatal: an unreadable directory,
 a file that vanishes mid-walk, or a pattern restic itself would reject (caught
@@ -815,7 +806,7 @@ code, and the retained queue entry with its attempt count.
 
 | Step | Cost |
 |------|------|
-| `--live` | local; measured 4.7s over an 80k-file tree |
+| `--live` | local walk; cost scales with file count x pattern count |
 | `--snaps` | local; one stat per matched file per snapshot |
 | `--repo` | network: metadata only, cache-warm; seconds–minutes |
 | `rewrite` | metadata/tree-scale: new tree blobs + index entries only, since file data is shared with the original snapshot |
@@ -824,22 +815,19 @@ code, and the retained queue entry with its attempt count.
 `rewrite` not being data-scale is what makes the cheap run-time gate sufficient
 — no duration estimate is needed to decide whether it fits in the window.
 
-Measured, and worth recording because two plausible optimisations are wrong:
+Two consequences that are load-bearing for anyone optimising this:
 
-- **`**` patterns are the cost driver, not the tree size.** The same 80k-file
-  walk takes 4.7s with a normal pattern set and **56s with 40 `**` patterns**.
-  Pattern count multiplies path count, so an ignore file with many `**` rules is
-  the thing to watch. Resolving a pattern's `**` expansion into concrete part
-  lists is memoised (keyed on the parts, not on the pattern text, since
-  mid-expansion children of one pattern share both) because rebuilding it per
-  path was the single largest cost in a scan.
-- **Pruning the `--repo` listing is far worse than the listing it replaces.**
-  `restic ls <snap>:<subdir>` looks like a way to avoid descending into excluded
-  directories, and is 84× slower: one full `restic ls --long` over an 80k-file
-  snapshot took **1.8s**, while 200 pruned calls took **150s**. Each restic
-  invocation costs ~0.75s before doing any work — it loads the index and tree —
-  so N pruned calls lose to one full listing at any N above two, and on a remote
-  backend that fixed cost is a network round trip rather than a local read.
+- **`**` patterns are the cost driver, not the tree size.** Pattern count
+  multiplies path count, so an ignore file with many `**` rules is the thing to
+  watch. A pattern's `**` expansion is resolved once and memoised, keyed on the
+  resolved parts rather than the pattern text (mid-expansion children of one
+  pattern share both, so keying on the text returns one child's shapes for
+  another).
+- **`--repo` issues one `restic ls --long` per stored snapshot and must not be
+  "optimised" into `restic ls <snap>:<subdir>` calls.** Each restic invocation
+  costs ~0.75s before doing any work — it loads the index and tree — so N pruned
+  calls lose to one full listing at any N above two, and on a remote backend that
+  fixed cost is a network round trip.
 
 Neither `restic backup --dry-run` nor `find` can substitute: `--dry-run` reports
 only what it **kept** (never an excluded path), and `find` has no equivalent for

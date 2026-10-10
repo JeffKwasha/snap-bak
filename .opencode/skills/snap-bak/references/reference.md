@@ -50,14 +50,14 @@ keeping first occurrence (`dict.fromkeys`, not a `set`: restic applies `!`
 negation sequentially, so `['**','!keep']` and `['!keep','**']` give opposite
 answers and a set would silently reorder the user's rules).
 
-Two consequences, verified against `restic backup`:
+Two consequences:
 
 - A trial's `!` **does** cancel a config rule naming the same target
   (`cache` then `!cache` stores the directory). Negation is sequential and the
   trial runs last. A trial cannot *reorder*, though; the order above is fixed.
 - A trial's `!` cannot reach **inside** a directory an earlier pattern already
-  matched. Once `node_modules/` matched, both `!node_modules/keepme/` and
-  `!node_modules/keepme/vital.js` were ignored and nothing under it stored. The
+  matched: once `node_modules/` matches, both `!node_modules/keepme/` and
+  `!node_modules/keepme/vital.js` are ignored. The
   negation that works names the directory itself, after the exclusion
   (`logs/` then `!logs/`, which does restore the directory and its contents).
   To keep one file out of a wholesale-excluded directory, exclude that file
@@ -66,15 +66,13 @@ Two consequences, verified against `restic backup`:
 Without `-v`, a trial lists only rows attributed to its own added rules.
 Totals are unaffected.
 
-Cost, measured on an 80k-file tree: `--live` ~4.7s with a normal pattern set,
-**~56s with 40 `**` patterns** — pattern count multiplies path count, so `**`
-rules are the cost driver. `--repo` is one `restic ls --long` per stored
-snapshot (~1.8s each locally).
+Cost scales with file count x pattern count, and `**` rules inflate the
+pattern side. `--repo` is one `restic ls --long` per stored snapshot.
 
 **Do not prune the repo listing by listing subdirectories instead of the whole
-tree.** Each restic invocation costs ~0.75s before doing any work; 200 pruned
-`ls <snap>:<subdir>` calls measured 150s against 1.8s for one full listing
-(84x slower). On rclone that fixed cost is a network round trip.
+tree.** Each restic invocation costs ~0.75s before doing any work; N pruned
+`ls <snap>:<subdir>` calls lose to one full listing at any N above two. On rclone
+that fixed cost is a network round trip.
 
 Neither `restic backup --dry-run` nor `find` is a substitute: `--dry-run` reports
 only what it **kept**, never an excluded path, and `find` has no equivalent for
@@ -226,29 +224,24 @@ snap-bak-managed flags are filtered out with a warning if configured: `-r`,
 `--password-file`, `--json`, `--dry-run`, `--tag`, `--keep-*`, `--prune`,
 `--exclude`, `--exclude-file`, `--forget`.
 
-## Pattern syntax, and what restic does not document
+## Pattern syntax
 
-restic's own docs (`doc/040_backup.rst`, "Excluding files") are the authority for
-**syntax**: Go `filepath.Match` per segment, `**` as a *complete* path component,
-patterns matched on complete path components, a leading `/` anchoring at the
-root, blank and `#` lines ignored, `$VAR` expanded with `$$` for a literal
-dollar, and `~` deliberately not expanded.
+Go `filepath.Match` per segment, plus `**`. `**` must be a *complete* path
+component (`foo/**/bar`, not `foo**` or `foo/**bar`). Patterns match on complete
+path components: `foo` matches `/dir1/foo/dir2/file` but not `/dir/foobar`. A
+leading `/` anchors at the root. A **trailing `/` is ignored** — `foo/` ≡ `foo`,
+so it is not a directories-only marker. Blank and `#` lines are ignored, `$VAR`
+is expanded with `$$` for a literal dollar, and `~` is not expanded (use
+`$HOME`).
 
-Two things that are **not** in those docs, and which are therefore established by
-experiment against `restic backup` and pinned by tests:
+`!` negates. Negation is sequential and the **last match wins**, so
+`--exclude '*' --exclude '!keep.txt'` keeps only `keep.txt`. A matched directory
+is pruned, so no later `!` can reach inside it; only a `!` naming the directory
+itself, ordered after the exclusion, restores it.
 
-- **A trailing `/` is ignored.** `foo/` ≡ `foo`; it is *not* a
-  directories-only marker. Verified: `restic backup --exclude 'foo/'` excludes
-  a *file* named `foo`.
-- **Negation.** The word does not appear in the backup documentation at all.
-  `!` negates, evaluated in order, last match wins — verified with
-  `--exclude '*' --exclude '!keep.txt'`, which stores only `keep.txt`. And
-  because a matched directory is pruned, no later `!` can reach inside it; only
-  a `!` naming the directory itself, ordered after the exclusion, restores it.
-
-If you need to reason about an exclude pattern and cannot find it in restic's
-docs, that is why: negation and prune behaviour are simply not written down
-anywhere. Verify against `restic backup` rather than inferring from the manual.
+Negation and prune behaviour are **undocumented upstream** — restic describes
+syntax only. Treat them as volatile: a restic release may change them, and
+snap-bak follows. Do not present them as restic's specification.
 
 ## State
 
