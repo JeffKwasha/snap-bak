@@ -200,17 +200,17 @@ class PatternOverride:
         Deduplicated on the pattern text, keeping first occurrence. A rule named
         both on the command line and in the working file is one rule the user
         wrote twice, and listing it twice in the diff header would read as two
-        separate additions. Order is otherwise untouched: restic applies `!`
-        negation in sequence, so a rule's position can matter and nothing here
-        may reorder it.
+        separate additions.
         """
         added: list[str] = []
         if self.excludes_file:
             added.extend(excludes.read_pattern_file(self.excludes_file))
         added.extend(self.extra)
-        seen: set[str] = set()
-        unique = [p for p in added if not (p in seen or seen.add(p))]
-        return list(config_patterns) + unique
+        # `dict.fromkeys` dedupes keeping first occurrence, which is the built-in
+        # doing the work. Not a plain `set`: restic applies `!` negation
+        # sequentially, so `['**', '!keep']` and `['!keep', '**']` give opposite
+        # answers, and a set would silently reorder the user's rules.
+        return list(config_patterns) + list(dict.fromkeys(added))
 
     def diff(self, config_patterns: list[str]) -> dict:
         """Which of the effective patterns are not in the config's set.
