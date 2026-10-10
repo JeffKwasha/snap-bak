@@ -887,6 +887,7 @@ def walk_excluded(
     backup_root: str,
     patterns: Sequence[Pattern],
     attribute_rules: bool = False,
+    progress=None,
 ) -> Iterator[WalkedPath]:
     """Yield every excluded path under `root`, with its size and rule.
 
@@ -903,11 +904,22 @@ def walk_excluded(
     beneath it, so the file count comes free from the same traversal rather than
     costing a second pass.
 
+    `progress` is called with (files_seen, bytes_seen) as the walk goes, so a
+    large source subvolume reports that it is moving rather than looking hung.
+    Counting is nearly free next to matching, and matching is the real cost.
+
     Unreadable directories and vanished files are skipped, not fatal — an
     inspection must survive a source subvolume it cannot read.
     """
     root = Path(root)
     base = clean_path(backup_root)
+    seen = [0, 0]
+
+    def tick(size: int) -> None:
+        if progress is not None:
+            seen[0] += 1
+            seen[1] += size
+            progress(seen[0], seen[1])
 
     def scan(directory: Path, rel: str) -> Iterator[WalkedPath]:
         try:
@@ -934,6 +946,7 @@ def walk_excluded(
                     # pricing walk visits every file beneath it, so the file
                     # count comes out of the same traversal.
                     size, files = _subtree_totals(Path(entry.path))
+                    tick(size)
                     yield WalkedPath(
                         child_path,
                         size,
@@ -952,6 +965,7 @@ def walk_excluded(
                     size = entry.stat(follow_symlinks=False).st_size
                 except OSError:
                     continue
+                tick(size)
                 yield WalkedPath(
                     child_path,
                     size,

@@ -533,3 +533,204 @@ class TestHalfWindowRemaining:
         # At 06:00 the window has just ended: nothing left -> False.
         self._at(monkeypatch, 6, 0)
         assert cli.job.half_window_remaining(self._RJ(Window(22 * 60, 6 * 60))) is False
+
+
+class TestPatternOverride:
+    """A trial pattern set: same syntax as the config, no config mutation."""
+
+    def test_excludes_file_adds_to_the_jobs_own_rules(self, tmp_path):
+        trial = tmp_path / "work.ignore"
+        trial.write_text("# a comment\n*.iso\n\n!keep.iso\n")
+        ov = cli.PatternOverride(str(trial))
+        assert ov.active is True
+        assert ov.apply(["*.tmp", "*.cache"]) == [
+            "*.tmp", "*.cache", "*.iso", "!keep.iso",
+        ]
+
+    def test_extra_patterns_come_after_the_file(self, tmp_path):
+        trial = tmp_path / "work.ignore"
+        trial.write_text("*.iso\n")
+        ov = cli.PatternOverride(str(trial), ["build/cache/"])
+        # Order matters: `!` negation applies in sequence, and config rules come
+        # first so a trial rule cannot accidentally re-include what config excludes.
+        assert ov.apply(["*.tmp"]) == ["*.tmp", "*.iso", "build/cache/"]
+
+    def test_inactive_override_changes_nothing(self):
+        ov = cli.PatternOverride()
+        assert ov.active is False
+        assert ov.apply(["*.tmp"]) == ["*.tmp"]
+
+    def test_diff_reports_added_and_removed(self, tmp_path):
+        trial = tmp_path / "work.ignore"
+        trial.write_text("*.iso\n")
+        d = cli.PatternOverride(str(trial)).diff(["*.tmp", "*.cache"])
+        assert d["added"] == ["*.iso"]
+        # A trial cannot take a rule away, so removals are empty by construction.
+        assert d["removed"] == []
+        assert d["config"] == ["*.tmp", "*.cache"]
+        assert d["excludes_file"] == str(trial)
+
+    def test_an_edited_rule_appears_alongside_the_config_one(self):
+        """Both are evaluated, so the new text is an addition and the old one
+        stays in force - the change is visible rather than implied."""
+        d = cli.PatternOverride(extra=["*.tmpx"]).diff(["*.tmp"])
+        assert d["added"] == ["*.tmpx"]
+        assert d["removed"] == []
+        assert d["effective"] == ["*.tmp", "*.tmpx"]
+
+    def test_changed_rules_is_the_additions(self):
+        ov = cli.PatternOverride(extra=["*.iso"])
+        assert ov.changed_rules(["*.tmp"]) == {"*.iso"}
+
+
+class TestShowRefusesWhatApplyRefuses:
+    """The trial flags are read-only; only apply must explain the refusal."""
+
+    def test_show_accepts_the_trial_flags(self):
+        args = cli.excludes_parser("show").parse_args(
+            ["excludes", "--excludes-file", "/tmp/w.ignore", "-e", "*.iso"]
+        )
+        assert args.excludes_file == "/tmp/w.ignore"
+        assert args.exclude == ["*.iso"]
+
+    @pytest.mark.parametrize(
+        "argv,flag",
+        [
+            (["excludes", "--excludes-file", "/tmp/w.ignore"], "--excludes-file"),
+            (["excludes", "-e", "*.iso"], "-e"),
+            (["excludes", "--exclude", "*.iso"], "--exclude"),
+        ],
+    )
+    def test_apply_refuses_a_trial_pattern_set(self, argv, flag, capsys):
+        with pytest.raises(SystemExit):
+            cli.excludes_parser("apply").parse_args(argv + ["--now"])
+        err = capsys.readouterr().err
+        assert flag in err
+        assert "trial pattern set" in err
+        # The message must say what to do instead, not just refuse.
+        assert "show excludes --excludes-file" in err
+
+
+class TestOutputPresentation:
+    def _job(self, tmp_path, monkeypatch):
+        """A job whose stored snapshot holds data its current rules exclude.
+
+        The backup deliberately used *fewer* excludes than the job now has, so
+        the rows exist to be reported: that is the whole situation `show` and
+        `apply` exist for.
+        """
+        rj, src, repo = resolved_job(
+            tmp_path, monkeypatch, excludes_list=["*.tmp", "cache"]
+        )
+        from conftest import backup, init_repo
+
+        init_repo(repo)
+        backup(repo, str(src), "--exclude", "*.tmp")  # cache/ stays stored
+        return rj
+
+    def test_rows_are_grouped_by_rule_with_a_subtotal(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        rj = self._job(tmp_path, monkeypatch)
+        cli._do_live([rj], cli._View())
+        out = capsys.readouterr().out
+        assert "*.tmp  —" in out or "cache  —" in out
+        assert "TOTAL:" in out
+        assert "file(s)" in out
+
+    def test_csv_has_numeric_bytes_and_a_header(self, tmp_path, monkeypatch, capsys):
+        import csv
+        import io
+
+        rj = self._job(tmp_path, monkeypatch)
+        cli._do_live([rj], cli._View(fmt="csv"))
+        records = list(csv.DictReader(io.StringIO(capsys.readouterr().out)))
+
+        assert records, "the fixture must store something the rules exclude"
+        assert {"job", "rule", "path", "is_dir", "files", "bytes"} <= set(records[0])
+        for r in records:
+            # Numeric, so a spreadsheet can sum it; the human form is alongside
+            # for reading.
+            int(r["bytes"])
+            int(r["files"])
+            assert r["bytes_human"]
+        assert any(r["rule"] == "cache" for r in records)
+
+    def test_csv_suppresses_the_prose_diff_header(self, tmp_path, monkeypatch, capsys):
+        """A prose header would corrupt the first CSV record."""
+        trial = tmp_path / "w.ignore"
+        trial.write_text("*.iso\n")
+        rj = self._job(tmp_path, monkeypatch)
+        cli._do_live(
+            [rj],
+            cli._View(fmt="csv", override=cli.PatternOverride(str(trial))),
+        )
+        out = capsys.readouterr().out
+        assert "trial pattern set" not in out, "the diff header is prose"
+        # Every line must be a record, header or data - nothing else mixed in.
+        for line in out.splitlines():
+            assert line.startswith(("job,", rj.job.name)), line
+
+    def test_verbose_lists_every_row_not_only_the_trial_ones(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        trial = tmp_path / "w.ignore"
+        trial.write_text("*.iso\n")
+        rj = self._job(tmp_path, monkeypatch)
+        ov = cli.PatternOverride(str(trial))
+
+        cli._do_live([rj], cli._View(override=ov))
+        quiet = capsys.readouterr().out
+        cli._do_live([rj], cli._View(override=ov, verbose=True))
+        loud = capsys.readouterr().out
+
+        # The config's own rule matches nothing here, so -v must show strictly more.
+        assert len(loud.splitlines()) >= len(quiet.splitlines())
+        # Totals are unaffected by the listing restriction, in both cases.
+        assert "TOTAL:" in quiet and "TOTAL:" in loud
+
+    def test_only_rules_is_none_without_a_trial(self, tmp_path, monkeypatch):
+        rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
+        assert cli._View().only_rules(rj) is None
+        assert cli._View(verbose=True).only_rules(rj) is None
+
+
+class TestFileTotalsAreFree:
+    """The file count must come from the traversal already being done."""
+
+    def test_a_matched_directory_reports_its_subtree_file_count(self, tmp_path):
+        from snap_bak import excludes as ex
+
+        root = tmp_path / "src"
+        deep = root / "cache" / "sub"
+        deep.mkdir(parents=True)
+        for i in range(7):
+            (deep / f"f{i}").write_bytes(b"x" * 10)
+        found = ex.ExclusionSet()
+        for w in ex.walk_excluded(
+            root, "/bak/x", ex.parse_patterns(["cache"]), attribute_rules=True
+        ):
+            found.add(None, w.path, w.size, w.is_dir, w.rule, w.files)
+
+        assert len(found.entries) == 1, "one row for the directory"
+        assert found.total_files == 7, "seven files beneath it"
+        assert found.total_size == 70
+        assert found.by_rule()[0].rule == "cache"
+
+    def test_files_reported_per_row(self, tmp_path):
+        from snap_bak import excludes as ex
+
+        root = tmp_path / "src"
+        (root / "cache").mkdir(parents=True)
+        (root / "cache" / "a").write_bytes(b"x")
+        (root / "top.tmp").write_bytes(b"y")
+        found = ex.ExclusionSet()
+        for w in ex.walk_excluded(
+            root, "/bak/x", ex.parse_patterns(["cache", "*.tmp"]),
+            attribute_rules=True,
+        ):
+            found.add(None, w.path, w.size, w.is_dir, w.rule, w.files)
+        by_path = {e.path: e.files for e in found.entries.values()}
+        assert by_path["/bak/x/cache"] == 1
+        assert by_path["/bak/x/top.tmp"] == 1
+        assert found.total_files == 2

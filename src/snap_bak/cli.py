@@ -20,6 +20,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -204,10 +205,16 @@ class PatternOverride:
     def diff(self, config_patterns: list[str]) -> dict:
         """Which of the effective patterns are not in the config's set.
 
-        Set difference on the pattern text, so an edited rule reads as one
-        removal and one addition rather than a change nobody can see. Returns
-        config patterns too, because "you are running against these" is the fact
-        a caller most needs to be able to print.
+        `added` is the whole point: these are the rules the trial adds, and they
+        are the ones whose rows get listed. `removed` is empty by construction
+        — a trial never takes a rule away, since it cannot edit the config — and
+        is kept in the schema so a caller can see that explicitly rather than
+        inferring it.
+
+        An edited rule therefore reads as one addition (`*.tmpx`) alongside the
+        config's `*.tmp` still in force, which is what actually happens: both are
+        evaluated. Set difference on the text, so the change is visible rather
+        than implied.
         """
         effective = self.apply(config_patterns)
         added = [p for p in effective if p not in config_patterns]
@@ -273,13 +280,17 @@ def _do_lint(
 
 
 def _scan_live(
-    rj, attribute: bool = False, override: PatternOverride | None = None
+    rj,
+    attribute: bool = False,
+    override: PatternOverride | None = None,
+    progress=None,
 ) -> tuple[excludes.ExclusionSet, str]:
     """The live source subvolume: no mount, no restic, no writes."""
     _, patterns, root = _patterns_for(rj, override)
     found = excludes.ExclusionSet()
     for walked in excludes.walk_excluded(
-        Path(rj.job.source_subvolume), root, patterns, attribute_rules=attribute
+        Path(rj.job.source_subvolume), root, patterns,
+        attribute_rules=attribute, progress=progress,
     ):
         found.add(
             None, walked.path, walked.size, walked.is_dir, walked.rule, walked.files
@@ -288,14 +299,18 @@ def _scan_live(
 
 
 def _scan_snaps(
-    rj, attribute: bool = False, override: PatternOverride | None = None
+    rj,
+    attribute: bool = False,
+    override: PatternOverride | None = None,
+    progress=None,
 ) -> tuple[excludes.ExclusionSet, str]:
     """Each local btrfs snapshot dir, labelled by its snapshot name."""
     _, patterns, root = _patterns_for(rj, override)
     found = excludes.ExclusionSet()
     for snap in snapshot_model.Snapshot.scan(rj.job.snapshot_dir):
         for walked in excludes.walk_excluded(
-            snap.path, root, patterns, attribute_rules=attribute
+            snap.path, root, patterns,
+            attribute_rules=attribute, progress=progress,
         ):
             found.add(
                 snap.name, walked.path, walked.size, walked.is_dir,
@@ -319,6 +334,25 @@ class _View:
     fmt: str = "text"
     verbose: bool = False
     override: PatternOverride | None = None
+    # Off unless the caller asks or stderr is a terminal: a piped or journalled
+    # run wants results, not a running commentary.
+    progress: bool = False
+
+    @classmethod
+    def build(cls, args, override) -> "_View":
+        return cls(
+            limit=args.limit,
+            as_json=args.json,
+            fmt=args.format,
+            verbose=args.verbose,
+            override=override,
+            # Never while emitting a machine-readable document.
+            progress=args.verbose or (
+                args.format == "text"
+                and not args.json
+                and sys.stderr.isatty()
+            ),
+        )
 
     @property
     def csv(self) -> bool:
@@ -345,14 +379,47 @@ class _View:
         )
 
 
+def _progress_reporter(rj, enabled: bool):
+    """A walk callback that reports progress on stderr, throttled.
+
+    Only when stderr is a terminal or the caller asked for it: on a pipe or in a
+    journal, an unending stream of counts is noise, and in CSV or JSON output it
+    would corrupt the document. Written to stderr so `--format csv` piped into a
+    spreadsheet stays clean either way.
+
+    Throttled to whole seconds, because the callback fires per excluded file and
+    a 40k-file tree would otherwise emit 40k lines.
+    """
+    if not enabled:
+        return None
+    state = {"last": 0.0}
+
+    def report(files: int, nbytes: int) -> None:
+        now = time.monotonic()
+        if now - state["last"] < 1.0:
+            return
+        state["last"] = now
+        print(
+            f"  scanning {rj.job.name}: {files} file(s), "
+            f"{excludes.human_bytes(nbytes)} so far...",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    return report
+
+
 def _do_live(jobs: list, view: _View) -> int:
     """Walk each job's live source subvolume and list what the rules exclude.
 
     Read-only, and local: nothing is mounted and restic is never invoked, so
     this answers "what would the next backup skip?" without touching the repo.
     """
-    scans = [(rj, *_scan_live(rj, attribute=True, override=view.override))
-             for rj in jobs]
+    scans = [
+        (rj, *_scan_live(rj, attribute=True, override=view.override,
+                          progress=_progress_reporter(rj, view.progress)))
+        for rj in jobs
+    ]
     if view.as_json:
         print(json.dumps({"live": [apply.payload(r.job.name, root, f) for r, f, root in scans]}, indent=2))
         return config.EXIT_SUCCESS
@@ -404,8 +471,11 @@ def _csv_rows(rj, found: excludes.ExclusionSet, view: _View) -> list[dict]:
 
 def _do_snaps(jobs: list, view: _View) -> int:
     """Per-snapshot table across each job's local btrfs snapshot dirs."""
-    scans = [(rj, *_scan_snaps(rj, attribute=True, override=view.override))
-             for rj in jobs]
+    scans = [
+        (rj, *_scan_snaps(rj, attribute=True, override=view.override,
+                          progress=_progress_reporter(rj, view.progress)))
+        for rj in jobs
+    ]
     if view.as_json:
         print(json.dumps({"snaps": [apply.payload(r.job.name, root, f) for r, f, root in scans]}, indent=2))
         return config.EXIT_SUCCESS
@@ -872,13 +942,7 @@ def _excludes_main(argv: list[str], config_path: str) -> None:
                 sys.exit(config.EXIT_ERROR)
             _report_override(override, jobs, as_csv=args.format == "csv")
 
-        view = _View(
-            limit=args.limit,
-            as_json=args.json,
-            fmt=args.format,
-            verbose=args.verbose,
-            override=override,
-        )
+        view = _View.build(args, override)
         _do_lint(jobs, args.json, override)  # always; silent when clean
         # A `show` that cannot reach what it was asked about must not exit 0.
         # The worst outcome for a caller is a clean report that was never
