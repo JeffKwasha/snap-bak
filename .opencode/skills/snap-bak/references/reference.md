@@ -226,6 +226,30 @@ snap-bak-managed flags are filtered out with a warning if configured: `-r`,
 `--password-file`, `--json`, `--dry-run`, `--tag`, `--keep-*`, `--prune`,
 `--exclude`, `--exclude-file`, `--forget`.
 
+## Pattern syntax, and what restic does not document
+
+restic's own docs (`doc/040_backup.rst`, "Excluding files") are the authority for
+**syntax**: Go `filepath.Match` per segment, `**` as a *complete* path component,
+patterns matched on complete path components, a leading `/` anchoring at the
+root, blank and `#` lines ignored, `$VAR` expanded with `$$` for a literal
+dollar, and `~` deliberately not expanded.
+
+Two things that are **not** in those docs, and which are therefore established by
+experiment against `restic backup` and pinned by tests:
+
+- **A trailing `/` is ignored.** `foo/` ≡ `foo`; it is *not* a
+  directories-only marker. Verified: `restic backup --exclude 'foo/'` excludes
+  a *file* named `foo`.
+- **Negation.** The word does not appear in the backup documentation at all.
+  `!` negates, evaluated in order, last match wins — verified with
+  `--exclude '*' --exclude '!keep.txt'`, which stores only `keep.txt`. And
+  because a matched directory is pruned, no later `!` can reach inside it; only
+  a `!` naming the directory itself, ordered after the exclusion, restores it.
+
+If you need to reason about an exclude pattern and cannot find it in restic's
+docs, that is why: negation and prune behaviour are simply not written down
+anywhere. Verify against `restic backup` rather than inferring from the manual.
+
 ## State
 
 One file per job: `/opt/snap-bak/state/<job>.json`, holding that job's last

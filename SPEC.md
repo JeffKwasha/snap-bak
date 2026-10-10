@@ -596,14 +596,33 @@ empty `snapshots` / `per_snapshot` rather than omitting the keys.
 
 `src/snap_bak/excludes.py` is a faithful port of restic's own exclusion engine
 (`internal/filter`, matching restic 0.19.1) so listings agree with what restic
-would do. Ported semantics:
+would do.
+
+**Where the rules come from.** restic's documentation (`doc/040_backup.rst`,
+"Excluding files") is the authority for **syntax** and covers it well:
+`filepath.Match` per segment, `**` as a complete path component, patterns
+matched on complete path components, a leading `/` anchoring at the root, **a
+trailing `/` being ignored** (so `foo/` ≡ `foo` — it is *not* a
+directories-only marker, and this was confirmed against `restic backup`), blank
+and `#` lines dropped, `$VAR` expansion with `$$` for a literal dollar, and
+`~` deliberately *not* expanded.
+
+It says nothing at all about **negation**. The word does not appear in the
+backup documentation, nor does any statement of what happens when a directory
+matches. Everything below about `!` and about pruning was therefore established
+by experiment against `restic backup` rather than read, and is pinned by
+`tests/test_excludes.py` against restic's own golden cases plus the CLI
+integration test. Do not go looking for a citation that does not exist.
+
+Ported semantics:
 
 - Per-segment Go `filepath.Match` — `*` never crosses `/`, plus `?`, `[a-z]`,
   `[^a]`, `\` escapes. Deliberately **not** Python `fnmatch`.
 - A pattern with no leading `/` matches at **any** path offset (`Trash` matches
   `/bak/home/Trash/x`); a leading `/` anchors to the root.
 - `**` matches any number of intermediate directories.
-- `!` prefix negates, evaluated in order (last match wins).
+- `!` prefix negates, evaluated in order (last match wins). Verified: with
+  `--exclude '*' --exclude '!keep.txt'`, restic stores only `keep.txt`.
 - Patterns are `filepath.Clean`ed, so `/foo/../bar` ≡ `/bar`.
 - `ignore_file` lines are trimmed; blanks and `#` comments dropped; `$VAR` is
   expanded and `$$` yields a literal `$`.
@@ -614,10 +633,10 @@ and reported by the lint that runs on every `show`) all degrade to "skip this
 path" rather than aborting
 the run.
 
-Directory matching prunes the walk, mirroring restic's walker (it does not
-descend into an excluded directory, so a `!` pattern cannot re-include
-something inside one). Symlinks are never followed: restic stores a link as a
-link, so following one would name paths the repo does not contain.
+Directory matching prunes the walk, mirroring restic's walker: it does not
+descend into an excluded directory, so a `!` pattern cannot re-include something
+inside one. Symlinks are never followed: restic stores a link as a link, so
+following one would name paths the repo does not contain.
 
 Because pruning is what restic does, the rule order is load-bearing and cannot
 be worked around by reordering later patterns: the excluding pattern is
