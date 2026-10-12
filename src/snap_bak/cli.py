@@ -467,15 +467,32 @@ def _plan_exit_code(plans: list) -> int:
     return _query_error_exit([p.query_error for p in plans if p.query_error])
 
 
-def _sheets(jobs: list, modes: tuple[str, ...], view: _View) -> tuple[list, list]:
-    """One report per job, plus the repository errors that decide the exit code.
+def _snaps_note(rj) -> str | None:
+    """Why this job's snapshots could not be read, or None if they could be.
+
+    `is_dir()` is False for an absent path, a dangling symlink, a plain file and
+    an unsearchable one. The old config-time check called all four "does not
+    exist", which sends the reader hunting a directory they can plainly see.
+    """
+    path = Path(rj.job.snapshot_dir)
+    if path.is_dir():
+        return None
+    return f"snapshot directory is not a usable directory: {path}"
+
+
+def _sheets(
+    jobs: list, modes: tuple[str, ...], view: _View
+) -> tuple[list, list, list]:
+    """One report per job, plus what decided the exit code.
+
+    Returns `(sheets, repo errors, sources that could not be read)`.
 
     Every mode is collected before anything is printed, so a run that scanned
     live, snapshots and the repository emits a single document rather than three.
     Two JSON objects on stdout is not a JSON document, and neither is three CSV
     headers.
     """
-    sheets, errors = [], []
+    sheets, errors, unreadable = [], [], []
     for rj in jobs:
         rules, _patterns, root = _patterns_for(rj, view.override)
         sources, details, notes = [], [], []
@@ -489,6 +506,10 @@ def _sheets(jobs: list, modes: tuple[str, ...], view: _View) -> tuple[list, list
                 )
                 sources.append((report.KIND_LIVE, found))
             elif mode == "snaps":
+                note = _snaps_note(rj)
+                if note is not None:
+                    unreadable.append(note)
+                    notes.append(note)
                 found, detail, _ = _scan_snaps(
                     rj, attribute=True, override=view.override,
                     progress=progress, expand=verbose,
@@ -512,7 +533,7 @@ def _sheets(jobs: list, modes: tuple[str, ...], view: _View) -> tuple[list, list
         )
         sheet.notes.extend(notes)
         sheets.append(sheet)
-    return sheets, errors
+    return sheets, errors, unreadable
 
 
 def _trial_rules(rj, override: PatternOverride | None) -> set[str]:
@@ -530,7 +551,7 @@ def _show(jobs: list, args, view: _View) -> int:
         for issue in excludes.lint(raw, root):
             lint.append({"job": rj.job.name, **vars(issue)})
 
-    sheets, errors = _sheets(jobs, _selected_modes(args), view)
+    sheets, errors, unreadable = _sheets(jobs, _selected_modes(args), view)
     document = report.render(sheets, view.fmt, view.as_json, view.width, lint)
     # One trailing newline, whatever the format: a CSV whose last line is blank
     # reads as a record with four empty fields.
@@ -541,7 +562,14 @@ def _show(jobs: list, args, view: _View) -> int:
             + [document]
         )
     print(document)
-    return _query_error_exit(errors)
+    # A source that could not be read is the same failure as an unreachable
+    # repository: nothing was checked, so 0 would claim it was. 41 outranks 30,
+    # so a broken repository alongside an unreadable snapshot directory still
+    # reports the permanent cause.
+    code = _query_error_exit(errors)
+    if unreadable:
+        code = max(code, config.EXIT_TEMP_UNREACHABLE)
+    return code
 
 
 def _do_apply(jobs: list, now: bool, later: bool, as_json: bool, limit: int | None) -> int:

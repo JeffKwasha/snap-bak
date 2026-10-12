@@ -304,13 +304,9 @@ class Job(BaseModel):
     def _parse_interval(cls, v):
         return parse_duration(v)
 
-    # `snapshot_dir` existence is deliberately not checked here. It looks like a
-    # config fact and is not one: it is machine state, and nothing creates this
-    # directory, so a new job's is absent until an admin makes it. Checking it
-    # made the config that would have named that job unloadable, took down every
-    # other job along with it, and blocked read-only commands that never touch
-    # it. It is checked where it is used, by `Runner.create_snapshot`. Readers
-    # (`Snapshot.scan`, `_cleanup_snapshots`) already treat it as optional.
+    # Existence is not checked here: nothing creates this directory, so a new
+    # job's is absent until an admin makes it, and checking made the whole config
+    # unloadable. Checked at use, by Runner.create_snapshot.
 
     @field_validator("name", "tag")
     @classmethod

@@ -189,6 +189,88 @@ def _empty_repo(rj):
         shutil.rmtree(rj.repo.path, ignore_errors=True)
 
 
+class TestUnreadableSnapshotDirectory:
+    """A `snapshot_dir` that cannot be read must say so, not look clean.
+
+    The config-time existence check that used to raise here was wrong twice
+    over — it failed a read-only command that never touches the directory, and
+    it labelled every fault "does not exist" when only one of them is. Removing
+    it left the command silent, which is worse still: an empty table reads as
+    "nothing excluded" when it means "nothing checked".
+    """
+
+    def _job_with_broken_snapshot_dir(self, tmp_path, monkeypatch):
+        rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
+        import dataclasses
+
+        broken = dataclasses.replace(
+            rj, job=rj.job.model_copy(update={"snapshot_dir": tmp_path / "gone"})
+        )
+        return broken
+
+    def test_live_does_not_care_about_the_snapshot_dir(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The reported case: `show excludes --live` on a job whose snapshot dir
+        is missing must work, because it never reads it."""
+        rj = self._job_with_broken_snapshot_dir(tmp_path, monkeypatch)
+        code, out = show(capsys, [rj], "live")
+        assert code == config.EXIT_SUCCESS
+        assert "snapshot directory" not in out
+
+    def test_snaps_reports_it_and_exits_delayed(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        rj = self._job_with_broken_snapshot_dir(tmp_path, monkeypatch)
+        code, out = show(capsys, [rj], "snaps")
+        # 30, not 0: nothing was checked, and 0 would claim it was clean.
+        assert code == config.EXIT_TEMP_UNREACHABLE
+        assert "not a usable directory" in out
+        assert str(rj.job.snapshot_dir) in out
+
+    def test_the_message_does_not_diagnose(self, tmp_path, monkeypatch, capsys):
+        """It states what is true. "Does not exist" is a guess, and it is wrong
+        for a dangling symlink, a plain file, and a directory this process
+        cannot search — which is how a reader ends up hunting a missing
+        directory they can see."""
+        rj = self._job_with_broken_snapshot_dir(tmp_path, monkeypatch)
+        _code, out = show(capsys, [rj], "snaps")
+        assert "does not exist" not in out
+
+    def test_a_dangling_symlink_is_reported_not_claimed_missing(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The exact case the old check mislabelled: the path is present, and
+        plainly so, but is not a usable directory."""
+        rj = self._job_with_broken_snapshot_dir(tmp_path, monkeypatch)
+        link = tmp_path / "link"
+        link.symlink_to(tmp_path / "absent")
+        import dataclasses
+
+        linked = dataclasses.replace(
+            rj, job=rj.job.model_copy(update={"snapshot_dir": link})
+        )
+        code, out = show(capsys, [linked], "snaps")
+        assert code == config.EXIT_TEMP_UNREACHABLE
+        assert "does not exist" not in out
+        assert "not a usable directory" in out
+
+    def test_a_readable_directory_says_nothing(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
+        code, out = show(capsys, [rj], "snaps")
+        assert code == config.EXIT_SUCCESS
+        assert "not a usable directory" not in out
+
+    def test_json_carries_the_note(self, tmp_path, monkeypatch, capsys):
+        rj = self._job_with_broken_snapshot_dir(tmp_path, monkeypatch)
+        _code, out = show(capsys, [rj], "snaps", view=cli._View(as_json=True))
+        body = json.loads(out)["jobs"][0]
+        assert body["sources"] == []
+        assert "not a usable directory" in body["notes"][0]
+
+
 class TestRepoOutput:
     def test_repo_empty_when_no_snapshots(self, tmp_path, monkeypatch, capsys):
         # An initialised but empty repo is a real "nothing to report": restic
