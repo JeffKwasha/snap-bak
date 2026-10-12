@@ -730,15 +730,9 @@ class ExclusionSet:
     ) -> None:
         """Record one excluded path.
 
-        `files` is how many files this row accounts for, so it accepts an int: a
-        directory row is priced by walking its subtree and reports how many files
-        that walk found. Pass 1 for an ordinary file.
-
-        A directory is never itself counted as a file — only what sits beneath it
-        — so a matched empty directory reports 0. Symlinks and hardlinks *are*
-        counted, because restic stores each of those paths as its own node and a
-        rewrite removes every one of them; see `_node_size` for what they cost in
-        bytes.
+        `files` is how many this row accounts for: 1 for a file, the subtree's
+        count for a matched directory. A directory is never itself a file, so a
+        matched empty one reports 0.
         """
         entry = self.entries.get(path)
         if entry is None:
@@ -784,12 +778,8 @@ class ExclusionSet:
     def total_files(self) -> int:
         """Files that would be dropped.
 
-        Free to report: every traversal that produces byte totals has already
-        visited each file it counted, so this needs no extra IO. Counted during
-        the walk rather than derived from `len(entries)`, because one directory
-        row stands for a whole subtree. The sum is over the per-snapshot counts
-        where there are any, so a set spanning several snapshots reports the
-        files dropped from all of them.
+        Free: the traversal producing byte totals already visited every file it
+        counted. Not `len(entries)` — one directory row stands for a subtree.
         """
         return sum(
             sum(files.values()) for files in self.per_snapshot_files.values()
@@ -816,11 +806,8 @@ class ExclusionSet:
     ) -> dict[str, dict[str, RuleTotals]]:
         """`rule -> source -> totals`, over the sources named.
 
-        The report is a rule-by-source grid, and the two dimensions are joined
-        here rather than in the renderer: joining in the renderer would mean
-        every output format repeating the same loop and the same off-by-one risk.
-        A source with no rows for a rule is absent from that rule's map, so the
-        renderer prints a zero rather than a missing cell.
+        Joined here rather than in the renderer, which would otherwise repeat
+        this loop once per output format. Absent cells mean zero, not unscanned.
         """
         grid: dict[str, dict[str, RuleTotals]] = {}
         for rule, source, path in self.rule_source_cells(sources):
@@ -856,15 +843,11 @@ class ExclusionSet:
 def _node_size(path: str, is_symlink: bool) -> int:
     """Bytes restic would hold for one stored node.
 
-    A symlink costs 0: restic keeps the target as a string in the tree and
-    `restic ls --long` reports the node with size 0, so charging it `lstat`'s
-    size (the length of the target path) would make the live walk report bytes
-    the repository does not hold — and the two would disagree on the same file.
-
-    A hardlink is not special-cased because restic's own `ls` does not
-    special-case it either: it reports every hardlinked path at full size. We
-    agree with restic, so hardlinked data is counted once per path and the
-    figure over-states what `prune` reclaims by exactly the shared blocks.
+    A symlink costs 0: `restic ls --long` reports it at 0, so charging it
+    `lstat`'s size (the length of the target path) would make the live walk
+    report bytes the repository does not hold. Hardlinks are not special-cased
+    because restic's `ls` does not special-case them either, so hardlinked data
+    is over-counted by exactly the shared blocks.
     """
     if is_symlink:
         return 0
@@ -912,6 +895,30 @@ def _walk_chunk_expanded(root_path: str) -> tuple[list[str], list[int]]:
         paths.append(str(fpath))
         sizes.append(fsize)
     return paths, sizes
+
+
+_worker_patterns: list[Pattern] | None = None
+
+# Subtrees dispatched before any result is drained, so a source with thousands
+# of directories does not queue them all at once.
+_MAX_OUTSTANDING = 32
+
+
+def _init_worker(patterns: Sequence[Pattern]) -> None:
+    global _worker_patterns
+    _worker_patterns = list(patterns)
+
+
+def _scan_subtree(args: tuple) -> list[tuple]:
+    root_path, backup_root, attribute_rules, expand, skip = args
+    assert _worker_patterns is not None
+    return [
+        (w.path, w.size, w.is_dir, w.rule, w.files, w.detail)
+        for w in walk_excluded(
+            Path(root_path), backup_root, _worker_patterns,
+            attribute_rules=attribute_rules, expand=expand, skip=skip,
+        )
+    ]
 
 
 def _subtree_size(root: Path) -> int:
@@ -980,6 +987,7 @@ def walk_excluded(
     expand: bool = False,
     pool=None,
     skip: str | None = None,
+    top_level: bool = False,
 ) -> Iterator[WalkedPath]:
     """Yield every excluded path under `root`, with its size and rule.
 
@@ -1017,6 +1025,10 @@ def walk_excluded(
     `skip` is a path whose subtree is pruned from the walk. The live source
     scan passes the snapshot directory here, so snapshots are never reported
     as excluded files — restic backs up the source, not its own snapshots.
+
+    `top_level` enables parallel dispatch of non-excluded directories to the
+    pool. Only the outermost call sets this; workers recurse serially within
+    their own subtree, so no worker ever waits on another worker.
     """
     root = Path(root)
     base = clean_path(backup_root)
@@ -1034,20 +1046,29 @@ def walk_excluded(
                 entries = sorted(it, key=lambda e: e.name)
         except (PermissionError, FileNotFoundError, NotADirectoryError):
             return
+
+        def drain():
+            for fut in futures:
+                for path, size, is_dir, r, files, detail in fut.result():
+                    yield WalkedPath(
+                        path, size, is_dir, r, files, detail=detail
+                    )
+            futures.clear()
+
+        futures = []
         for entry in entries:
             child_rel = f"{rel}/{entry.name}" if rel else entry.name
             child_path = f"{base}/{child_rel}"
             if skip and entry.path == skip:
                 continue
             try:
-                # follow_symlinks=False: a symlinked directory is stored as a
-                # link, so it is reported by its own name, never descended into.
+                # follow_symlinks=False: a symlink is stored as a link, never
+                # descended into.
                 is_dir = entry.is_dir(follow_symlinks=False)
                 hit, rule = list_match(patterns, child_path)
             except (OSError, BadPatternError):
-                # OSError: the entry vanished or is unreadable.
-                # BadPatternError: restic would reject the pattern outright,
-                # which --lint reports; here the path is simply skipped.
+                # Vanished or unreadable; or a pattern restic would reject
+                # outright, which --lint reports.
                 continue
             if not attribute_rules:
                 rule = None
@@ -1067,13 +1088,15 @@ def walk_excluded(
                     except (PermissionError, FileNotFoundError, NotADirectoryError):
                         pass
                     if pool is not None and len(subdirs) > 1:
-                        futures = []
+                        chunk_futures = []
                         for sd in subdirs:
                             if expand:
-                                futures.append(pool.submit(_walk_chunk_expanded, sd))
+                                chunk_futures.append(
+                                    pool.submit(_walk_chunk_expanded, sd)
+                                )
                             else:
-                                futures.append(pool.submit(_walk_chunk, sd))
-                        for fut in futures:
+                                chunk_futures.append(pool.submit(_walk_chunk, sd))
+                        for fut in chunk_futures:
                             if expand:
                                 paths, sizes = fut.result()
                                 for p, s in zip(paths, sizes):
@@ -1121,7 +1144,21 @@ def walk_excluded(
                                 )
                     yield WalkedPath(child_path, total, True, rule, count)
                     continue
-                yield from scan(Path(entry.path), child_rel)
+                if top_level and pool is not None:
+                    # The worker re-roots at `child_rel`, not at `base`: it has
+                    # no idea how deep it is, so passing the backup root made
+                    # every row come back with its parent directories missing.
+                    futures.append(pool.submit(
+                        _scan_subtree,
+                        (entry.path, f"{base}/{child_rel}",
+                         attribute_rules, expand, skip),
+                    ))
+                    # Submission order, not completion order: a reproducible
+                    # walk is a reproducible report.
+                    if len(futures) >= _MAX_OUTSTANDING:
+                        yield from drain()
+                else:
+                    yield from scan(Path(entry.path), child_rel)
             elif hit:
                 try:
                     size = _node_size(entry.path, entry.is_symlink())
@@ -1129,6 +1166,7 @@ def walk_excluded(
                     continue
                 tick(size)
                 yield WalkedPath(child_path, size, False, rule, 1)
+        yield from drain()
 
     yield from scan(root, "")
 
@@ -1136,25 +1174,16 @@ def walk_excluded(
 # --------------------------------------------------------------------------
 # Source 2: files already stored in restic (`restic ls --long`)
 # --------------------------------------------------------------------------
-# Six whitespace-separated fields (mode uid gid size date time), then the path,
-# which may hold spaces and unicode. Directories are identified by a mode
-# starting with 'd' (restic appends no trailing slash, even in plain `ls`), and
-# symlinks by a mode starting with 'l', with the target appended after ` -> `.
-# The leading "snapshot <id> of [...]" header line is skipped.
+# Six fields, then the path — which may hold spaces, so never whitespace-split.
+# A symlink prints as `path -> target` under Go's capital-`L` mode; keeping the
+# arrow made the path match nothing, so every symlink vanished from --repo.
 
 
 def parse_ls_long(text: str) -> Iterator[tuple[str, int, bool]]:
     """Parse `restic ls --long` output into (path, size, is_dir).
 
-    The path is the remainder after exactly six fields, never a whitespace
-    split, so names with spaces survive. Lines whose size field is not an
-    integer are skipped rather than guessed at.
-
-    A symlink is printed as `path -> target`, and the arrow is part of the
-    rendered line rather than of the name. Keeping the whole tail would make the
-    path match no pattern at all, so a symlink would silently never appear in any
-    `--repo` report. It is split on the *last* ` -> `, so a file genuinely named
-    `a -> b` still parses; restic appends only one arrow, for a link node.
+    Six fields then the path, never whitespace-split, so names with spaces
+    survive. A non-integer size is skipped rather than guessed at.
     """
     for line in text.splitlines():
         if not line.strip() or line.startswith("snapshot "):

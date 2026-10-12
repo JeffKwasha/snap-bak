@@ -13,6 +13,7 @@ no real repo, seconds per run, and the directory is removed afterwards.
 import json
 import os
 import shutil
+from concurrent.futures import ProcessPoolExecutor
 
 import pytest
 from conftest import backup, init_repo, restic, stored_files
@@ -245,6 +246,25 @@ def test_restic_prune_after_rewrite_reclaims_and_stays_readable(repo, tree):
     assert any(p.endswith("keep.txt") for p in stored)
 
 
+def walk(root, base, parsed):
+    """Walk the way the CLI does: through a process pool.
+
+    The agreement this test exists to prove is only worth anything on the path
+    production takes. The pool path went unchecked for a while and shipped a bug
+    that truncated every emitted path to its basename, which this caught the
+    moment it was pointed at the real walk.
+    """
+    with ProcessPoolExecutor(
+        max_workers=4,
+        initializer=excludes._init_worker,
+        initargs=(parsed,),
+    ) as pool:
+        yield from excludes.walk_excluded(
+            root, base, parsed, attribute_rules=True,
+            pool=pool, skip=str(root / "skipme"), top_level=True,
+        )
+
+
 def test_the_live_walk_and_the_repository_report_the_same_numbers(repo, tree):
     """The report's whole premise is that two columns can be compared.
 
@@ -264,7 +284,7 @@ def test_the_live_walk_and_the_repository_report_the_same_numbers(repo, tree):
     base = str(tree)
 
     walked = excludes.ExclusionSet()
-    for w in excludes.walk_excluded(tree, base, parsed, attribute_rules=True):
+    for w in walk(tree, base, parsed):
         walked.add(excludes.LIVE, w.path, w.size, w.is_dir, w.rule, w.files)
 
     listing = restic(repo, "ls", "--long", snap).stdout
@@ -303,10 +323,9 @@ def test_a_symlinked_directory_is_one_file_worth_nothing(repo, tree):
         excludes.parse_ls_long(restic(repo, "ls", "--long", snap).stdout),
         "s1", excludes.parse_patterns(["dirlink"]), into=found,
     )
+    parsed = excludes.parse_patterns(["dirlink"])
     walked = excludes.ExclusionSet()
-    for w in excludes.walk_excluded(
-        tree, str(tree), excludes.parse_patterns(["dirlink"])
-    ):
+    for w in walk(tree, str(tree), parsed):
         walked.add(excludes.LIVE, w.path, w.size, w.is_dir, w.rule, w.files)
 
     assert walked.total_files == found.total_files == 1

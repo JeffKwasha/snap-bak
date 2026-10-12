@@ -279,11 +279,15 @@ def _scan_live(
     found = excludes.ExclusionSet()
     detail = excludes.ExclusionSet() if expand else None
     workers = min(8, (os.cpu_count() or 4))
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=excludes._init_worker,
+        initargs=(patterns,),
+    ) as pool:
         for walked in excludes.walk_excluded(
             Path(rj.job.source_subvolume), root, patterns,
             attribute_rules=attribute, progress=progress, expand=bool(expand),
-            pool=pool, skip=str(rj.job.snapshot_dir),
+            pool=pool, skip=str(rj.job.snapshot_dir), top_level=True,
         ):
             if walked.detail:
                 if detail is not None:
@@ -316,12 +320,16 @@ def _scan_snaps(
     found = excludes.ExclusionSet()
     detail = excludes.ExclusionSet() if expand else None
     workers = min(8, (os.cpu_count() or 4))
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=excludes._init_worker,
+        initargs=(patterns,),
+    ) as pool:
         for snap in snapshot_model.Snapshot.scan(rj.job.snapshot_dir):
             for walked in excludes.walk_excluded(
                 snap.path, root, patterns,
                 attribute_rules=attribute, progress=progress,
-                expand=bool(expand), pool=pool,
+                expand=bool(expand), pool=pool, top_level=True,
             ):
                 if walked.detail:
                     if detail is not None:

@@ -1,48 +1,17 @@
 """One report, four renderings: what each exclude rule costs, per source.
 
-The question this answers is "is this rule working?", and no single source can
-answer it. A rule that drops 40k files from the live filesystem and 3 from what
-restic stored has either never been deployed or has stopped matching — and the
-difference is invisible unless both are on the page together. So the report is a
-grid: one row per rule, one column pair per source.
+A rule dropping 40k files live but 3 from restic has either not been deployed or
+has stopped matching, and the difference is invisible unless both are on one
+page. So: one row per rule, one `files / bytes` column pair per source.
 
-    TOTAL          exclude pattern   live             restic:a1b2c3d4
-    files    bytes                    files     bytes   files    bytes
-       4123       8.1T   cache/          4123     8.1T        0       0
-         135       1.0M   *.tmp            123       987       12      77
-         123       987    + *.iso            0         0        3    4.5G
-       4223       8.1T   TOTAL             4223     8.1T       15    4.5G
+Every configured rule gets a row, *including one that matches nothing* — the zero
+row is the finding, and a report that omits it cannot tell "not deployed yet"
+from "stopped matching". `+` marks a rule a trial added.
 
-Every configured rule gets a row, including one that matches nothing. A zero row
-*is* the finding — it is the difference between "this rule is not matching" and
-"this rule has not been deployed yet" — and a report that omits it cannot tell
-you which. A rule added by `--excludes-file` or `-e` is marked `+`, because the
-only reason to mark it is to tell a trial's new rules from the config's own.
-
-## One grid, four renderings
-
-`--json`, `--format csv`, `--format markdown` and the console all carry the same
-columns with the same numbers. Only the presentation differs:
-
-- **console** puts the numeric columns first. They have a fixed width, so the
-  rule or path column — arbitrarily long in a verbose report — can be folded at
-  the right without disturbing any number. `rich` does the layout; the column
-  *set* is fitted to the detected terminal width.
-- **csv / markdown / json** emit every column, always. They are not bound by a
-  terminal, so nothing is fitted and nothing is dropped. A fit-to-width console
-  must never become a fit-to-width CSV, because that is how a machine reader ends
-  up silently reading a subset.
-
-## What counts as a file
-
-A file is a non-directory entry restic stores: a regular file, a symlink, or a
-hardlink. Directories are never counted — a matched directory's row reports what
-sits *under* it, so counting the directory would make the total depend on
-directory layout rather than on data. A symlink is one file and zero bytes,
-because that is the node restic keeps (`restic ls --long` reports it at size 0). A
-hardlink is counted once per path, matching restic's own `ls`, which reports
-every hardlinked path at full size; the figure therefore over-states what `prune`
-reclaims by exactly the shared blocks.
+Only the console is fitted to the terminal. csv, markdown and json emit every
+column: a fit-to-width machine format is how a reader silently gets a subset.
+A file is any non-directory entry restic stores — regular file, symlink or
+hardlink; directories are never counted.
 """
 
 from __future__ import annotations
@@ -109,11 +78,9 @@ def human_bytes(n: int) -> str:
 def compact_bytes(n: int) -> str:
     """A byte count in at most 4 characters: `0`, `987`, `9.1M`, `12G`.
 
-    Single-letter units, and one decimal only where it fits, so every value cell
-    has the same width and a column of them lines up without a per-column padding
-    guess. A value that cannot be shown with a decimal inside three characters is
-    rounded instead, and one that rounds past its unit is promoted rather than
-    printed as `1024K`.
+    Fixed width per cell, so a column lines up without a padding guess. One
+    decimal only where it fits; anything that rounds past its unit is promoted
+    rather than printed as `1024K`.
     """
     n = int(n)
     if n < 1024:
@@ -208,20 +175,14 @@ def build(
     """The report for one job.
 
     `rules` is the effective pattern list, so a rule that matched nothing still
-    gets a row. `sources` pairs each source kind with the set that scanned it; a
-    set spanning several snapshots yields one column per snapshot, because
-    `per_snapshot` already carries that split.
+    gets a row. `sources` pairs each kind with the set that scanned it; a set
+    spanning several snapshots yields a column each.
 
-    `detail_sources` are the same sources scanned a second way, with every
-    matched directory opened up into the files beneath it. They are scanned
-    separately rather than derived from `sources`, because the rule table wants a
-    matched directory as one row and the file sheet wants its contents — and
-    because a directory that was pruned during the walk is not recoverable after
-    the fact.
-
-    Detail paths are rendered relative to the mount point, because that is the
-    only form in which a file present in three sources appears once instead of
-    three times, which is the entire point of putting the sources side by side.
+    `detail_sources` are the same sources with matched directories opened up.
+    They are scanned separately because a pruned directory is unrecoverable
+    afterwards, and because the rule table wants one row where the file sheet
+    wants the contents. Paths are relative to the mount point, so a file in three
+    sources appears once rather than three times.
     """
     marked = marked or set()
     columns: list[Column] = []
@@ -297,11 +258,15 @@ def _detail_rows(
                 bucket = merged.setdefault(path, {})
                 bucket[label] = bucket.get(label, 0) + found.size_in_of(path, label)
     prefix = root.rstrip("/") + "/"
-    return [
+    rows = [
         Row(label=path.removeprefix(prefix),
             cells={label: (0, nbytes) for label, nbytes in cells.items()})
         for path, cells in merged.items()
     ]
+    # Sorted like the rule rows: the walk order differs between the serial and
+    # parallel paths, and a file sheet that reorders per run is not comparable.
+    rows.sort(key=lambda r: (-r.total_bytes, r.label))
+    return rows
 
 
 # --------------------------------------------------------------------------

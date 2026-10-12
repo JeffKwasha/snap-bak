@@ -10,6 +10,7 @@ inspection mode report the wrong files.
 
 
 import os
+from concurrent.futures import ProcessPoolExecutor
 
 import pytest
 
@@ -868,3 +869,128 @@ def test_patterns_digest_avoids_boundary_collisions():
 def test_patterns_digest_handles_non_utf8_patterns():
     # Latin-1 bytes are legal in a Linux filename, so a pattern can hold them.
     assert excludes.patterns_digest(["caf\udce9"])
+
+
+# --- parallel walk --------------------------------------------------------
+# The CLI walks with a process pool; the cross-source agreement tests do not.
+# Anything the pool path gets wrong is therefore invisible to the rest of the
+# suite, which is how it shipped a bug that dropped every parent directory from
+# the paths it emitted.
+
+
+def _mixed_tree(root):
+    """Nesting, an excluded directory, symlinks, and a subtree to skip.
+
+    Each of those is a case where the two walks take different code paths: a
+    plain nested walk, a parallel one, `expand` in and out.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    for i in range(6):
+        d = root / f"dir{i}"
+        d.mkdir()
+        (d / "file.bin").write_bytes(b"x" * (i + 1))
+        if i % 2 == 0:
+            (d / "deep").mkdir()
+            (d / "deep" / "leaf.tmp").write_bytes(b"y" * 5)
+        if i % 3 == 0:
+            (d / "node_modules").mkdir()
+            (d / "node_modules" / "big.bin").write_bytes(b"z" * 200)
+    (root / "top.tmp").write_bytes(b"t" * 9)
+    (root / "skipme").mkdir()
+    (root / "skipme" / "hidden.tmp").write_bytes(b"s" * 99)
+    (root / "link.tmp").symlink_to("top.tmp")
+    return root
+
+
+def _rows(root, patterns, **kwargs):
+    return [
+        (w.path, w.size, w.is_dir, w.rule, w.files, w.detail)
+        for w in excludes.walk_excluded(
+            root, "/bak/E", patterns, attribute_rules=True, **kwargs
+        )
+    ]
+
+
+@pytest.mark.parametrize("expand", [False, True])
+def test_the_parallel_walk_yields_the_same_rows_as_the_serial_one(tmp_path, expand):
+    """Order-insensitive on purpose: the pool drains subtrees after the current
+    level, so order differs by design. The rows themselves must not — a worker
+    re-roots its own subtree, and getting that wrong silently truncates every
+    path to its basename."""
+    root = _mixed_tree(tmp_path / "src")
+    patterns = excludes.parse_patterns(["*.tmp", "node_modules", "!keep.tmp"])
+    skip = str(root / "skipme")
+    # `skip` on both sides: it is a walk option, not a parallel-only one, so
+    # leaving it off the baseline would compare different trees.
+    serial = _rows(root, patterns, expand=expand, skip=skip)
+
+    with ProcessPoolExecutor(
+        max_workers=4,
+        initializer=excludes._init_worker,
+        initargs=(patterns,),
+    ) as pool:
+        parallel = _rows(
+            root, patterns, expand=expand, pool=pool, skip=skip, top_level=True,
+        )
+
+    assert sorted(parallel) == sorted(serial)
+    # A parent directory missing from every path is the failure this pins.
+    assert any(r[0].startswith("/bak/E/dir0/deep/") for r in parallel)
+
+
+@pytest.mark.parametrize("expand", [False, True])
+def test_the_parallel_walk_honours_skip(tmp_path, expand):
+    root = _mixed_tree(tmp_path / "src")
+    patterns = excludes.parse_patterns(["*.tmp"])
+    with ProcessPoolExecutor(
+        max_workers=4,
+        initializer=excludes._init_worker,
+        initargs=(patterns,),
+    ) as pool:
+        rows = _rows(
+            root, patterns, expand=expand,
+            pool=pool, skip=str(root / "skipme"), top_level=True,
+        )
+    assert rows, "the fixture must match something"
+    assert not any("skipme" in r[0] for r in rows)
+
+
+def test_the_parallel_walk_orders_its_results_deterministically(tmp_path):
+    """Reproducible reports need a reproducible walk. Draining by submission
+    order rather than completion order is what buys that."""
+    root = _mixed_tree(tmp_path / "src")
+    patterns = excludes.parse_patterns(["*.tmp", "node_modules"])
+
+    def run():
+        with ProcessPoolExecutor(
+            max_workers=4,
+            initializer=excludes._init_worker,
+            initargs=(patterns,),
+        ) as pool:
+            return _rows(root, patterns, pool=pool, top_level=True)
+
+    assert run() == run()
+
+
+def test_the_parallel_walk_bounds_outstanding_work(tmp_path):
+    """A source with thousands of directories must not queue them all at once."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    root = tmp_path / "src"
+    root.mkdir()
+    for i in range(excludes._MAX_OUTSTANDING + 20):
+        (root / f"d{i:03d}").mkdir()
+        (root / f"d{i:03d}" / "f.tmp").write_bytes(b"x")
+
+    patterns = excludes.parse_patterns(["*.tmp"])
+    seen = 0
+    with ThreadPoolExecutor(
+        max_workers=4,
+        initializer=excludes._init_worker,
+        initargs=(patterns,),
+    ) as pool:
+        for _ in excludes.walk_excluded(
+            root, "/bak/E", patterns, pool=pool, top_level=True
+        ):
+            seen += 1
+    assert seen == excludes._MAX_OUTSTANDING + 20
