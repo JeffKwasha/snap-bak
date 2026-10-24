@@ -83,7 +83,7 @@ class TestParseSize:
 
 class TestConfig:
     def test_loads_and_resolves(self, tmp_path):
-        cfg = Config(**_config(tmp_path))
+        cfg = Config.model_validate(_config(tmp_path))
         jobs = cfg.resolve("/tmp/cfg.json")
         assert jobs[0].repo.name == "primary"
         assert jobs[0].repo.path == "rclone:test"
@@ -95,37 +95,40 @@ class TestConfig:
     def test_unknown_top_level_key_is_rejected(self, tmp_path):
         """A typo must be a loud error, not a setting that silently does nothing."""
         with pytest.raises(ValidationError):
-            Config(**_config(tmp_path, bogus_key=1))
+            Config.model_validate(_config(tmp_path, bogus_key=1))
 
     def test_unknown_job_key_is_rejected(self, tmp_path):
         base = _config(tmp_path)
         data = _config(tmp_path, jobs=[{**base["jobs"][0], "exclude": ["*.tmp"]}])
         with pytest.raises(ValidationError):
-            Config(**data)
+            Config.model_validate(data)
 
     def test_unknown_repo_key_is_rejected(self, tmp_path):
         base = _config(tmp_path)
         data = _config(tmp_path, repos=[{**base["repos"][0], "pasword_file": "x"}])
         with pytest.raises(ValidationError):
-            Config(**data)
+            Config.model_validate(data)
 
     def test_empty_repos_rejected(self, tmp_path):
         with pytest.raises(ValidationError):
-            Config(repos=[], jobs=[])
+            Config.model_validate({
+                "repos": [],
+                "jobs": [],
+            })
 
     def test_unknown_repo_reference_rejected(self, tmp_path):
         data = _config(
             tmp_path, jobs=[{**_config(tmp_path)["jobs"][0], "repo": "nope"}]
         )
         with pytest.raises(ValidationError):
-            Config(**data)
+            Config.model_validate(data)
 
     def test_invalid_restic_update_rejected(self, tmp_path):
         with pytest.raises(ValidationError):
-            Config(**_config(tmp_path, restic_update="before"))
+            Config.model_validate(_config(tmp_path, restic_update="before"))
 
     def test_stuck_threshold_parsed(self, tmp_path):
-        cfg = Config(**_config(tmp_path, stuck_threshold="1h"))
+        cfg = Config.model_validate(_config(tmp_path, stuck_threshold="1h"))
         assert cfg.stuck_threshold == 3600
 
 
@@ -151,21 +154,21 @@ class TestConfigLoad:
 
 class TestConfigLookup:
     def test_get_hit(self, tmp_path):
-        cfg = Config(**_config(tmp_path))
+        cfg = Config.model_validate(_config(tmp_path))
         rj = cfg.get("home")
         assert rj is not None
         assert rj.job.name == "home"
 
     def test_get_miss_is_none(self, tmp_path):
-        cfg = Config(**_config(tmp_path))
+        cfg = Config.model_validate(_config(tmp_path))
         assert cfg.get("nope") is None
 
     def test_getitem_hit(self, tmp_path):
-        cfg = Config(**_config(tmp_path))
+        cfg = Config.model_validate(_config(tmp_path))
         assert cfg["home"].mount_point == Path("/bak") / Path(str(tmp_path)).name
 
     def test_getitem_miss_raises_keyerror(self, tmp_path):
-        cfg = Config(**_config(tmp_path))
+        cfg = Config.model_validate(_config(tmp_path))
         with pytest.raises(KeyError):
             cfg["nope"]
 
@@ -176,22 +179,22 @@ class TestConfigLookup:
 class TestJobValidators:
     def test_unsafe_name_rejected(self, tmp_path):
         with pytest.raises(ValidationError):
-            Job(
-                name="bad/name",
-                snapshot_dir=tmp_path,
-                source_subvolume=tmp_path,
-                repo="r",
-            )
+            Job.model_validate({
+                "name": "bad/name",
+                "snapshot_dir": tmp_path,
+                "source_subvolume": tmp_path,
+                "repo": "r",
+            })
 
     def test_unsafe_tag_rejected(self, tmp_path):
         with pytest.raises(ValidationError):
-            Job(
-                name="ok",
-                tag="bad tag",
-                snapshot_dir=tmp_path,
-                source_subvolume=tmp_path,
-                repo="r",
-            )
+            Job.model_validate({
+                "name": "ok",
+                "tag": "bad tag",
+                "snapshot_dir": tmp_path,
+                "source_subvolume": tmp_path,
+                "repo": "r",
+            })
 
     def test_a_missing_snapshot_dir_still_loads(self, tmp_path):
         """`snapshot_dir` is machine state, not config shape.
@@ -203,33 +206,33 @@ class TestJobValidators:
         is used, by `Runner.create_snapshot` — which names the job and says what
         is actually wrong.
         """
-        job = Job(
-            name="ok",
-            snapshot_dir=tmp_path / "nope",
-            source_subvolume=tmp_path,
-            repo="r",
-        )
+        job = Job.model_validate({
+                  "name": "ok",
+                  "snapshot_dir": tmp_path / "nope",
+                  "source_subvolume": tmp_path,
+                  "repo": "r",
+              })
         assert job.snapshot_dir == tmp_path / "nope"
 
     def test_snapshot_interval_minimum(self, tmp_path):
         with pytest.raises(ValidationError):
-            Job(
-                name="ok",
-                snapshot_dir=tmp_path,
-                source_subvolume=tmp_path,
-                repo="r",
-                snapshot_interval=1,
-            )
+            Job.model_validate({
+                "name": "ok",
+                "snapshot_dir": tmp_path,
+                "source_subvolume": tmp_path,
+                "repo": "r",
+                "snapshot_interval": 1,
+            })
 
     def test_intervals_parsed(self, tmp_path):
-        job = Job(
-            name="ok",
-            snapshot_dir=tmp_path,
-            source_subvolume=tmp_path,
-            repo="r",
-            snapshot_interval="2h",
-            backup_interval="1w",
-        )
+        job = Job.model_validate({
+                  "name": "ok",
+                  "snapshot_dir": tmp_path,
+                  "source_subvolume": tmp_path,
+                  "repo": "r",
+                  "snapshot_interval": "2h",
+                  "backup_interval": "1w",
+              })
         assert job.snapshot_interval == 7200
         assert job.backup_interval == 604800
 
@@ -247,12 +250,14 @@ class TestWindow:
 
     def test_same_day_window(self):
         w = Window.parse("02:00", "06:00")
+        assert w is not None
         assert w.contains(datetime(2026, 1, 1, 3, 0))
         assert not w.contains(datetime(2026, 1, 1, 1, 0))
         assert not w.contains(datetime(2026, 1, 1, 6, 0))  # end is exclusive
 
     def test_overnight_window(self):
         w = Window.parse("22:00", "06:00")
+        assert w is not None
         assert w.contains(datetime(2026, 1, 1, 23, 0))
         assert w.contains(datetime(2026, 1, 1, 1, 0))
         assert not w.contains(datetime(2026, 1, 1, 12, 0))

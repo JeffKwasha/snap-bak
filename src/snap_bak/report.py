@@ -625,7 +625,7 @@ def _totals_json(sheet: Sheet) -> dict:
     """The footer's JSON. `"rough"` appears only when a caveat exists, so
     fully-priced documents keep the shape they always had."""
     total = sheet.totals()
-    out = {
+    out: dict[str, object] = {
         "rules": len(sheet.rows),
         "files": total.total_files,
         "bytes": total.total_bytes,
@@ -644,7 +644,7 @@ def _rule_json(row: Row, columns: list[Column]) -> dict:
     fully-priced document keeps the shape it always had."""
     sources = {}
     for c in columns:
-        entry = {
+        entry: dict[str, object] = {
             "files": row.cells.get(c.label, (0, 0))[0],
             "bytes": row.cells.get(c.label, (0, 0))[1],
         }

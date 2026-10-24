@@ -41,9 +41,9 @@ def _runner(
     time_for_backup=True,
     in_window=True,
 ):
-    cfg = config.Config(
-        repos=[{"name": "r", "path": "x", "size_limit": size_limit}],
-        jobs=[
+    cfg = config.Config.model_validate({
+              "repos": [{"name": "r", "path": "x", "size_limit": size_limit}],
+              "jobs": [
             {
                 "name": "j",
                 "snapshot_dir": str(tmp_path),
@@ -51,7 +51,7 @@ def _runner(
                 "repo": "r",
             }
         ],
-    )
+          })
     rj = cfg.resolve()[0]
     runner = Runner(
         rj,
@@ -117,6 +117,7 @@ class TestStatus:
             restic_snapshot_id="abc",
         )
         data = read_status(p)
+        assert data is not None
         assert data["job"] == "j"
         assert data["status"] == "delayed"
         assert data["snapshot_name"] == "snap"
@@ -157,7 +158,9 @@ class TestStatus:
             delay=DelayState(),
             snapshot_time=t,
         )
-        assert read_status(p)["snapshot_time"] == "2026-01-02_03:04Z"
+        data = read_status(p)
+        assert data is not None
+        assert data["snapshot_time"] == "2026-01-02_03:04Z"
 
 
 # --- Result ---
@@ -177,7 +180,11 @@ class TestResult:
 
 class TestCheckPasswordFile:
     def _repo(self, password_file):
-        return config.Repo(name="r", path="x", password_file=password_file)
+        return config.Repo.model_validate({
+                   "name": "r",
+                   "path": "x",
+                   "password_file": password_file,
+               })
 
     def test_no_password_file_is_noop(self, monkeypatch):
         check_password_file(self._repo(""))
@@ -346,9 +353,9 @@ class TestDecide:
 
 class TestRun:
     def test_retries_failed_backup(self, monkeypatch, tmp_path):
-        cfg = config.Config(
-            repos=[{"name": "r", "path": "x"}],
-            jobs=[
+        cfg = config.Config.model_validate({
+                  "repos": [{"name": "r", "path": "x"}],
+                  "jobs": [
                 {
                     "name": "j",
                     "snapshot_dir": str(tmp_path),
@@ -356,7 +363,7 @@ class TestRun:
                     "repo": "r",
                 }
             ],
-        )
+              })
         rj = cfg.resolve()[0]
         (tmp_path / "snap").mkdir()
         write_status(

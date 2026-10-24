@@ -1173,7 +1173,7 @@ def walk_excluded(
             seen[1] += size
             progress(seen[0], seen[1])
 
-    def list_children(path: Path) -> tuple[list, list, bool]:
+    def list_children(path: str) -> tuple[list, list, bool]:
         """`(subdir entries, non-dir entries, ok)` beneath `path`.
 
         `ok` is False when the directory itself could not be read; the caller

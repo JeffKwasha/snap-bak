@@ -20,6 +20,7 @@ from snap_bak import config
 _WRAPPER_PATH = Path(__file__).parent.parent / "src" / "sudo-exec.py"
 _loader = importlib.machinery.SourceFileLoader("sudo_exec", str(_WRAPPER_PATH))
 _spec = importlib.util.spec_from_loader("sudo_exec", _loader)
+assert _spec is not None
 io = importlib.util.module_from_spec(_spec)
 _loader.exec_module(io)
 
@@ -438,12 +439,12 @@ class TestStatusOp:
         (snap / "2026-08-10_04:00Z").mkdir()
 
         io._op_status(
-            config.Job(
-                name="x",
-                snapshot_dir=snap,
-                source_subvolume="/mnt/data",
-                repo="primary",
-            )
+            config.Job.model_validate({
+                "name": "x",
+                "snapshot_dir": snap,
+                "source_subvolume": "/mnt/data",
+                "repo": "primary",
+            })
         )
         parsed = json.loads(capsys.readouterr().out)
 
@@ -473,12 +474,12 @@ class TestStatusOp:
         (snap / "2026-08-10_04:00Z").mkdir()
 
         io._op_status(
-            config.Job(
-                name="x",
-                snapshot_dir=snap,
-                source_subvolume="/mnt/data",
-                repo="primary",
-            )
+            config.Job.model_validate({
+                "name": "x",
+                "snapshot_dir": snap,
+                "source_subvolume": "/mnt/data",
+                "repo": "primary",
+            })
         )
         parsed = json.loads(capsys.readouterr().out)
 
@@ -506,12 +507,12 @@ class TestStatusOp:
         snap.mkdir()  # empty snapshot dir
 
         io._op_status(
-            config.Job(
-                name="x",
-                snapshot_dir=snap,
-                source_subvolume="/mnt/data",
-                repo="primary",
-            )
+            config.Job.model_validate({
+                "name": "x",
+                "snapshot_dir": snap,
+                "source_subvolume": "/mnt/data",
+                "repo": "primary",
+            })
         )
         parsed = json.loads(capsys.readouterr().out)
 

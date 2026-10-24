@@ -25,6 +25,20 @@ jobs:
       # which interpreter environment happened to install it.
       - run: uvx ruff@0.16.9 check .
 
+  types:
+    name: pyright
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+      # Pyright reads the interpreter and venv from pyproject.toml, so the
+      # environment has to exist before it runs. Pinned like ruff: a pyright
+      # release must not turn the gate red on its own.
+      - run: uv sync --locked
+      - run: uvx pyright@1.1.414
+
   test:
     name: pytest
     runs-on: ubuntu-latest

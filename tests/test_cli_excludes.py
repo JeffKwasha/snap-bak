@@ -648,7 +648,10 @@ class TestAgentFacingErrors:
         list, a wrong name is a dead end that invites a retry loop with nothing
         to vary."""
         rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp"])
-        cfg = config.Config(repos=[rj.repo], jobs=[rj.job])
+        cfg = config.Config.model_validate({
+                  "repos": [rj.repo],
+                  "jobs": [rj.job],
+              })
         with pytest.raises(SystemExit) as caught:
             cli._selected_jobs(cfg, "data", "cfg.json")
         assert caught.value.code == config.EXIT_ERROR

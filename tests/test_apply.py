@@ -220,6 +220,7 @@ class TestExecute:
         runner.ping_error = subprocess.CalledProcessError(10, "restic")
         result = apply.execute(runner, p)
         assert result.status == job.ResultStatus.DELAYED
+        assert result.reason is not None
         assert "rc=10" in result.reason
         assert not any("rewrite" in c for c in runner.commands)
 
@@ -230,6 +231,7 @@ class TestExecute:
         runner.ping_error = subprocess.CalledProcessError(11, "restic")
         result = apply.execute(runner, p)
         assert result.status == job.ResultStatus.DELAYED
+        assert result.reason is not None
         assert "rc=11" in result.reason
 
     def test_rewrite_failure_leaves_originals_and_reports(self, state_dir):
@@ -237,6 +239,7 @@ class TestExecute:
         runner.run_error = subprocess.CalledProcessError(1, "restic")  # the rewrite, not the ping
         result = apply.execute(runner, p)
         assert result.status == job.ResultStatus.FAILED
+        assert result.reason is not None
         assert "intact" in result.reason
 
     def test_failure_is_counted_so_it_can_escalate(self, state_dir):
@@ -323,7 +326,9 @@ class TestQueue:
         job.write_status(
             path, job="data", status="delayed", message="nope", delay=job.DelayState()
         )
-        assert job.read_status(path)["status"] == "delayed"
+        status = job.read_status(path)
+        assert status is not None
+        assert status["status"] == "delayed"
 
 
 class TestDispatch:
@@ -340,6 +345,7 @@ class TestDispatch:
     def test_successful_task_clears_its_entry(self, state_dir):
         path, runner = self._armed(state_dir)
         result, repos = todo.dispatch(path, runner)
+        assert result is not None
         assert result.status == job.ResultStatus.SUCCESS
         assert todo.queued_tasks(path) == []
         assert repos == {"/repo"}
@@ -348,6 +354,7 @@ class TestDispatch:
         path, runner = self._armed(state_dir)
         runner.run_error = subprocess.CalledProcessError(1, "restic")
         result, repos = todo.dispatch(path, runner)
+        assert result is not None
         assert result.status == job.ResultStatus.FAILED
         assert len(todo.queued_tasks(path)) == 1, "the request is still outstanding"
         assert todo.queued_tasks(path)[0]["attempts"] == 1
@@ -359,6 +366,7 @@ class TestDispatch:
         path, runner = self._armed(state_dir)
         runner._listings = {"id0": []}
         result, _ = todo.dispatch(path, runner)
+        assert result is not None
         assert result.status == job.ResultStatus.SKIPPED
         assert todo.queued_tasks(path) == []
 
@@ -366,7 +374,9 @@ class TestDispatch:
         path = state_dir / "Test.json"
         todo.arm_task(path, "a-task-this-version-never-heard-of")
         result, _ = todo.dispatch(path, FakeRunner(state_file=path))
+        assert result is not None
         assert result.status == job.ResultStatus.FAILED
+        assert result.reason is not None
         assert "no handler" in result.reason
         assert todo.queued_tasks(path) == []
 
@@ -382,7 +392,9 @@ class TestDispatch:
             result, repos = todo.dispatch(path, FakeRunner(state_file=path))
         finally:
             del todo.TASKS["boom-for-test"]
+        assert result is not None
         assert result.status == job.ResultStatus.FAILED
+        assert result.reason is not None
         assert "kaboom" in result.reason
         assert len(todo.queued_tasks(path)) == 1
         assert repos == set()
