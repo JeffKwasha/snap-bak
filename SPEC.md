@@ -1260,9 +1260,10 @@ uv run pytest -q
 
 snap-bak supports:
 
-- Python ≥ 3.10
+- Python ≥ 3.14
 - pydantic >= 2.0 (config models)
 - python-dateutil (relativedelta for retention calculations)
 - json5 (JSONC config parsing)
-- restic (backup tool)
+- rich (terminal rendering of the reports)
+- restic (backup tool), installed at /usr/local/bin/restic
 - btrfs-progs (snapshot management)

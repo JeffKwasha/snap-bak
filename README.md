@@ -26,6 +26,13 @@ to daily use.
 ```bash
 uv sync        # or: python3 -m venv .venv && .venv/bin/pip install -e .
 .venv/bin/snap-bak -c config/config.json --list-jobs
+```
+
+The example config names files that do not exist in a clone (its
+`ignore_file`, the per-repo password files), so edit it first — see
+*Configuration* — then the inspection commands work against your own tree:
+
+```bash
 .venv/bin/snap-bak -c config/config.json show excludes --live
 ```
 
