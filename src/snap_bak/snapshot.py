@@ -28,7 +28,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 # Canonical, timezone-honest snapshot name (UTC). The trailing Z marks the
@@ -57,7 +57,7 @@ def parse_name(name: str) -> datetime | None:
     if SNAPSHOT_RE.fullmatch(name) is None:
         return None
     try:
-        return datetime.strptime(name, SNAPSHOT_FMT).replace(tzinfo=timezone.utc)
+        return datetime.strptime(name, SNAPSHOT_FMT).replace(tzinfo=UTC)
     except ValueError:
         return None
 
@@ -146,7 +146,7 @@ class Snapshot:
         """Age of the snapshot (now - time); None for a source subvolume."""
         if self.time is None:
             return None
-        return datetime.now(timezone.utc) - self.time
+        return datetime.now(UTC) - self.time
 
     @property
     def generation(self) -> int | None:
@@ -218,7 +218,7 @@ class Snapshot:
         Prefer it over `latest` when backing up: it ages the snapshot cadence
         rather than always hammering the most recent subvolume.
         """
-        cutoff = datetime.now(timezone.utc) - interval
+        cutoff = datetime.now(UTC) - interval
         for s in cls.scan(snapshot_dir):
             if s.time is not None and s.time >= cutoff:
                 return s

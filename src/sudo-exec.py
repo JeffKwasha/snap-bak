@@ -69,7 +69,7 @@ RESTIC = "/usr/local/bin/restic"
 SETCAP = "/usr/sbin/setcap"
 
 
-def _exit_err(msg: str, code: int = 1) -> "NoReturn":
+def _exit_err(msg: str, code: int = 1) -> NoReturn:
     print(f"sudo-exec: {msg}", file=sys.stderr)
     sys.exit(code)
 
@@ -164,13 +164,18 @@ def _pool_device_names(source_subvolume: str) -> list[str]:
             devdir = os.path.join(_SYSFS_BTRFS, fsname, "devices")
             if not os.path.isdir(devdir):
                 continue
-            names: list[str] = []
-            for name in os.listdir(devdir):
-                names.append(name)
+            try:
+                names = sorted(os.listdir(devdir))
+            except OSError:
+                continue
+            for name in names:
                 try:
                     with open(os.path.join(devdir, name, "dev")) as f:
                         if f.read().strip() == want:
-                            return sorted(names)
+                            # Every device of the pool, not just the ones
+                            # listed before the match: a RAID1 snapshot must
+                            # wake all of them.
+                            return names
                 except OSError:
                     continue
     except OSError:

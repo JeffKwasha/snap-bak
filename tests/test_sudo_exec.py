@@ -314,6 +314,19 @@ class TestPoolDeviceNames:
         monkeypatch.setattr(io, "_SYSFS_BTRFS", str(tmp_path / "btrfs"))
         monkeypatch.setattr(io, "_btrfs_mount_device", lambda src: "/dev/dm-3")
 
+        # The mount device comes FIRST in listing order. Returning as soon as
+        # it matches would then yield only ['dm-3']; the whole pool is wanted.
+        real_listdir = os.listdir
+
+        def fake_listdir(path):
+            if str(path) == str(tmp_path / "btrfs"):
+                return ["c84c2c15"]
+            if str(path) == str(fs):
+                return ["dm-3", "dm-11", "dm-4"]
+            return real_listdir(path)
+
+        monkeypatch.setattr(io.os, "listdir", fake_listdir)
+
         real_stat = os.stat
 
         def fake_stat(p):

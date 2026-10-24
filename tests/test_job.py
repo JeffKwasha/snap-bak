@@ -2,7 +2,7 @@
 
 import subprocess
 import types
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -148,7 +148,7 @@ class TestStatus:
 
     def test_snapshot_time_serialized(self, tmp_path):
         p = tmp_path / "s.json"
-        t = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
+        t = datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
         write_status(
             p,
             job="j",

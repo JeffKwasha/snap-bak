@@ -16,7 +16,7 @@ import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import TextIO
@@ -167,10 +167,10 @@ def _write_lock_info(job_name=None, snapshot_name=None):
     """Write lock info in place (never tmp+rename — that would orphan the flock)."""
     info = {
         "pid": os.getpid(),
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": datetime.now(UTC).isoformat(),
         "current_job": job_name,
         "snapshot_name": snapshot_name,
-        "backup_started_at": datetime.now(timezone.utc).isoformat()
+        "backup_started_at": datetime.now(UTC).isoformat()
         if job_name
         else None,
     }
@@ -382,7 +382,7 @@ def write_status(
     data = {
         "job": job,
         "status": status,
-        "timestamp": datetime.now(timezone.utc).strftime(snapshot.SNAPSHOT_FMT),
+        "timestamp": datetime.now(UTC).strftime(snapshot.SNAPSHOT_FMT),
         "message": message,
         **delay.to_dict(),
     }
@@ -600,7 +600,7 @@ class Runner:
     # --- snapshot creation / retention ---
 
     def create_snapshot(self):
-        snap_name = snapshot.snapshot_name(datetime.now(timezone.utc))
+        snap_name = snapshot.snapshot_name(datetime.now(UTC))
         snap_path = Path(self.job.snapshot_dir) / snap_name
         for path, what in (
             (snap_path.parent, "Snapshot directory"),
@@ -630,7 +630,7 @@ class Runner:
         snap_time = snapshot.parse_name(snapshot_path.name)
         return (
             snap_time is None
-            or (datetime.now(timezone.utc) - snap_time).total_seconds()
+            or (datetime.now(UTC) - snap_time).total_seconds()
             < config.DEFAULT_SNAPSHOT_AGE_MIN
         )
 
@@ -652,7 +652,7 @@ class Runner:
     def _should_create_snapshot(self) -> bool:
         """Power-saving gate: skip when a disk is spun down or the source is unchanged."""
         status = self._wrapper_status()
-        candidate = snapshot.snapshot_name(datetime.now(timezone.utc))
+        candidate = snapshot.snapshot_name(datetime.now(UTC))
         if self.job.skip_snapshot_if_idle and status.get("any_spun_down") is True:
             logger.info(
                 f"Skipping '{candidate}': pool has a spun-down disk (power saving; not waking the drive)"
@@ -663,7 +663,7 @@ class Runner:
         due = (
             latest is None
             or latest.time is None
-            or (datetime.now(timezone.utc) - latest.time).total_seconds()
+            or (datetime.now(UTC) - latest.time).total_seconds()
             >= self.job.snapshot_interval
         )
         if self.dry_run or not due:
@@ -932,8 +932,8 @@ class Runner:
             ts = data["timestamp"].removesuffix("Z")
             if "T" in ts:
                 last = datetime.fromisoformat(ts)
-                return last if last.tzinfo else last.replace(tzinfo=timezone.utc)
-            return datetime.strptime(ts, "%Y-%m-%d_%H:%M").replace(tzinfo=timezone.utc)
+                return last if last.tzinfo else last.replace(tzinfo=UTC)
+            return datetime.strptime(ts, "%Y-%m-%d_%H:%M").replace(tzinfo=UTC)
         except (KeyError, ValueError):
             return None
 
@@ -941,7 +941,7 @@ class Runner:
         last = self._last_success_time()
         return (
             last is None
-            or (datetime.now(timezone.utc) - last).total_seconds()
+            or (datetime.now(UTC) - last).total_seconds()
             >= self.job.backup_interval
         )
 
@@ -1122,7 +1122,7 @@ class Runner:
         self._bump_repo_size(repo, total_size)
 
         message = (
-            f"Backup completed at {datetime.now(timezone.utc).isoformat()}"
+            f"Backup completed at {datetime.now(UTC).isoformat()}"
             if not retry
             else "Backup completed (retry of failed snapshot)"
         )

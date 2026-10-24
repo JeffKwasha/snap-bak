@@ -12,7 +12,7 @@ import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import json5
@@ -168,7 +168,7 @@ Snapshot = snapshot.Snapshot
 
 def build_retention_exponential(n: int = 1) -> list[datetime]:
     """Generate tier boundaries at exponential intervals: 1h, 2h, 4h, 8h..."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return [now - relativedelta(hours=2**i) for i in range(n)]
 
 
@@ -180,7 +180,7 @@ def build_retention_datetimes(
     yearly: int = 0,
 ) -> list[datetime]:
     """Calendar-based retention boundaries; each tier starts after the previous."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     hours = [now - relativedelta(hours=i) for i in range(hourly)]
     days = [now - relativedelta(hours=hourly, days=i) for i in range(daily)]
     weeks = [
@@ -265,7 +265,7 @@ class Window:
         return current_minutes >= self.start_min or current_minutes < self.end_min
 
     @classmethod
-    def parse(cls, start: str | None, end: str | None) -> "Window | None":
+    def parse(cls, start: str | None, end: str | None) -> Window | None:
         if not start or not end:
             return None
         try:
@@ -390,7 +390,7 @@ class Config(BaseModel):
         return self
 
     @classmethod
-    def load(cls, path: Path) -> "Config":
+    def load(cls, path: Path) -> Config:
         """Load and validate a JSON config file using pydantic."""
         if not path.exists():
             logger.error(f"Config not found: {path}")

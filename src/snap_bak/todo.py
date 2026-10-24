@@ -22,7 +22,7 @@ import inspect
 import json
 import logging
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from snap_bak import config, job
 
@@ -102,7 +102,7 @@ def arm_task(path, task_name: str, *, now: datetime | None = None) -> dict:
     data = _load(path)
     entry = {
         "task": task_name,
-        "armed_at": (now or datetime.now(timezone.utc)).isoformat(),
+        "armed_at": (now or datetime.now(UTC)).isoformat(),
         "attempts": 0,
         "last_rc": None,
         "last_error": None,
@@ -135,7 +135,7 @@ def record_attempt(path, task_name: str, *, rc: int | None, error: str | None) -
             entry["attempts"] = attempts
             entry["last_rc"] = rc
             entry["last_error"] = error
-            entry["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
+            entry["last_attempt_at"] = datetime.now(UTC).isoformat()
     data[QUEUED_KEY] = data.get(QUEUED_KEY, [])
     _store(path, data)
     return attempts
@@ -232,7 +232,7 @@ def reap(cfg, job_names: set[str]) -> list[str]:
     if not config.STATE_DIR.exists():
         return []
     cutoff = (
-        datetime.now(timezone.utc).timestamp() - cfg.state_retention_days * 86400
+        datetime.now(UTC).timestamp() - cfg.state_retention_days * 86400
     )
     removed = []
     for path in sorted(config.STATE_DIR.glob("*.json")):

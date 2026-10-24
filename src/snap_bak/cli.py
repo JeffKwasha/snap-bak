@@ -437,7 +437,7 @@ class _View:
     width: int | None = None
 
     @classmethod
-    def build(cls, args, override) -> "_View":
+    def build(cls, args, override) -> _View:
         return cls(
             limit=args.limit,
             as_json=args.json,

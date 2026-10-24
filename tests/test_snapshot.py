@@ -7,7 +7,7 @@ parse (the crash that started all this) and the memoized generation reads.
 """
 
 import types
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from snap_bak import snapshot
@@ -17,7 +17,7 @@ from snap_bak import snapshot
 
 class TestNameFormat:
     def test_round_trip(self):
-        dt = datetime(2026, 8, 14, 2, 0, tzinfo=timezone.utc)
+        dt = datetime(2026, 8, 14, 2, 0, tzinfo=UTC)
         assert snapshot.parse_name(snapshot.snapshot_name(dt)) == dt
 
     def test_utc_zone(self):
@@ -69,7 +69,7 @@ class TestScan:
         assert snapshot.Snapshot.latest(tmp_path) is None
 
     def test_oldest_within(self, tmp_path):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         recent = (now - timedelta(minutes=30)).strftime("%Y-%m-%d_%H:%MZ")
         old = (now - timedelta(hours=24)).strftime("%Y-%m-%d_%H:%MZ")
         (tmp_path / old).mkdir()

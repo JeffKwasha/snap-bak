@@ -1,7 +1,7 @@
 """Tests for snap_bak.config: parsing, models, resolution, retention."""
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -263,7 +263,7 @@ class TestWindow:
 
 class TestRetention:
     def test_exponential(self):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         bounds = build_retention_exponential(3)
         assert len(bounds) == 3
         assert all(b <= now for b in bounds)
@@ -273,13 +273,13 @@ class TestRetention:
         assert len(bounds) == 3
 
     def test_keeplist_keeps_recent_and_slot_oldest(self):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         snaps = [Snapshot(Path(f"/s/{i}"), now - timedelta(hours=i)) for i in range(5)]
         keep = build_snapshot_keeplist(snaps, [now - timedelta(hours=2)])
         assert keep == {snaps[0].path, snaps[2].path}
 
     def test_keeplist_ignores_source_subvolume(self):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         snaps = [
             Snapshot(Path("/s/src"), None),  # source subvolume, time=None
             Snapshot(Path("/s/a"), now - timedelta(hours=1)),
