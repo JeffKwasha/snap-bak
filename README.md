@@ -48,7 +48,7 @@ sudo /opt/snap-bak/venv/bin/pip install pydantic python-dateutil json5 rich
 sudo PYTHON_BIN=/opt/snap-bak/venv/bin/python ./snap-bak-setup.sh
 ```
 
-Otherwise, from the repo clone (the script is not on `PATH`):
+Otherwise run the copy in the clone:
 
 ```bash
 chmod +x snap-bak-setup.sh
