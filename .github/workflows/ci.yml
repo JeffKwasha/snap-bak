@@ -1,0 +1,47 @@
+name: CI
+
+# Change-triggered only: no schedules. The Actions tab can run it by hand too.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # Pinned rather than a dependency: the lint result must not depend on
+      # which interpreter environment happened to install it.
+      - run: uvx ruff@0.16.9 check .
+
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+      # The suite skips its restic integration tests when the binary is
+      # absent — which would let a broken walker pass. Install the version the
+      # golden matcher cases are pinned against.
+      - name: Install restic 0.19.1
+        run: |
+          curl -fsSL -o /tmp/restic.bz2 \
+            https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2
+          bunzip2 /tmp/restic.bz2
+          sudo install -m 0755 /tmp/restic /usr/local/bin/restic
+          restic version
+      - run: uv sync --locked
+      - run: uv run pytest -q
