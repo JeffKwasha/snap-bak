@@ -10,64 +10,102 @@ to daily use.
 
 ## Requirements
 
-- **Btrfs** — snapshots and subvolume mount
-- **Python ≥ 3.10**
-- **restic**
-- **pydantic python-dateutil json5**
+- **Btrfs** with `btrfs-progs` — the `btrfs` CLI creates and inspects snapshots
+- **Python ≥ 3.14**
+- **restic** at `/usr/local/bin/restic` — a real file, not a symlink: the root
+  wrapper applies `cap_dac_read_search` to it (see *Permissions & Security*)
+- **`pydantic`, `python-dateutil`, `json5`, `rich`** — `pip install -e .` pulls
+  them in; the setup script installs them for the service interpreter
 - **optional:** `rclone` — for `rclone:REMOTE:DIR` repos
 - **optional:** systemd (Linux) — for the timer-driven service
 
 ## Installation
 
-### Option A — Manual / development
+### Option A — Development and inspection
 
 ```bash
-# install python package + deps (or: cd repo && uv sync)
-pip install -e .
+uv sync        # or: python3 -m venv .venv && .venv/bin/pip install -e .
+.venv/bin/snap-bak -c config/config.json --list-jobs
+.venv/bin/snap-bak -c config/config.json show excludes --live
 ```
 
-Then configure `config/config.json` and run manually (`snap-bak --dry-run`)
-or schedule via cron/systemd yourself.
+That is enough to develop, run the suite, and inspect a configuration. It is
+**not** enough to run a backup: every privileged step (mount, snapshot,
+unmount, delete, restic update) goes through the root wrapper
+`/opt/snap-bak/sudo-exec.py` and its sudoers rule, which Option B installs.
 
 ### Option B — Systemd service (recommended for production)
 
-The fully-automated setup script creates an unprivileged system user, installs
-the orchestrator + a root-owned sudo wrapper, configures a static sudoers
-rule, and wires up a systemd *service + timer*.
+Prerequisites: restic at `/usr/local/bin/restic` (a distro package lands in
+`/usr/bin`, which the wrapper rejects; download the release binary and
+`sudo install -m755 restic /usr/local/bin/restic`), and Python 3.14 with the
+dependencies importable by the interpreter the service will use. If the system
+Python is externally managed (Debian/Ubuntu), give the script a virtualenv:
 
 ```bash
-sudo snap-bak-setup.sh
-sudo systemctl enable --now snap-bak.timer
+sudo python3 -m venv /opt/snap-bak/venv
+sudo /opt/snap-bak/venv/bin/pip install pydantic python-dateutil json5 rich
+sudo PYTHON_BIN=/opt/snap-bak/venv/bin/python ./snap-bak-setup.sh
+```
+
+Otherwise, from the repo clone (the script is not on `PATH`):
+
+```bash
+chmod +x snap-bak-setup.sh
+sudo ./snap-bak-setup.sh
 ```
 
 What `snap-bak-setup.sh` does:
 
-1. Verifies you are `root`.
+1. Verifies you are `root`, and that Python can import its dependencies.
 2. Creates the `snap-bak` user/group and `/opt/snap-bak`.
 3. Installs the orchestrator package to `/opt/snap-bak/snap_bak/` (root:root
    0644) and the wrapper to `/opt/snap-bak/sudo-exec.py` (root:root 0755).
-4. Writes an annotated example config to `/opt/snap-bak/config.json`.
-5. Creates service-writable `state/`, `cache/`, `passwords/` and
+4. Validates `/usr/local/bin/restic`, self-updates it to the newest release,
+   and applies `cap_dac_read_search` (the wrapper's `update-restic` op).
+5. Writes an annotated example config to `/opt/snap-bak/config.json`.
+6. Creates service-writable `state/`, `cache/`, `passwords/` and
    `.config/rclone/`; root:snap-bak `excludes/`.
- 6. Creates the mount base `/bak` and installs a single static sudoers rule —
-    `snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/sudo-exec.py` (bare command
-    name = any arguments, per sudoers(5)) — valid on both sudo-rs and
-    sudo.ws.
-7. Writes `snap-bak.service` (oneshot) and `snap-bak.timer` (hourly).
+7. Creates the mount base `/bak` and installs a single static sudoers rule —
+   `snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/sudo-exec.py` (bare command
+   name = any arguments, per sudoers(5)) — valid on both sudo-rs and
+   sudo.ws.
+8. Writes `snap-bak.service` (oneshot) and `snap-bak.timer` (hourly).
+
+Then, before enabling the timer:
+
+1. Edit `/opt/snap-bak/config.json` to match your environment.
+2. Create the per-repo restic password files under `/opt/snap-bak/passwords/` —
+   owned by you and readable by the service group:
+   `sudo chown <you>:snap-bak <file> && sudo chmod 640 <file>`. The gate accepts
+   owner-only (0600) or owner + `snap-bak` group-read (0640); a group other than
+   `snap-bak`, group write/execute, or any `other` access is rejected (exit 4).
+3. Copy your rclone config to `/opt/snap-bak/.config/rclone/rclone.conf`
+   (chmod 600) if any repo is `rclone:`.
+4. Make sure each job's `snapshot_dir` exists, and that the `snap-bak` user can
+   read and write the restic repository path.
+5. Do one real run and watch it:
+
+   ```bash
+   sudo systemctl start snap-bak.service
+   systemctl status snap-bak.service --no-pager
+   sudo journalctl -u snap-bak --since "10 minutes ago" --no-pager
+   cat /opt/snap-bak/state/<job>.json
+   ```
+
+6. Enable the timer — by its full name, because `systemctl enable snap-bak`
+   means `snap-bak.service`, not the timer:
+
+   ```bash
+   sudo systemctl enable --now snap-bak.timer
+   ```
 
 The timer runs hourly; restic uploads happen per-job only when
 `backup_interval` has elapsed (so weekly backups = `backup_interval: "1w"`).
 
 The setup script is **idempotent** — re-running it is safe: it skips the user,
 group, and existing `config.json` (so your edits are preserved), refreshes the
-program + unit files, and re-validates sudoers.
-
-Before enabling, edit `/opt/snap-bak/config.json` to match your environment and
-create the per-repo restic password files under `/opt/snap-bak/passwords/` —
-owned by you and readable by the service group:
-`sudo chown <you>:snap-bak <file> && sudo chmod 640 <file>`. The gate accepts
-owner-only (0600) or owner + `snap-bak` group-read (0640); a group other than
-`snap-bak`, group write/execute, or any `other` access is rejected (exit 4).
+program + unit files, re-validates sudoers and re-runs the restic update.
 
 ## How It Works
 
