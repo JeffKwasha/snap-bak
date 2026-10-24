@@ -50,6 +50,14 @@ Add `--job NAME` to scope to one job. `--all` puts every source in one table;
 `--limit N` bounds the per-file rows under `-v` (rule rows and totals always
 cover everything).
 
+The local modes (`--live`, `--snaps`) **prune matched directories unread**, as
+restic's own walker does, so a rule's totals show `?` instead of a number: the
+size is genuinely unknown, not zero, and a `?` row is not evidence the rule
+matched nothing. `+?` means part of the rule's price is unknown. When the
+numbers themselves are the question, `--price` walks those directories out
+(slow: one stat per file beneath every rule). The `--repo` mode is always
+exact — it reads what restic stored.
+
 Step 4 is the one that answers "is my backup working". If it exits 0 with
 `count: 0`, the stored data genuinely holds nothing your excludes would drop.
 If it exits 30 or 41, you learned **nothing** — see exit codes below.
@@ -86,6 +94,14 @@ snap-bak apply excludes --job data --later  # queue for the next run
 ```
 
 Ad-hoc rules work too: `-e '*.iso' -e 'build/cache/'`, repeatable.
+
+To see what a rule *would* newly exclude before you even put it in a working
+file, use `--reveal` (repeatable) or `--reveal-file PATH`. A reveal is treated
+as an extra rule, its matches are priced whole and listed file by file, and
+what the config already excludes keeps its own `?` rows — that part is not
+what the candidate adds. Reveal patterns are never handed to restic and
+`apply` refuses them; when the survey looks right, copy the pattern into the
+`ignore_file`.
 
 **Rule order is `config → --excludes-file → -e`.** Two things follow, and they
 cut in opposite directions:
@@ -324,7 +340,9 @@ maps it to the exit code, so quoting the exit code alone loses it.
 - **A mistyped config key is now a hard error (exit 2), not a silent no-op.**
   This is deliberate. If you see exit 2 naming `Extra inputs are not permitted`,
   the key you added is not real — check for an old field name.
-- **`show excludes` with no selector defaults to `--live`** (local, instant).
+- **`show excludes` with no selector defaults to `--live`** (local, shallow —
+  matched directories are pruned unread, so their totals print `?`; `--price`
+  walks them out).
   Passing `--repo` is what actually queries the network, and it can be slow on
   a large or remote repo.
 - Patterns are linted on every `show` and print nothing when clean, so silence

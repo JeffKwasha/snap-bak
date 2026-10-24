@@ -34,12 +34,20 @@ jobs:
         with:
           python-version: "3.14"
       # The suite skips its restic integration tests when the binary is
-      # absent — which would let a broken walker pass. Install the version the
-      # golden matcher cases are pinned against.
-      - name: Install restic 0.19.1
+      # absent, so a missing binary would let a broken walker pass.
+      #
+      # Deliberately the NEWEST release, not a pin: restic's own behaviour is
+      # what we port, so a restic change must surface here as a failing test
+      # and be fixed in our code. Pinning an old binary would hide the
+      # divergence until a user hit it with their own restic.
+      - name: Install the latest restic
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          tag=$(gh api repos/restic/restic/releases/latest --jq .tag_name)
+          echo "Installing restic $tag"
           curl -fsSL -o /tmp/restic.bz2 \
-            https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2
+            "https://github.com/restic/restic/releases/download/${tag}/restic_${tag#v}_linux_amd64.bz2"
           bunzip2 /tmp/restic.bz2
           sudo install -m 0755 /tmp/restic /usr/local/bin/restic
           restic version

@@ -649,6 +649,11 @@ the full set.
 (`internal/filter`, matching restic 0.19.1) so listings agree with what restic
 would do. restic's documentation of pattern syntax is the authority.
 
+CI installs the **newest** restic release rather than pinning 0.19.1: when
+restic's behaviour changes, the integration tests fail and the port gets fixed
+in the same change. A pinned old binary would hide the divergence until a user
+hit it against their own restic.
+
 Negation and prune behaviour are **not** documented upstream — restic describes
 pattern syntax and says nothing about `!` or about what a matched directory does
 to later rules. Those rules below are therefore the volatile kind: a restic

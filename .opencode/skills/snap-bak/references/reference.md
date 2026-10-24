@@ -29,9 +29,12 @@ Read-only. Never creates, removes, or modifies a snapshot or a local file.
 | Flag | Meaning |
 |------|---------|
 | `--live` | Match the live filesystem. **Default when no selector is given** |
-| `--snaps` | Match local btrfs snapshots (local, instant) |
+| `--snaps` | Match local btrfs snapshots (local) |
 | `--repo` | Match files already stored in restic (network, metadata only) |
 | `--all` | All three, in one pass |
+| `--price` | Walk matched directories for exact sizes; the default prunes them unread and prints `?` |
+| `--reveal PATTERN` | What-if: treat PATTERN as a rule, price its matches whole and list them (repeatable) |
+| `--reveal-file PATH` | A file of `--reveal` patterns, `ignore_file` syntax |
 | `--excludes-file PATH` | Add a working pattern file's rules to the job's |
 | `-e, --exclude PATTERN` | Add one rule, repeatable |
 | `-j, --job NAME` | Scope to one job |
@@ -39,6 +42,12 @@ Read-only. Never creates, removes, or modifies a snapshot or a local file.
 | `--format text\|csv\|markdown` | How to render the grid; only `text` is fitted to the terminal |
 | `-v, --verbose` | List every excluded path, not just the trial's new rules |
 | `--limit N` | Bound displayed rows. Totals still cover every match |
+
+The local modes prune matched directories unread, exactly as restic's walker
+does, so a rule's totals are `?` (unknown, not zero) unless `--price` walks
+them out; `+?` marks a price that covers only part of what a rule matched. CSV
+writes an empty cell for an unknown total rather than a false `0`, and JSON
+carries a `rough` key only when there is a caveat. `--repo` is always exact.
 
 `--excludes-file` and `-e` **add to** the job's patterns rather than replacing
 them. They take the same syntax an `ignore_file` uses, so a rule moves between
