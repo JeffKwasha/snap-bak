@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Integration tests: the exclude engine against a real restic binary.
 
 These are the tests that matter most. The unit tests port restic's own golden

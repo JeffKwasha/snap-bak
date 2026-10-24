@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Unit tests for snap_bak/excludes.py — restic's exclusion engine, ported.
 
 The MATCH_* / CHILD_* / LIST_* tables below are restic's own golden cases from
@@ -11,6 +10,7 @@ inspection mode report the wrong files.
 
 import os
 from concurrent.futures import ProcessPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -455,12 +455,13 @@ def test_expand_env_edge_cases(monkeypatch):
 
 
 def test_patterns_for_job_merges_ignore_file_then_excludes(tmp_path):
-    class FakeJob:
-        ignore_file = str(tmp_path / "j.ignore")
-        excludes = ["*.cache"]
+    job_stub = SimpleNamespace(
+        ignore_file=str(tmp_path / "j.ignore"),
+        excludes=["*.cache"],
+    )
 
     (tmp_path / "j.ignore").write_text("# c\n*.tmp\n")
-    assert excludes.patterns_for_job(FakeJob()) == ["*.tmp", "*.cache"]
+    assert excludes.patterns_for_job(job_stub) == ["*.tmp", "*.cache"]
 
 
 # --- lint -----------------------------------------------------------------
@@ -518,14 +519,39 @@ def _make_tree(root):
     return root
 
 
+def test_matcher_caches_never_change_an_answer():
+    """Both memoised layers (pattern-shape and segment answers) must be pure.
+
+    `clear_matcher_cache` between two identical matches is the cheapest way to
+    catch a cache keyed on something its answers depend on: if a future flag
+    (case sensitivity, locale) is left out of a cache key, the second answer
+    here diverges from the first.
+    """
+    pats = excludes.parse_patterns(
+        ["*.tmp", "**/cache", "!**/cache/keep", "/bak/E/*.iso"]
+    )
+    paths = [
+        "/bak/E/a.tmp",
+        "/bak/E/sub/b.tmp",
+        "/bak/E/cache/x",
+        "/bak/E/cache/keep/y",
+        "/bak/E/a.iso",
+        "/bak/E/deep/deeper/a.tmp",
+    ]
+    for path in paths:
+        first = excludes.list_match(pats, path)
+        excludes.clear_matcher_cache()
+        assert excludes.list_match(pats, path) == first, path
+
+
 def test_walk_excluded_uses_backup_root_paths(tmp_path):
     root = _make_tree(tmp_path / "src")
-    found = dict(
-        (w.path, (w.size, w.is_dir))
+    found = {
+        w.path: (w.size, w.is_dir)
         for w in excludes.walk_excluded(
             root, "/bak/data", excludes.parse_patterns(["*.tmp", "cache"])
         )
-    )
+    }
     assert found == {
         "/bak/data/a.tmp": (10, False),
         "/bak/data/sub/b.tmp": (20, False),
@@ -545,6 +571,247 @@ def test_walk_does_not_descend_into_excluded_directory(tmp_path):
         )
     ]
     assert paths == ["/bak/E/cache"]
+
+
+def test_shallow_walk_leaves_a_matched_directory_unknown(tmp_path):
+    """The default `show` scan: a matched directory is one row with no counts.
+
+    The library default stays exact (existing tests pin that); `shallow=True`
+    is what the CLI turns on, pricing every row restic's walker would price and
+    leaving only pruned directories unknown.
+    """
+    root = _make_tree(tmp_path / "src")
+    rows = {
+        w.path: w
+        for w in excludes.walk_excluded(
+            root, "/bak/E", excludes.parse_patterns(["*.tmp", "cache"]),
+            shallow=True,
+        )
+    }
+    cache = rows["/bak/E/cache"]
+    assert cache.unknown and not cache.partial
+    assert (cache.files, cache.size) == (0, 0)
+    # Files are matched and priced exactly: one stat each, no descent.
+    assert rows["/bak/E/a.tmp"].size == 10
+    assert rows["/bak/E/sub/b.tmp"].size == 20
+    # Nothing that restic would keep is reported.
+    assert "/bak/E/keep.txt" not in rows
+    assert "/bak/E/sub/keep2.txt" not in rows
+
+
+def test_shallow_walk_never_opens_a_matched_directory(tmp_path, monkeypatch):
+    """The proof of non-descent is mechanical: a matched directory is never
+    readdir'd, which is what makes the default scan cheap on huge subtrees."""
+    root = tmp_path / "src"
+    root.mkdir()
+    cache = root / "cache"
+    cache.mkdir()
+    (cache / "big.bin").write_text("z" * 100)
+    opened = []
+    real_scandir = os.scandir
+
+    def scandir(path, *args, **kwargs):
+        if str(path) == str(cache):
+            opened.append(str(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(excludes.os, "scandir", scandir)
+    rows = list(excludes.walk_excluded(
+        root, "/bak/E", excludes.parse_patterns(["cache"]), shallow=True,
+    ))
+    assert [w.path for w in rows] == ["/bak/E/cache"]
+    assert opened == [], "the matched directory was read"
+
+
+def test_an_unreadable_subtree_marks_a_priced_row_partial(tmp_path):
+    """`os.walk` swallows an unreadable directory; the walker must surface the
+    loss as `partial` rather than silently undercounting the row."""
+    root = tmp_path / "src"
+    root.mkdir()
+    cache = root / "cache"
+    cache.mkdir()
+    (cache / "ok.bin").write_text("o" * 20)
+    denied = root / "cache" / "denied"
+    denied.mkdir()
+    (denied / "x.bin").write_text("x" * 30)
+    denied.chmod(0)
+    try:
+        rows = {
+            w.path: w
+            for w in excludes.walk_excluded(
+                root, "/bak/E", excludes.parse_patterns(["cache"]),
+            )
+        }
+    finally:
+        denied.chmod(0o755)  # let tmp_path's cleanup do its job
+    cache = rows["/bak/E/cache"]
+    # The readable part is priced; the loss is stated, not hidden.
+    assert (cache.files, cache.size) == (1, 20)
+    assert cache.partial and not cache.unknown
+
+
+# --- reveal (what-if) ---
+
+
+def test_reveal_descends_and_prices_its_matches(tmp_path):
+    """A reveal pattern is a candidate rule: its matched directories are
+    priced and (under expand) listed, while the config's own rules are
+    untouched."""
+    root = _make_tree(tmp_path / "src")
+    rows = {
+        w.path: w
+        for w in excludes.walk_excluded(
+            root, "/bak/E", excludes.parse_patterns(["*.tmp"]),
+            attribute_rules=True,
+            reveal=excludes.parse_patterns(["cache"]),
+        )
+    }
+    cache = rows["/bak/E/cache"]
+    assert (cache.files, cache.size) == (2, 150)
+    assert cache.rule == "cache"
+    assert not cache.unknown and not cache.partial
+    # The config's rows are exactly what they always were.
+    assert rows["/bak/E/a.tmp"].size == 10
+    assert "/bak/E/cache" in rows
+
+
+def test_reveal_lists_its_matches_when_expanded(tmp_path):
+    root = _make_tree(tmp_path / "src")
+    rows = {
+        w.path: w
+        for w in excludes.walk_excluded(
+            root, "/bak/E", excludes.parse_patterns(["*.tmp"]),
+            attribute_rules=True,
+            reveal=excludes.parse_patterns(["cache"]), expand=True,
+        )
+    }
+    details = sorted(
+        (p, w.rule) for p, w in rows.items() if w.detail and w.is_dir is False
+    )
+    assert [p for p, _r in details] == [
+        "/bak/E/cache/big.bin",
+        "/bak/E/cache/nested/deep.bin",
+    ]
+    # Detail rows are attributed to the directory's rule — restic pruned the
+    # directory, so no deeper rule ever reached the files (same convention the
+    # config's own verbose listing uses).
+    assert all(r == "cache" for _p, r in details)
+    cache = rows["/bak/E/cache"]
+    assert (cache.files, cache.size) == (2, 150)
+
+
+def test_a_direct_child_the_config_excludes_stays_unpriced_under_a_reveal(
+    tmp_path,
+):
+    """A reveal is a what-if against the config as deployed: what the config
+    already removes is not what the candidate adds. Such children keep their
+    own unpriced rows and mark the revealed directory `partial`."""
+    root = tmp_path / "src"
+    root.mkdir()
+    cache = root / "cache"
+    cache.mkdir()
+    (cache / "big.bin").write_text("z" * 100)
+    (cache / "sub").mkdir()
+    (cache / "sub" / "stuff.bin").write_text("s" * 40)
+    logs = root / "cache" / "logs"
+    logs.mkdir()
+    (logs / "l").write_text("x" * 10)
+    rows = {
+        w.path: w
+        for w in excludes.walk_excluded(
+            root, "/bak/E", excludes.parse_patterns(["logs"]),
+            attribute_rules=True,
+            reveal=excludes.parse_patterns(["cache"]),
+        )
+    }
+    cache = rows["/bak/E/cache"]
+    # Only `sub` (and the top file) is priced into the reveal rule's total.
+    assert (cache.files, cache.size) == (2, 140)
+    assert cache.partial and not cache.unknown
+    logs_row = rows["/bak/E/cache/logs"]
+    assert logs_row.unknown and (logs_row.files, logs_row.size) == (0, 0)
+    assert logs_row.rule == "logs", "the config's rule keeps its own row"
+
+
+def test_a_reveal_pattern_already_in_the_config_is_revealed_all_along(
+    tmp_path,
+):
+    root = _make_tree(tmp_path / "src")
+    rows = {
+        w.path: w
+        for w in excludes.walk_excluded(
+            root, "/bak/E", excludes.parse_patterns(["cache", "*.tmp"]),
+            attribute_rules=True,
+            reveal=excludes.parse_patterns(["cache"]),
+        )
+    }
+    cache = rows["/bak/E/cache"]
+    assert (cache.files, cache.size) == (2, 150)
+    assert cache.rule == "cache"
+    assert not cache.partial, "nothing under it is config-excluded"
+
+
+def test_a_config_rule_matching_first_beats_a_reveal_candidate(tmp_path):
+    """restic applies patterns in order and the config's come first, so a
+    reveal candidate is credited nothing a different configured rule already
+    removed."""
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "c").mkdir()
+    (root / "c" / "f.bin").write_text("f" * 30)
+    rows = {
+        w.path: w
+        for w in excludes.walk_excluded(
+            root, "/bak/E", excludes.parse_patterns(["c"]),
+            attribute_rules=True,
+            reveal=excludes.parse_patterns(["c/*"]),
+        )
+    }
+    row = rows["/bak/E/c"]
+    assert row.rule == "c"
+    assert (row.files, row.size) == (1, 30)
+    # The candidate's text never matched the directory restic pruned at `c`,
+    # so nothing about the walk changed: the config did all the work.
+
+
+def test_a_reveal_pattern_can_match_files(tmp_path):
+    root = _make_tree(tmp_path / "src")
+    rows = {
+        w.path: w
+        for w in excludes.walk_excluded(
+            root, "/bak/E", excludes.parse_patterns(["cache"]),
+            attribute_rules=True,
+            reveal=excludes.parse_patterns(["b.tmp"]),
+        )
+    }
+    row = rows["/bak/E/sub/b.tmp"]
+    assert row.size == 20
+    assert row.rule == "b.tmp"
+
+
+def test_rule_totals_merge_decides_the_caveat():
+    """`?` when nothing behind the rule is priced, `+?` when some is, and no
+    caveat at all when everything is."""
+    t = excludes.RuleTotals("r", files=2, bytes=20)
+    t.merge(excludes.RuleTotals("r"))
+    assert t.rough is None
+
+    t = excludes.RuleTotals("r", files=2, bytes=20)
+    t.merge(excludes.RuleTotals("r", unknown=True))
+    assert t.rough == "+?"
+
+    t = excludes.RuleTotals("r", files=2, bytes=20)
+    t.merge(excludes.RuleTotals("r", partial=True))
+    assert t.rough == "+?"
+
+    t = excludes.RuleTotals("r")
+    t.merge(excludes.RuleTotals("r", unknown=True))
+    assert t.rough == "?"
+
+    t = excludes.RuleTotals("r")
+    t.merge(excludes.RuleTotals("r", partial=True))
+    t.merge(excludes.RuleTotals("r", partial=True))
+    assert t.rough == "+?"
 
 
 def test_walk_skip_prunes_snapshot_directory(tmp_path):
@@ -769,12 +1036,12 @@ def test_walk_prunes_excluded_directory_even_with_negated_child(tmp_path):
     (cache / "drop.bin").write_text("x" * 10)
     (root / "top.txt").write_text("t")
 
-    found = dict(
-        (w.path, (w.size, w.is_dir))
+    found = {
+        w.path: (w.size, w.is_dir)
         for w in excludes.walk_excluded(
             root, "/bak/x", excludes.parse_patterns(["**/cache", "!cache/keep"])
         )
-    )
+    }
     # One row for the directory, priced by its whole subtree: important.txt (9)
     # + drop.bin (10). The negated child cannot shrink it.
     assert found == {"/bak/x/cache": (19, True)}

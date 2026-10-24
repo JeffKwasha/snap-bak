@@ -88,7 +88,9 @@ def _run_restic_update() -> None:
     cmd = [config.SUDO, config.SUDO_EXEC, "update-restic"]
     logger.info(f"running {' '.join(cmd)}")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=600, check=False
+        )
     except subprocess.TimeoutExpired:
         logger.error("restic update timed out; continuing with existing restic")
         return
@@ -247,6 +249,32 @@ class PatternOverride:
         return set(self.diff(config_patterns)["added"])
 
 
+def reveal_patterns(args) -> tuple[str, ...]:
+    """The reveal (what-if) patterns one `show` invocation lists.
+
+    `--reveal-file`'s lines first, then repeats of `--reveal`, deduplicated on
+    the pattern text with `dict.fromkeys` (first occurrence kept): negation is
+    order-sensitive, `['!keep', '**']` ≠ `['**', '!keep']`, so reordering would
+    silently change what the survey answers. An unreadable reveal file is the
+    same hard failure an unreadable trial file is — a listing built from
+    patterns nobody can see would be worse than no listing.
+    """
+    patterns: list[str] = []
+    reveal_file = getattr(args, "reveal_file", None)
+    if reveal_file:
+        try:
+            patterns.extend(excludes.read_pattern_file(reveal_file))
+        except OSError as e:
+            logger.error(
+                "Cannot read the reveal file: %s (%s). A reveal file must be "
+                "readable by whoever runs this command.",
+                reveal_file, e.strerror or e,
+            )
+            sys.exit(config.EXIT_ERROR)
+    patterns.extend(getattr(args, "reveal", []))
+    return tuple(dict.fromkeys(patterns))
+
+
 def _patterns_for(
     rj, override: PatternOverride | None = None
 ) -> tuple[list[str], list[excludes.Pattern], str]:
@@ -262,50 +290,88 @@ def _patterns_for(
     return raw, excludes.parse_patterns(raw), rj.backup_root
 
 
-def _scan_live(
+def _walk_sources(
+    roots: list[tuple[str, Path]],
     rj,
-    attribute: bool = False,
-    override: PatternOverride | None = None,
-    progress=None,
-    expand: bool = False,
+    attribute: bool,
+    override: PatternOverride | None,
+    progress,
+    expand: bool,
+    reveal: tuple[str, ...],
+    price: bool,
+    skip: str | None,
 ) -> tuple[excludes.ExclusionSet, excludes.ExclusionSet | None, str]:
-    """The live source subvolume: no mount, no restic, no writes.
+    """Walk local roots (live and/or snapshots) into one found/detail pair.
 
-    Rows land under the `live` label rather than under no label at all, so the
-    live filesystem is a source in the same per-source map as every snapshot and
-    the report needs no special case for it.
+    The one walker both `_scan_live` and `_scan_snaps` feed, so the two modes
+    cannot drift on how rows land in the sets — which is exactly what happened
+    when row flags were added. Each root is labelled (`live`, or a snapshot
+    name), pruned at `skip` when given, and walked shallow unless `price`.
+
+    Reveal patterns are always priced and listed (a reveal is a what-if: the
+    listing is its point), so they force the detail set even without `-v`.
     """
     _, patterns, root = _patterns_for(rj, override)
+    reveal_pats = excludes.parse_patterns(reveal) if reveal else []
+    shallow = not price
+    expand = bool(expand) or bool(reveal_pats)
     found = excludes.ExclusionSet()
     detail = excludes.ExclusionSet() if expand else None
     workers = min(8, (os.cpu_count() or 4))
     with ProcessPoolExecutor(
         max_workers=workers,
         initializer=excludes._init_worker,
-        initargs=(patterns,),
+        initargs=(patterns, reveal_pats),
     ) as pool:
-        for walked in excludes.walk_excluded(
-            Path(rj.job.source_subvolume), root, patterns,
-            attribute_rules=attribute, progress=progress, expand=bool(expand),
-            pool=pool, skip=str(rj.job.snapshot_dir), top_level=True,
-        ):
-            if walked.detail:
-                if detail is not None:
+        for label, path in roots:
+            for walked in excludes.walk_excluded(
+                path, root, patterns,
+                attribute_rules=attribute, progress=progress, expand=expand,
+                pool=pool, skip=skip, top_level=True,
+                shallow=shallow, reveal=reveal_pats,
+            ):
+                if walked.detail:
+                    if detail is not None:
+                        detail.add(
+                            label, walked.path, walked.size, False,
+                            walked.rule, 1,
+                        )
+                    continue
+                found.add(
+                    label, walked.path, walked.size, walked.is_dir,
+                    walked.rule, walked.files,
+                    unknown=walked.unknown, partial=walked.partial,
+                )
+                if detail is not None and not walked.is_dir:
                     detail.add(
-                        excludes.LIVE, walked.path, walked.size, False,
+                        label, walked.path, walked.size, False,
                         walked.rule, 1,
                     )
-                continue
-            found.add(
-                excludes.LIVE, walked.path, walked.size, walked.is_dir,
-                walked.rule, walked.files,
-            )
-            if detail is not None and not walked.is_dir:
-                detail.add(
-                    excludes.LIVE, walked.path, walked.size, False,
-                    walked.rule, 1,
-                )
     return found, detail, root
+
+
+def _scan_live(
+    rj,
+    attribute: bool = False,
+    override: PatternOverride | None = None,
+    progress=None,
+    expand: bool = False,
+    reveal: tuple[str, ...] = (),
+    price: bool = False,
+) -> tuple[excludes.ExclusionSet, excludes.ExclusionSet | None, str]:
+    """The live source subvolume: no mount, no restic, no writes.
+
+    Rows land under the `live` label rather than under no label at all, so the
+    live filesystem is a source in the same per-source map as every snapshot and
+    the report needs no special case for it. By default the walk is shallow —
+    matched directories are pruned unread, exactly the I/O restic's own walker
+    does; `--price` (`price=True`) descends for exact totals.
+    """
+    return _walk_sources(
+        [(excludes.LIVE, Path(rj.job.source_subvolume))], rj, attribute,
+        override, progress, expand, reveal, price,
+        skip=str(rj.job.snapshot_dir),
+    )
 
 
 def _scan_snaps(
@@ -314,40 +380,17 @@ def _scan_snaps(
     override: PatternOverride | None = None,
     progress=None,
     expand: bool = False,
+    reveal: tuple[str, ...] = (),
+    price: bool = False,
 ) -> tuple[excludes.ExclusionSet, excludes.ExclusionSet | None, str]:
     """Each local btrfs snapshot dir, labelled by its snapshot name."""
-    _, patterns, root = _patterns_for(rj, override)
-    found = excludes.ExclusionSet()
-    detail = excludes.ExclusionSet() if expand else None
-    workers = min(8, (os.cpu_count() or 4))
-    with ProcessPoolExecutor(
-        max_workers=workers,
-        initializer=excludes._init_worker,
-        initargs=(patterns,),
-    ) as pool:
-        for snap in snapshot_model.Snapshot.scan(rj.job.snapshot_dir):
-            for walked in excludes.walk_excluded(
-                snap.path, root, patterns,
-                attribute_rules=attribute, progress=progress,
-                expand=bool(expand), pool=pool, top_level=True,
-            ):
-                if walked.detail:
-                    if detail is not None:
-                        detail.add(
-                            snap.name, walked.path, walked.size, False,
-                            walked.rule, 1,
-                        )
-                    continue
-                found.add(
-                    snap.name, walked.path, walked.size, walked.is_dir,
-                    walked.rule, walked.files,
-                )
-                if detail is not None and not walked.is_dir:
-                    detail.add(
-                        snap.name, walked.path, walked.size, False,
-                        walked.rule, 1,
-                    )
-    return found, detail, root
+    return _walk_sources(
+        [
+            (snap.name, snap.path)
+            for snap in snapshot_model.Snapshot.scan(rj.job.snapshot_dir)
+        ],
+        rj, attribute, override, progress, expand, reveal, price, skip=None,
+    )
 
 
 def _scan_repo(rj, override: PatternOverride | None = None, expand: bool = False):
@@ -379,6 +422,12 @@ class _View:
     as_json: bool = False
     fmt: str = "text"
     verbose: bool = False
+    # A one-shot `--price` walk: restore exact sizes for directories the default
+    # (`?`) would leave unread.
+    price: bool = False
+    # Reveal (what-if) patterns: excluded like any other rule, but their
+    # matches are descended and listed. Never handed to restic or `apply`.
+    reveal: tuple[str, ...] = ()
     override: PatternOverride | None = None
     # Off unless the caller asks or stderr is a terminal: a piped or journalled
     # run wants results, not a running commentary.
@@ -394,6 +443,8 @@ class _View:
             as_json=args.json,
             fmt=args.format,
             verbose=args.verbose,
+            price=args.price,
+            reveal=tuple(reveal_patterns(args)),
             override=override,
             # Never while emitting a machine-readable document.
             progress=args.verbose or (
@@ -504,6 +555,7 @@ def _sheets(
     for rj in jobs:
         rules, _patterns, root = _patterns_for(rj, view.override)
         sources, details, notes = [], [], []
+        rough_seen = False
         for mode in modes:
             progress = _progress_reporter(rj, view.progress)
             verbose = view.verbose
@@ -511,6 +563,7 @@ def _sheets(
                 found, detail, _ = _scan_live(
                     rj, attribute=True, override=view.override,
                     progress=progress, expand=verbose,
+                    reveal=view.reveal, price=view.price,
                 )
                 sources.append((report.KIND_LIVE, found))
             elif mode == "snaps":
@@ -521,6 +574,7 @@ def _sheets(
                 found, detail, _ = _scan_snaps(
                     rj, attribute=True, override=view.override,
                     progress=progress, expand=verbose,
+                    reveal=view.reveal, price=view.price,
                 )
                 sources.append((report.KIND_SNAPS, found))
             else:
@@ -531,8 +585,24 @@ def _sheets(
                 if error is not None:
                     errors.append(error)
                     notes.append(_describe_query_error(error))
+            if found.has_rough:
+                rough_seen = True
             if detail is not None:
                 details.append((mode, detail))
+        if view.reveal:
+            # A survey lens, not a config change: the header says what was
+            # listed that restic was never asked about.
+            notes.append(
+                "revealed pattern(s), priced and listed: "
+                + ", ".join(repr(p) for p in view.reveal)
+            )
+        if rough_seen:
+            notes.append(
+                "'?' = a matched directory was pruned without being read "
+                "(restic does the same); '+?' = priced in part. `--price` "
+                "walks such directories for exact sizes; `--reveal` lists "
+                "candidate patterns beneath their matches."
+            )
         sheet = report.build(
             rj.job.name, root, rules, sources,
             detail_sources=details,
@@ -556,7 +626,10 @@ def _show(jobs: list, args, view: _View) -> int:
     lint = []
     for rj in jobs:
         raw, _patterns, root = _patterns_for(rj, view.override)
-        for issue in excludes.lint(raw, root):
+        # Reveal patterns are show-only, but they are restic-syntax patterns
+        # all the same: a malformed one silently matches nothing, so it is
+        # linted with the rest rather than let fail quietly.
+        for issue in excludes.lint([*raw, *view.reveal], root):
             lint.append({"job": rj.job.name, **vars(issue)})
 
     sheets, errors, unreadable = _sheets(jobs, _selected_modes(args), view)
@@ -810,14 +883,16 @@ class _RefuseSelector(argparse.Action):
     A trial pattern set is refused for a different reason: rewriting real
     backups against rules the deployment does not use would remove data on the
     strength of an experiment. The trial belongs to `show`, and `apply` acts on
-    what is actually configured.
+    what is actually configured. A reveal pattern set is refused with the same
+    sentence: `--reveal` is a survey lens for `show excludes`, never an
+    instruction to restic.
     """
 
     def __init__(self, option_strings, dest, nargs=None, **kwargs):
         super().__init__(option_strings, dest, nargs=nargs, **kwargs)
 
     def __call__(self, parser, namespace, values, option_string=None):
-        if option_string in ("--excludes-file", "-e", "--exclude"):
+        if option_string in ("--excludes-file", "-e", "--exclude", "--reveal", "--reveal-file"):
             parser.error(
                 f"{option_string} tries the rewrite against a trial pattern set, "
                 "but `apply excludes` rewrites real backups and must use the "
@@ -847,9 +922,13 @@ def excludes_parser(verb: str) -> argparse.ArgumentParser:
         ),
         epilog=(
             "Cost: patterns are linted on every `show`, silently when clean. "
-            "--live and --snaps are local and instant; --repo reaches the network "
-            "for metadata only. `apply --now` prunes after rewriting, which "
-            "repacks and re-uploads (minutes to hours); prefer --later."
+            "--live and --snaps walk locally, pruning matched directories "
+            "unread the way restic's backup does — '?' marks a rule whose "
+            "directory totals are therefore unknown; --price walks them out, "
+            "--reveal lists candidate patterns beneath their matches. "
+            "--repo reaches the network for metadata only. `apply --now` "
+            "prunes after rewriting, which repacks and re-uploads (minutes to "
+            "hours); prefer --later."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -881,6 +960,16 @@ def excludes_parser(verb: str) -> argparse.ArgumentParser:
     )
 
     if verb == "show":
+        parser.add_argument(
+            "--price",
+            action="store_true",
+            help=(
+                "Walk matched directories for exact sizes (the slow way: one "
+                "stat per file beneath every rule). The default marks "
+                "directories restic would prune with '?' instead of reading "
+                "them; --live and --snaps only."
+            ),
+        )
         parser.add_argument("--live", action="store_true", help="Match the live filesystem.")
         parser.add_argument(
             "--snaps", action="store_true", help="Match local btrfs snapshots (table)."
@@ -911,6 +1000,28 @@ def excludes_parser(verb: str) -> argparse.ArgumentParser:
                 "excludes file uses. Repeatable; added after --excludes-file."
             ),
         )
+        parser.add_argument(
+            "--reveal",
+            action="append",
+            default=[],
+            metavar="PATTERN",
+            help=(
+                "What-if: exclude with PATTERN and list everything beneath "
+                "each match (exact sizes). What the configuration already "
+                "excludes is shown on its own row. Restic never sees reveal "
+                "patterns; run them through `show --excludes-file` and then "
+                "edit the config to make them real."
+            ),
+        )
+        parser.add_argument(
+            "--reveal-file",
+            metavar="PATH",
+            default=None,
+            help=(
+                "A file of --reveal patterns, ignore_file syntax. Repeat "
+                "--reveal as well; they combine."
+            ),
+        )
     else:
         parser.add_argument(
             "--now", action="store_true", help="Execute the rewrite now."
@@ -918,6 +1029,10 @@ def excludes_parser(verb: str) -> argparse.ArgumentParser:
         parser.add_argument(
             "--later", action="store_true", help="Arm the next scheduled run."
         )
+        # A flag that takes a value must consume it: `apply excludes
+        # --excludes-file f` refusing without the value would leave `f` as a
+        # stray positional and error on the choice check instead of explaining.
+        needs_value = {"--excludes-file", "-e", "--exclude", "--reveal", "--reveal-file"}
         for refused in (
             "--live",
             "--snaps",
@@ -925,10 +1040,13 @@ def excludes_parser(verb: str) -> argparse.ArgumentParser:
             "--excludes-file",
             "-e",
             "--exclude",
+            "--reveal",
+            "--reveal-file",
+            "--price",
         ):
             parser.add_argument(
                 refused,
-                nargs=0 if refused.startswith("--") else 1,
+                nargs=1 if refused in needs_value else 0,
                 action=_RefuseSelector,
                 help=argparse.SUPPRESS,
             )

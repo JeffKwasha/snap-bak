@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Unit tests for the root-owned sudo-exec.py wrapper.
 
 Tests the wrapper's pure functions (validation, path confinement, config
@@ -15,7 +14,6 @@ import types
 from pathlib import Path
 
 import pytest
-
 
 from snap_bak import config
 
@@ -273,13 +271,10 @@ class TestLatestSnapshotName:
 
 class TestBtrfsMountDevice:
     MOUNTINFO = (
-        "\n".join(
-            [
-                "164 32 0:63 /@/data /mnt/data rw,noatime - btrfs /dev/dm-3[/@/data] rw",
-                "165 32 0:15 / / rw,noatime - btrfs /dev/dm-7 rw",
-            ]
-        )
-        + "\n"
+        "164 32 0:63 /@/data /mnt/data rw,noatime - "
+        "btrfs /dev/dm-3[/@/data] rw\n"
+        "165 32 0:15 / / rw,noatime - btrfs /dev/dm-7 rw"
+        "\n"
     )
 
     def _set_mountinfo(self, tmp_path, monkeypatch, text):

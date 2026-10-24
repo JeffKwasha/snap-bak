@@ -158,7 +158,7 @@ def _pool_device_names(source_subvolume: str) -> list[str]:
         st = os.stat(dev_node)
     except OSError:
         return []
-    want = "%d:%d" % (os.major(st.st_rdev), os.minor(st.st_rdev))
+    want = f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
     try:
         for fsname in os.listdir(_SYSFS_BTRFS):
             devdir = os.path.join(_SYSFS_BTRFS, fsname, "devices")

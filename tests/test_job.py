@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Tests for snap_bak.job: errors, lock helpers, status, Runner decisions."""
 
 import subprocess
@@ -7,7 +6,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-
 
 from snap_bak import config
 from snap_bak import job as job_mod

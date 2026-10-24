@@ -8,7 +8,7 @@ This module STAYS dependency-free. It MUST NOT be writable by non-root users.
 from __future__ import annotations
 
 import json
-from typing import Callable, Sequence
+from collections.abc import Callable, Sequence
 
 # Default graceful-timeout options applied to EVERY restic subcommand.
 #
@@ -188,12 +188,15 @@ def build(
     # --stdio` silently breaks the rclone backend (the repo path lands in
     # rclone's subcommand slot). Warn so the misconfiguration is obvious.
     for opt in global_options:
-        if "rclone.args=" in opt and "serve restic --stdio" not in opt:
-            if warn is not None:
-                warn(
-                    f"{opt}: rclone.args must include 'serve restic --stdio' "
-                    f"or the rclone backend breaks"
-                )
+        if (
+            "rclone.args=" in opt
+            and "serve restic --stdio" not in opt
+            and warn is not None
+        ):
+            warn(
+                f"{opt}: rclone.args must include 'serve restic --stdio' "
+                f"or the rclone backend breaks"
+            )
     cmd.extend(_with_defaults(global_options))
     if password_file:
         cmd.extend(["--password-file", password_file])

@@ -1,8 +1,6 @@
-# -*- coding: utf-8 -*-
 """Tests for snap_bak.cli: exit-code ladder and restic-update gating."""
 
-from snap_bak import config
-from snap_bak import cli
+from snap_bak import cli, config
 from snap_bak.job import Result, ResultStatus
 
 

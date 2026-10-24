@@ -44,6 +44,10 @@ banned-api = { "tempfile.mkdtemp" = { msg = "use pytest's tmp_path/tmp_path_fact
 
 [tool.ruff.lint.per-file-ignores]
 "tests/conftest.py" = ["TID251"]
+# Backup windows are naive local wall-clock times by design (see
+# half_window_remaining), so tests must build naive datetimes to exercise them.
+# An "aware" fixture datetime would silently shift the window under test.
+"tests/*" = ["DTZ001", "DTZ005"]
 
 [tool.pyright]
 venvPath = "."

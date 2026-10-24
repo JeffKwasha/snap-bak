@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Tests for the `show excludes` / `apply excludes` subcommands.
 
 Mostly unit tests over the pure helpers (mode selection, plan building,
@@ -766,12 +765,30 @@ class TestShowRefusesWhatApplyRefuses:
         assert args.excludes_file == "/tmp/w.ignore"
         assert args.exclude == ["*.iso"]
 
+    def test_show_accepts_the_reveal_and_price_flags(self):
+        args = cli.excludes_parser("show").parse_args(
+            [
+                "excludes", "--live", "--price",
+                "--reveal", "cache", "--reveal", "**/build/**",
+                "--reveal-file", "/tmp/reveal.ignore",
+            ]
+        )
+        assert args.price is True
+        assert args.reveal == ["cache", "**/build/**"]
+        assert args.reveal_file == "/tmp/reveal.ignore"
+        # Without --price the default stays shallow, no flag required.
+        assert cli.excludes_parser("show").parse_args(
+            ["excludes"]
+        ).price is False
+
     @pytest.mark.parametrize(
         "argv,flag",
         [
             (["excludes", "--excludes-file", "/tmp/w.ignore"], "--excludes-file"),
             (["excludes", "-e", "*.iso"], "-e"),
             (["excludes", "--exclude", "*.iso"], "--exclude"),
+            (["excludes", "--reveal", "cache"], "--reveal"),
+            (["excludes", "--reveal-file", "/tmp/r.ignore"], "--reveal-file"),
         ],
     )
     def test_apply_refuses_a_trial_pattern_set(self, argv, flag, capsys):
@@ -782,6 +799,42 @@ class TestShowRefusesWhatApplyRefuses:
         assert "trial pattern set" in err
         # The message must say what to do instead, not just refuse.
         assert "show excludes --excludes-file" in err
+
+    def test_apply_refuses_price_with_the_inspect_advice(self, capsys):
+        """`--price` is not a pattern set but a pricing lens for the local
+        walk — refused as an inspection argument, not a trial one."""
+        with pytest.raises(SystemExit):
+            cli.excludes_parser("apply").parse_args(["excludes", "--price", "--now"])
+        err = capsys.readouterr().err
+        assert "--price" in err
+        assert "show excludes" in err
+
+    def test_show_refuses_an_unreadable_reveal_file(self):
+        """Same treatment as an unreadable trial file: a hard exit before any
+        report is built — a listing built from patterns nobody can see would
+        be worse than no listing."""
+        args = SimpleNamespace(reveal_file="/tmp/does-not-exist.ignore", reveal=[])
+        with pytest.raises(SystemExit) as exc:
+            cli.reveal_patterns(args)
+        assert exc.value.code == config.EXIT_ERROR
+
+    def test_reveal_patterns_dedupe_keeping_the_first_text(self, tmp_path):
+        """Negation is order-sensitive, so `['!keep', '**']` never reorders;
+        a repeated text appears once."""
+        reveal_file = tmp_path / "reveal.ignore"
+        reveal_file.write_text("**keep-important/**\n*.iso\n")
+        args = SimpleNamespace(
+            reveal_file=str(reveal_file),
+            reveal=["**/build/**", "**keep-important/**"],
+        )
+        assert cli.reveal_patterns(args) == (
+            "**keep-important/**", "*.iso", "**/build/**",
+        )
+        # No file, no --reveal: an empty survey, not an error.
+        assert cli.reveal_patterns(
+            SimpleNamespace(reveal_file=None, reveal=[])
+        ) == ()
+
 
 
 class TestOutputPresentation:
@@ -809,9 +862,27 @@ class TestOutputPresentation:
         _code, out = show(capsys, [rj], "live")
         rows = [line for line in out.splitlines() if "*.tmp" in line or "cache" in line]
         assert len(rows) == 2
-        # cache holds 100 B and *.tmp one 3 B file, so the bigger rule leads.
-        assert "cache" in rows[0] and "*.tmp" in rows[1]
-        assert out.rstrip().splitlines()[-1].rstrip().endswith("TOTAL")
+        # The default walk prunes `cache` unread, so only `*.tmp` is priced:
+        # the bigger rule is the one whose numbers exist.
+        assert "*.tmp" in rows[0] and "cache" in rows[1]
+        assert "?" in rows[1], "an unpriced directory says so"
+        out_lines = out.splitlines()
+        total = next(
+            line for line in out_lines if line.rstrip().endswith("TOTAL")
+        )
+        assert out_lines.index(rows[1]) < out_lines.index(total), "TOTAL is the footer"
+
+        # With --price the walk descends after all, and the old order comes
+        # back: cache holds 100 B and *.tmp one 3 B file.
+        _code, priced = show(
+            capsys, [rj], "live", view=cli._View(width=WIDE, price=True)
+        )
+        priced_rows = [
+            line for line in priced.splitlines()
+            if "*.tmp" in line or "cache" in line
+        ]
+        assert "cache" in priced_rows[0] and "*.tmp" in priced_rows[1]
+        assert "?" not in priced_rows[1]
 
     def test_a_rule_matching_nothing_still_gets_a_row(
         self, tmp_path, monkeypatch, capsys
@@ -849,11 +920,24 @@ class TestOutputPresentation:
         assert {"job", "scope", "rule_or_path", "live_files", "live_bytes",
                 "total_files", "total_bytes"} <= set(records[0])
         for r in records:
-            # Numeric, so a spreadsheet can sum it. Bytes are never abbreviated
-            # in a machine-readable format.
-            int(r["live_bytes"])
-            int(r["live_files"])
-        assert any(r["rule_or_path"] == "cache" for r in records)
+            # Numeric, so a spreadsheet can sum it — but a shallow row pruned
+            # the directory unread, and an empty cell is what an unknown total
+            # writes: `0` would claim it was scanned and priced.
+            if r["live_bytes"] != "":
+                int(r["live_bytes"])
+                int(r["live_files"])
+        cache_rows = [r for r in records if r["rule_or_path"] == "cache"]
+        assert cache_rows, "the fixture must exclude something cache-shaped"
+        assert all(r["live_bytes"] == "" and r["live_files"] == ""
+                   for r in cache_rows), "unpriced rows are empty, not zero"
+        # --price fills them in with the real integers.
+        _code, priced_out = show(
+            capsys, [rj], "live", "snaps",
+            view=cli._View(fmt="csv", width=WIDE, price=True),
+        )
+        priced_records = list(csv.DictReader(io.StringIO(priced_out)))
+        priced_cache = [r for r in priced_records if r["rule_or_path"] == "cache"]
+        assert all(int(r["live_bytes"]) >= 100 for r in priced_cache)
 
     def test_csv_suppresses_the_prose_diff_header(self, tmp_path, monkeypatch, capsys):
         """A prose header would corrupt the first CSV record."""
@@ -894,28 +978,80 @@ class TestOutputPresentation:
         )
         assert "path (relative to the mount point)" not in quiet
         assert "path (relative to the mount point)" in loud
-        # Paths are relative to the mount point, so the same file in two sources
-        # lines up instead of appearing under two different names.
-        assert "cache/big.bin" in loud
-        # No listed file is left in stored-path form, so the same file lines up
-        # across sources instead of appearing once per mount-point prefix. The
-        # job header legitimately shows the root, so check the rows only.
+        # Verbosely, matched FILES get rows; the default walk pruned the
+        # `cache` directory unread, so its contents only appear under --price.
         _header, _, rows = loud.partition("path (relative to the mount point)")
         assert rows, "the file sheet is missing"
         assert all("/bak/" not in line for line in rows.splitlines()[1:])
+        _code, priced = show(
+            capsys, [rj], "live",
+            view=cli._View(width=WIDE, verbose=True, price=True),
+        )
+        assert "cache/big.bin" in priced
 
     def test_verbose_opens_a_matched_directory_into_its_files(
         self, tmp_path, monkeypatch, capsys
     ):
+        """Under --price, `-v` lists the contents of a matched directory.
+
+        The default walk prunes a matched directory unread — restic's own
+        behaviour — so there are no contents to list until --price descends.
+        """
         rj = self._job(tmp_path, monkeypatch)
         _code, out = show(
-            capsys, [rj], "live", view=cli._View(width=WIDE, verbose=True)
+            capsys, [rj], "live",
+            view=cli._View(width=WIDE, verbose=True, price=True),
         )
         # `cache` matched as one directory row; verbosely its contents are listed.
         assert "cache/big.bin" in out
         rule_row = next(line for line in out.splitlines() if "cache" in line
                         and "*.tmp" not in line)
         assert "1 /" in rule_row, "still one file in the rule table"
+
+    def test_verbose_keeps_a_matched_directory_pruned_by_default(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        rj = self._job(tmp_path, monkeypatch)
+        _code, out = show(
+            capsys, [rj], "live", view=cli._View(width=WIDE, verbose=True)
+        )
+        # No `-v` file row for anything inside `cache`: the walk never went in.
+        assert "cache/big.bin" not in out
+        rule_row = next(line for line in out.splitlines() if "cache" in line
+                        and "*.tmp" not in line)
+        assert "?" in rule_row, "the unpriced directory says so in the rule table"
+
+    def test_a_reveal_prices_and_lists_its_matches_whatever_the_verbosity(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A reveal is a what-if: it descends, it prices, and the listing is
+        its point — so the file sheet opens even without `-v`. What the config
+        already excludes is untouched: `*.tmp` rows behave exactly as before."""
+        rj = self._job(tmp_path, monkeypatch)
+        _code, out = show(
+            capsys, [rj], "live", view=cli._View(width=WIDE, reveal=("cache",))
+        )
+        # `cache` gets its real price now, and the per-file sheet lists what is
+        # beneath the match.
+        assert "cache/big.bin" in out
+        rule_row = next(line for line in out.splitlines()
+                        if "cache" in line and "big.bin" not in line)
+        assert "?" not in rule_row, "a revealed directory is priced, not unknown"
+        # The reveal note names the pattern; restic is never told about it.
+        assert "revealed pattern" in out and "cache" in out
+        _header, _, rows = out.partition("path (relative to the mount point)")
+        assert rows, "the reveal listing is the point; the file sheet must open"
+
+        # The same survey with -v changes nothing structural.
+        _code, verbose = show(
+            capsys, [rj], "live",
+            view=cli._View(width=WIDE, verbose=True, reveal=("cache",)),
+        )
+        assert "cache/big.bin" in verbose
+
+        # Without any reveal, default output stays shallow: no listing.
+        _code, plain = show(capsys, [rj], "live")
+        assert "cache/big.bin" not in plain
 
     def test_nothing_is_marked_without_a_trial(self, tmp_path, monkeypatch):
         """With no trial there is nothing to mark, and every rule is shown

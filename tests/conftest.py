@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Test-wide isolation.
 
 Redirects SNAPBAK_STATE_DIR to a throwaway directory BEFORE snap_bak.config is
@@ -34,6 +33,8 @@ def restic(repo, *args, timeout=120):
         text=True,
         env=env,
         timeout=timeout,
+        # Callers assert on returncode/stdout directly, including failures.
+        check=False,
     )
 
 

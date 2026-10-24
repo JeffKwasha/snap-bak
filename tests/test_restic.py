@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Unit tests for snap_bak/restic.py — command construction & output parsing.
 
 The central regression here: backup-only flags (non-global restic_options) must

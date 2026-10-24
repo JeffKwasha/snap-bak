@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Unit tests for the shared snap_bak/snapshot.py domain module.
 
 The module is the single owner of the snapshot name format and the btrfs
@@ -11,9 +10,7 @@ import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-
 from snap_bak import snapshot
-
 
 # --- Name format / parse ---
 

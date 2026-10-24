@@ -193,7 +193,9 @@ def plan(
         label = snap.get("short_id") or snapshot_id[:8]
         try:
             listing = runner.repo_listing(snapshot_id)
-        except Exception as e:
+        # One unreadable snapshot must not void the rest of the plan; the
+        # listing failure is reported per snapshot.
+        except Exception as e:  # noqa: BLE001
             logger.error("%s: cannot list snapshot %s: %s", runner.job.name, label, e)
             continue
         excludes.collect_from_listing(

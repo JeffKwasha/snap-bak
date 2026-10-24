@@ -90,6 +90,7 @@ def _subvolume_generation(path: Path) -> int | None:
             capture_output=True,
             text=True,
             timeout=_SUBVOLUME_SHOW_TIMEOUT,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         print(
@@ -122,7 +123,7 @@ class Snapshot:
     can never wake a spun-down pool or require root.
     """
 
-    __slots__ = ("path", "time", "_generation", "_generation_read")
+    __slots__ = ("_generation", "_generation_read", "path", "time")
 
     def __init__(self, path: Path | str, time: datetime | None = None):
         self.path = Path(path)

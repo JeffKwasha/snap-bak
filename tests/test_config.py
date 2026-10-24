@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Tests for snap_bak.config: parsing, models, resolution, retention."""
 
 import json
@@ -7,7 +6,6 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
-
 
 from snap_bak import config
 from snap_bak.config import (

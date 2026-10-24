@@ -123,6 +123,10 @@ class Row:
     marked: bool = False
     is_total: bool = False
     cells: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # Per-source caveat on the numbers: "?" marks a cell the walk could not
+    # price at all (a directory pruned unread, restic-style), "+?" a price that
+    # covers only part of what the rule matched. One spelling for each, always.
+    rough: dict[str, str] = field(default_factory=dict)
 
     @property
     def total_files(self) -> int:
@@ -150,17 +154,42 @@ class Sheet:
     truncated: int = 0
 
     def totals(self, detail: bool = False) -> Row:
-        """The footer: every rule's files and bytes, summed per column."""
-        cells = {
-            c.label: (
-                sum(r.cells.get(c.label, (0, 0))[0] for r in self.rows),
-                sum(r.cells.get(c.label, (0, 0))[1] for r in self.rows),
-            )
-            for c in self.columns
-        }
+        """The footer: every rule's files and bytes, summed per column.
+
+        A caveat any contributing rule carries belongs on the total too, decided
+        with the same rule the per-source cells use: nothing priced means `?`,
+        some priced alongside something unpriced means `+?`.
+        """
         if detail:
-            cells = {label: (0, nbytes) for label, (_f, nbytes) in cells.items()}
-        return Row(label="TOTAL", is_total=True, cells=cells)
+            cells = {
+                c.label: (
+                    0,
+                    sum(
+                        r.cells.get(c.label, (0, 0))[1] for r in self.detail
+                    ),
+                )
+                for c in self.columns
+            }
+            return Row(label="TOTAL", is_total=True, cells=cells)
+        rough: dict[str, str] = {}
+        cells = {}
+        for c in self.columns:
+            t = excludes.RuleTotals(c.label)
+            for r in self.rows:
+                files, nbytes = r.cells.get(c.label, (0, 0))
+                t.merge(
+                    excludes.RuleTotals(
+                        c.label,
+                        files=files,
+                        bytes=nbytes,
+                        unknown=r.rough.get(c.label) == "?",
+                        partial=r.rough.get(c.label) == "+?",
+                    )
+                )
+            cells[c.label] = (t.files, t.bytes)
+            if t.rough is not None:
+                rough[c.label] = t.rough
+        return Row(label="TOTAL", is_total=True, cells=cells, rough=rough)
 
 
 def build(
@@ -197,13 +226,19 @@ def build(
             )
             per_column_grids.append(found.by_rule_per_source([label]))
 
-    merged: dict[str, dict[str, tuple[int, int]]] = {}
+    merged: dict[str, dict[str, excludes.RuleTotals]] = {}
     for grid in per_column_grids:
         for rule, cells in grid.items():
             slot = merged.setdefault(rule, {})
             for label, totals in cells.items():
-                files, nbytes = slot.get(label, (0, 0))
-                slot[label] = (files + totals.files, nbytes + totals.bytes)
+                t = slot.get(label)
+                if t is None:
+                    slot[label] = totals
+                else:
+                    # One label under one rule but two sources can only happen
+                    # when two sets were handed the same label; the totals fold
+                    # with their caveats exactly as the per-source cells do.
+                    t.merge(totals)
 
     # One row per *distinct* rule, first occurrence winning. A trial's effective
     # list is `config + additions`, and a rule named in both — the trial
@@ -222,10 +257,21 @@ def build(
     # Every row carries a cell for every column, zeros included: "this rule
     # matched nothing here" is a fact, and leaving it as a missing key would make
     # every renderer re-derive it.
-    labels = [c.label for c in columns]
+    labels = {c.label for c in columns}
     for row in rows:
         source = merged.get(row.label, {})
-        row.cells = {label: source.get(label, (0, 0)) for label in labels}
+        row.cells = {
+            label: (
+                (source[label].files, source[label].bytes)
+                if label in source else (0, 0)
+            )
+            for label in labels
+        }
+        row.rough = {
+            label: t.rough
+            for label, t in source.items()
+            if label in labels and t.rough is not None
+        }
     rows.sort(key=lambda r: (-r.total_bytes, r.label))
 
     detail = _detail_rows(detail_sources or [], root)
@@ -345,9 +391,10 @@ def _rule_table(sheet: Sheet, shown: list[Column]) -> Table:
         table.add_column(column.heading, justify="right")
     table.add_column("exclude pattern", justify="left", overflow="fold")
     for row in [*sheet.rows, sheet.totals()]:
+        total_rough = _total_rough(row)
         table.add_row(
-            compact_bytes(row.total_files),
-            compact_bytes(row.total_bytes),
+            _num(row.total_files, total_rough),
+            _num(row.total_bytes, total_rough),
             *(_cell(row, column) for column in shown),
             row.display,
         )
@@ -374,9 +421,27 @@ def _file_table(sheet: Sheet, shown: list[Column]) -> Table:
     return table
 
 
+def _num(value: int, rough: str | None) -> str:
+    """One number cell in the split-cell formats (markdown, csv is raw ints).
+
+    A caveat attaches to the *price*, which only the bytes carry: `?` when the
+    walk could not price it at all, `+?` when the price covers only part. The
+    files cell is `?` alongside it — no number there is knowable either.
+    """
+    if rough == "?":
+        return "?"
+    text = compact_bytes(value)
+    return f"{text}+?" if rough == "+?" else text
+
+
 def _cell(row: Row, column: Column) -> str:
+    rough = row.rough.get(column.label)
+    if rough == "?":
+        return "?"
+    # Each number carries the caveat individually — the same `_num` the split
+    # formats use — so a partial price reads `2+? / 140+?` everywhere it prints.
     files, nbytes = row.cells.get(column.label, (0, 0))
-    return f"{compact_bytes(files)} / {compact_bytes(nbytes)}"
+    return f"{_num(files, rough)} / {_num(nbytes, rough)}"
 
 
 def _fit_columns(sheet: Sheet, width: int) -> tuple[list[Column], list[Column]]:
@@ -432,6 +497,26 @@ def _markdown(sheets: list[Sheet]) -> str:
     return "\n".join(out).rstrip("\n")
 
 
+def _total_rough(row: Row) -> str | None:
+    """The caveat on a row's TOTAL cells, decided the same way cell merge is.
+
+    Nothing priced across the caveat-carrying columns is `?`; priced numbers
+    alongside any caveat are `+?`.
+    """
+    if not row.rough:
+        return None
+    t = excludes.RuleTotals(row.label)
+    for label, rough in row.rough.items():
+        files, nbytes = row.cells.get(label, (0, 0))
+        t.merge(
+            excludes.RuleTotals(
+                label, files=files, bytes=nbytes,
+                unknown=rough == "?", partial=rough == "+?",
+            )
+        )
+    return t.rough
+
+
 def _md_table(sheet: Sheet, detail: bool) -> list[str]:
     header = ["exclude pattern"]
     for column in sheet.columns:
@@ -444,11 +529,15 @@ def _md_table(sheet: Sheet, detail: bool) -> list[str]:
     body = sheet.detail if detail else [*sheet.rows, sheet.totals()]
     for row in body:
         cells = [f"`{row.display}`"]
+        total_rough = _total_rough(row)
         for column in sheet.columns:
             files, nbytes = row.cells.get(column.label, (0, 0))
-            cells += [compact_bytes(files), compact_bytes(nbytes)]
-        cells.append(compact_bytes(row.total_files))
-        cells.append(compact_bytes(row.total_bytes))
+            rough = row.rough.get(column.label) if not row.is_total else total_rough
+            cells += [_num(files, rough), _num(nbytes, rough)]
+        # The files and the bytes total carry the same caveat: a SUMMARY's
+        # incompleteness is one fact, not two.
+        cells.append(_num(row.total_files, total_rough))
+        cells.append(_num(row.total_bytes, total_rough))
         lines.append("| " + " | ".join(cells) + " |")
     return lines
 
@@ -495,8 +584,18 @@ def _csv(sheets: list[Sheet]) -> str:
                 }
                 for column in columns:
                     files, nbytes = row.cells.get(column.label, (0, 0))
-                    record[f"{column.heading}_files"] = files
-                    record[f"{column.heading}_bytes"] = nbytes
+                    # A caveated cell is not a number: an unpriced total writes
+                    # empty rather than `0` (which would claim "scanned and
+                    # priced, nothing there"). A partial price's known part is
+                    # a real integer; the sheet's note tells the reader the
+                    # `+?` story the prose renderings show.
+                    rough = row.rough.get(column.label)
+                    record[f"{column.heading}_files"] = (
+                        None if rough == "?" else files
+                    )
+                    record[f"{column.heading}_bytes"] = (
+                        None if rough == "?" else nbytes
+                    )
                 writer.writerow(record)
         for note in sheet.notes:
             writer.writerow(
@@ -522,6 +621,50 @@ def _json(sheets: list[Sheet], lint: list) -> str:
     )
 
 
+def _totals_json(sheet: Sheet) -> dict:
+    """The footer's JSON. `"rough"` appears only when a caveat exists, so
+    fully-priced documents keep the shape they always had."""
+    total = sheet.totals()
+    out = {
+        "rules": len(sheet.rows),
+        "files": total.total_files,
+        "bytes": total.total_bytes,
+    }
+    if total.rough:
+        headings = {c.label: c.heading for c in sheet.columns}
+        out["rough"] = {
+            headings.get(label, label): flag
+            for label, flag in total.rough.items()
+        }
+    return out
+
+
+def _rule_json(row: Row, columns: list[Column]) -> dict:
+    """One rule row's JSON. A caveat's `rough` key appears only when set, so a
+    fully-priced document keeps the shape it always had."""
+    sources = {}
+    for c in columns:
+        entry = {
+            "files": row.cells.get(c.label, (0, 0))[0],
+            "bytes": row.cells.get(c.label, (0, 0))[1],
+        }
+        rough = row.rough.get(c.label)
+        if rough is not None:
+            entry["rough"] = rough
+        sources[c.heading] = entry
+    out = {
+        "rule": row.label,
+        "added_by_trial": row.marked,
+        "sources": sources,
+        "total_files": row.total_files,
+        "total_bytes": row.total_bytes,
+    }
+    total_rough = _total_rough(row)
+    if total_rough is not None:
+        out["rough"] = total_rough
+    return out
+
+
 def _sheet_json(sheet: Sheet) -> dict:
     return {
         "job": sheet.job,
@@ -531,19 +674,7 @@ def _sheet_json(sheet: Sheet) -> dict:
             for c in sheet.columns
         ],
         "rules": [
-            {
-                "rule": row.label,
-                "added_by_trial": row.marked,
-                "sources": {
-                    c.heading: {
-                        "files": row.cells.get(c.label, (0, 0))[0],
-                        "bytes": row.cells.get(c.label, (0, 0))[1],
-                    }
-                    for c in sheet.columns
-                },
-                "total_files": row.total_files,
-                "total_bytes": row.total_bytes,
-            }
+            _rule_json(row, sheet.columns)
             for row in sheet.rows
         ],
         "files": [
@@ -558,10 +689,6 @@ def _sheet_json(sheet: Sheet) -> dict:
             for row in sheet.detail
         ],
         "files_omitted": sheet.truncated,
-        "totals": {
-            "rules": len(sheet.rows),
-            "files": sheet.totals().total_files,
-            "bytes": sheet.totals().total_bytes,
-        },
+        "totals": _totals_json(sheet),
         "notes": sheet.notes,
     }

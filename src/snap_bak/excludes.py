@@ -41,31 +41,32 @@ Inspection is read-only. Removing files from backups is restic's job (see
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import os
 import stat
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
 
 __all__ = [
     "BadPatternError",
-    "Pattern",
-    "parse_patterns",
-    "match",
-    "child_match",
-    "list_match",
-    "excluded",
-    "validate_patterns",
-    "read_pattern_file",
-    "patterns_for_job",
-    "lint",
     "ExcludedEntry",
     "ExclusionSet",
-    "walk_excluded",
-    "parse_ls_long",
+    "Pattern",
+    "child_match",
     "collect_from_listing",
+    "excluded",
+    "lint",
+    "list_match",
+    "match",
+    "parse_ls_long",
+    "parse_patterns",
     "patterns_digest",
+    "patterns_for_job",
+    "read_pattern_file",
+    "validate_patterns",
+    "walk_excluded",
 ]
 
 
@@ -147,9 +148,8 @@ def _scan_chunk(pattern: str) -> tuple[bool, str, str]:
             in_range = True
         elif c == "]":
             in_range = False
-        elif c == "*":
-            if not in_range:
-                break
+        elif c == "*" and not in_range:
+            break
         i += 1
     return star, pattern[:i], pattern[i:]
 
@@ -235,11 +235,17 @@ def _match_chunk(chunk: str, s: str) -> tuple[str, bool]:
     return s, True
 
 
+@functools.lru_cache(maxsize=1 << 17)
 def segment_match(pattern: str, name: str) -> bool:
     """Go `filepath.Match` for a single path segment.
 
     `*` matches any run of characters within the segment but never a `/`, so
     `*.tmp` cannot match `a/b.tmp` (restic applies this per component).
+
+    Memoised: the same (pattern, segment) pairs recur constantly — `share`,
+    `lib`, `.git`, file extensions — and the matcher is pure, so caching cannot
+    change an answer, only repeat one. This is the difference between the walk
+    spending its time in matching and spending it in the kernel.
     """
     while pattern:
         star, chunk, pattern = _scan_chunk(pattern)
@@ -340,8 +346,13 @@ _RESOLVED_LIMIT = 20_000
 
 
 def clear_matcher_cache() -> None:
-    """Drop memoised pattern expansions. Call between independent scans."""
+    """Drop memoised pattern expansions. Call between independent scans.
+
+    The segment cache holds pure answers and never goes stale, so clearing it
+    is memory hygiene between scans, not correctness.
+    """
     _RESOLVED_CACHE.clear()
+    segment_match.cache_clear()
 
 
 def _resolve(p: Pattern, segment_count: int) -> tuple[Pattern, ...]:
@@ -675,6 +686,12 @@ class ExcludedEntry:
     # than only having the set-wide total. Directories are never counted, so a
     # matched empty directory reports 0.
     files: int = 0
+    # A matched directory whose subtree was not read (shallow walk) reports no
+    # counts at all rather than a misleading 0. `partial` marks a price that
+    # counts only part of its subtree: entries unread or vanished mid-walk, or,
+    # beneath a revealed directory, direct children the config excludes anyway.
+    unknown: bool = False
+    partial: bool = False
 
     @property
     def sort_key(self) -> tuple:
@@ -688,9 +705,45 @@ class RuleTotals:
     rule: str
     files: int = 0
     bytes: int = 0
+    # A rule (in one source) is `unknown` when every row behind it is unpriced,
+    # and `partial` when a price exists but does not cover everything the rule
+    # matched. Rendered as `?` and `+?` respectively.
+    unknown: bool = False
+    partial: bool = False
+
+    def merge(self, other: RuleTotals) -> None:
+        """Fold a second source's totals into these.
+
+        Mixed known/unknown counts can only ever be `partial`: the question
+        `?` answers is whether the rule's impact is priced at all in this
+        source.
+        """
+        self.files += other.files
+        self.bytes += other.bytes
+        saw_unknown = self.unknown or other.unknown
+        saw_partial = self.partial or other.partial
+        if self.files or self.bytes:
+            self.unknown = False
+            self.partial = saw_unknown or saw_partial
+        else:
+            self.unknown = saw_unknown
+            self.partial = saw_partial
+
+    @property
+    def rough(self) -> str | None:
+        """`?` when unpriced, `+?` when partly priced; None with no caveat."""
+        if self.unknown:
+            return "?"
+        if self.partial:
+            return "+?"
+        return None
 
     def to_json(self) -> dict:
-        return {"rule": self.rule, "files": self.files, "bytes": self.bytes}
+        out = {"rule": self.rule, "files": self.files, "bytes": self.bytes}
+        rough = self.rough
+        if rough is not None:
+            out["rough"] = rough
+        return out
 
 
 # A row restic excluded without any single non-negated rule naming it. Should not
@@ -727,12 +780,16 @@ class ExclusionSet:
         is_dir: bool,
         rule: str | None = None,
         files: int = 0,
+        unknown: bool = False,
+        partial: bool = False,
     ) -> None:
         """Record one excluded path.
 
         `files` is how many this row accounts for: 1 for a file, the subtree's
         count for a matched directory. A directory is never itself a file, so a
-        matched empty one reports 0.
+        matched empty one reports 0. An `unknown` row carries no counts (its
+        subtree was not read); a `partial` row's counts cover its subtree only
+        in part.
         """
         entry = self.entries.get(path)
         if entry is None:
@@ -745,6 +802,8 @@ class ExclusionSet:
             entry.rule = rule
         entry.size += size
         entry.files += files
+        entry.unknown = entry.unknown or unknown
+        entry.partial = entry.partial or partial
         if snapshot is not None:
             bucket = self.per_snapshot.setdefault(snapshot, {})
             bucket[path] = bucket.get(path, 0) + size
@@ -797,8 +856,12 @@ class ExclusionSet:
             t = totals.get(entry.rule)
             if t is None:
                 t = totals[entry.rule] = RuleTotals(entry.rule or UNATTRIBUTED)
-            t.files += entry.files
-            t.bytes += entry.size
+            t.merge(
+                RuleTotals(
+                    t.rule, files=entry.files, bytes=entry.size,
+                    unknown=entry.unknown, partial=entry.partial,
+                )
+            )
         return sorted(totals.values(), key=lambda t: (-t.bytes, t.rule))
 
     def by_rule_per_source(
@@ -815,8 +878,16 @@ class ExclusionSet:
             cell = grid.setdefault(label, {}).setdefault(
                 source, RuleTotals(label)
             )
-            cell.files += self.files_in_of(path, source)
-            cell.bytes += self.size_in_of(path, source)
+            entry = self.entries[path]
+            cell.merge(
+                RuleTotals(
+                    label,
+                    files=self.files_in_of(path, source),
+                    bytes=self.size_in_of(path, source),
+                    unknown=entry.unknown,
+                    partial=entry.partial,
+                )
+            )
         return grid
 
     def rule_source_cells(
@@ -826,15 +897,27 @@ class ExclusionSet:
 
         Restricted to the sources named, because a caller building one column at
         a time must not fold every snapshot's totals into each of them. Only
-        non-zero cells are yielded, so the renderer never has to ask whether a
-        blank is "scanned and found nothing" or "not scanned".
+        non-zero cells are yielded — or cells an unpriced row stands behind, so
+        an unknown-anything cell is explained rather than silently blank — and
+        the renderer never has to ask whether a blank is "scanned and found
+        nothing" or "not scanned".
         """
         for entry in self.entries.values():
             for source in sources:
-                if self.files_in_of(entry.path, source) or self.size_in_of(
-                    entry.path, source
+                if (
+                    self.files_in_of(entry.path, source)
+                    or self.size_in_of(entry.path, source)
+                    or entry.unknown
+                    or entry.partial
                 ):
                     yield entry.rule, source, entry.path
+
+    @property
+    def has_rough(self) -> bool:
+        """True when any row's counts are unknown or only partly priced."""
+        return any(
+            e.unknown or e.partial for e in self.entries.values()
+        )
 
     def ordered_entries(self) -> list[ExcludedEntry]:
         return sorted(self.entries.values(), key=lambda e: e.sort_key)
@@ -857,14 +940,26 @@ def _node_size(path: str, is_symlink: bool) -> int:
         return 0
 
 
-def _subtree_files(root: Path) -> Iterator[tuple[Path, int]]:
+def _subtree_files(
+    root: Path, skipped: list | None = None
+) -> Iterator[tuple[Path, int]]:
     """Yield (path, size) for every file beneath `root`. Symlinks are not followed.
 
     A symlink — including one that points at a directory — counts as one file
     worth 0 bytes, because that is the node restic stores, and `os.walk` files a
     symlinked directory under `_dirs` rather than `_names`.
+
+    An entry that could not be stat'd is skipped either way, and so is a
+    directory that could not be read at all (`os.walk` would otherwise swallow
+    the descent silently); when `skipped` is given, each such loss is appended
+    to it, so the caller can price the row as `partial` instead of silently
+    undercounting it.
     """
-    for dirpath, dirs, names in os.walk(root, followlinks=False):
+    onerror = (
+        (lambda err: skipped.append(err.filename))
+        if skipped is not None else None
+    )
+    for dirpath, dirs, names in os.walk(root, followlinks=False, onerror=onerror):
         for name in names:
             full = os.path.join(dirpath, name)
             try:
@@ -874,49 +969,61 @@ def _subtree_files(root: Path) -> Iterator[tuple[Path, int]]:
                 else:
                     yield Path(full), st.st_size
             except OSError:
+                if skipped is not None:
+                    skipped.append(full)
                 continue
         for name in [d for d in dirs if os.path.islink(os.path.join(dirpath, d))]:
             yield Path(os.path.join(dirpath, name)), 0
 
 
-def _walk_chunk(root_path: str) -> tuple[int, int]:
+def _walk_chunk(root_path: str) -> tuple[int, int, int]:
+    """Price one subtree: (file count, total bytes, unreadable entries)."""
     total = 0
     count = 0
-    for _fpath, fsize in _subtree_files(Path(root_path)):
+    skipped: list = []
+    for _fpath, fsize in _subtree_files(Path(root_path), skipped):
         total += fsize
         count += 1
-    return count, total
+    return count, total, len(skipped)
 
 
-def _walk_chunk_expanded(root_path: str) -> tuple[list[str], list[int]]:
+def _walk_chunk_expanded(
+    root_path: str,
+) -> tuple[list[str], list[int], int]:
     paths = []
     sizes = []
-    for fpath, fsize in _subtree_files(Path(root_path)):
+    skipped: list = []
+    for fpath, fsize in _subtree_files(Path(root_path), skipped):
         paths.append(str(fpath))
         sizes.append(fsize)
-    return paths, sizes
+    return paths, sizes, len(skipped)
 
 
 _worker_patterns: list[Pattern] | None = None
+_worker_reveal: list[Pattern] = []
 
 # Subtrees dispatched before any result is drained, so a source with thousands
 # of directories does not queue them all at once.
 _MAX_OUTSTANDING = 32
 
 
-def _init_worker(patterns: Sequence[Pattern]) -> None:
-    global _worker_patterns
+def _init_worker(
+    patterns: Sequence[Pattern], reveal: Sequence[Pattern] = ()
+) -> None:
+    global _worker_patterns, _worker_reveal
     _worker_patterns = list(patterns)
+    _worker_reveal = list(reveal)
 
 
 def _scan_subtree(args: tuple) -> list[tuple]:
-    root_path, backup_root, attribute_rules, expand, skip = args
+    root_path, backup_root, attribute_rules, expand, skip, shallow = args
     assert _worker_patterns is not None
     return [
-        (w.path, w.size, w.is_dir, w.rule, w.files, w.detail)
+        (w.path, w.size, w.is_dir, w.rule, w.files, w.detail, w.unknown, w.partial)
         for w in walk_excluded(
             Path(root_path), backup_root, _worker_patterns,
             attribute_rules=attribute_rules, expand=expand, skip=skip,
+            reveal=_worker_reveal, shallow=shallow,
         )
     ]
 
@@ -972,10 +1079,15 @@ class WalkedPath:
     # rule table already counts the subtree through the directory's own row, so
     # adding them there would count every file twice.
     detail: bool = False
-
-    def as_tuple(self) -> tuple[str, int, bool]:
-        """The (path, size, is_dir) triple older callers expect."""
-        return self.path, self.size, self.is_dir
+    # A matched directory the walk did not descend into: `unknown` rows carry no
+    # counts, because restic prunes an excluded directory without reading it, and
+    # the report does not pay I/O restic would not pay. `partial` marks a
+    # directory whose price is incomplete: entries that vanished mid-walk or
+    # could not be read, and — beneath a revealed directory — direct children
+    # the configuration already excludes (those get their own unpriced rows,
+    # because the point of a reveal pattern is what it adds to the config).
+    unknown: bool = False
+    partial: bool = False
 
 
 def walk_excluded(
@@ -988,6 +1100,8 @@ def walk_excluded(
     pool=None,
     skip: str | None = None,
     top_level: bool = False,
+    shallow: bool = False,
+    reveal: Sequence[Pattern] = (),
 ) -> Iterator[WalkedPath]:
     """Yield every excluded path under `root`, with its size and rule.
 
@@ -1015,7 +1129,9 @@ def walk_excluded(
     Counting is nearly free next to matching, and matching is the real cost.
 
     Unreadable directories and vanished files are skipped, not fatal — an
-    inspection must survive a source subvolume it cannot read.
+    inspection must survive a source subvolume it cannot read. Skips inside a
+    directory whose price was wanted mark the row `partial` rather than
+    silently undercounting it.
 
     `pool` is an optional ProcessPoolExecutor. When given, a matched directory's
     subtree is split by top-level subdirectories and walked in parallel — on a
@@ -1029,16 +1145,116 @@ def walk_excluded(
     `top_level` enables parallel dispatch of non-excluded directories to the
     pool. Only the outermost call sets this; workers recurse serially within
     their own subtree, so no worker ever waits on another worker.
+
+    `shallow` prices matched directories the way restic's walker sees them:
+    pruned, unread. A shallow row carries `unknown=True` and no counts, which
+    is why the default `show` costs only one readdir for directories restic
+    would skip anyway. `False` (the library default) descends and prices, the
+    exact totals the `--price` escape hatch asks for.
+
+    `reveal` is a set of candidate patterns evaluated on top of `patterns`. A
+    directory matched by a reveal pattern (or by a configured rule with the
+    same text — revealed all along) is *not* pruned: the walk descends it and
+    prices its whole subtree, listing every file. Direct children the config
+    already excludes are the exception: they stay on their own unpriced rows —
+    they are the part the candidate pattern does not add — and mark the
+    revealed directory `partial`. Deeper rules (restic applies patterns in
+    order and the config's come first) are not consulted again inside: restic
+    pruned the revealed directory, so nothing beneath it was ever evaluated.
     """
     root = Path(root)
     base = clean_path(backup_root)
     seen = [0, 0]
+    reveal_texts = {p.original for p in reveal}
 
     def tick(size: int) -> None:
         if progress is not None:
             seen[0] += 1
             seen[1] += size
             progress(seen[0], seen[1])
+
+    def list_children(path: Path) -> tuple[list, list, bool]:
+        """`(subdir entries, non-dir entries, ok)` beneath `path`.
+
+        `ok` is False when the directory itself could not be read; the caller
+        decides what that does to its row. `is_dir` stays inside the try: a
+        DirEntry for a file that vanished between listing and classification
+        must degrade to an empty listing, not raise out of the walk.
+        """
+        try:
+            with os.scandir(path) as it:
+                entries = list(it)
+            return (
+                [e for e in entries if e.is_dir(follow_symlinks=False)],
+                [e for e in entries if not e.is_dir(follow_symlinks=False)],
+                True,
+            )
+        except (PermissionError, FileNotFoundError, NotADirectoryError):
+            return [], [], False
+
+    def detail_row(path: str, size: int, rule: str | None) -> WalkedPath:
+        """An expanded per-file row, named from the walk root."""
+        return WalkedPath(
+            f"{base}/{os.path.relpath(path, root)}", size, False, rule, 1,
+            detail=True,
+        )
+
+    def price_pieces(
+        subdirs: list[str], top_files: list, rule: str | None, acc: list
+    ) -> Iterator[WalkedPath]:
+        """Price the listed pieces of one matched directory.
+
+        Yields the expanded detail rows when `expand`; `acc` — `[files, bytes,
+        misses]` — is updated in place, because a generator cannot also return
+        the totals without pushing every caller through StopIteration
+        unwrapping. A miss is an entry that could not be read or vanished
+        mid-walk: the caller turns a nonzero count into a `partial` row rather
+        than silently undercounting.
+
+        Whether the pieces are chunked to the pool is decided here, next to
+        both of the loops it governs: chunked when there is a pool and more
+        than one subdirectory, serial otherwise — the same file set either way.
+        """
+        if pool is not None and len(subdirs) > 1:
+            chunk_futures = [
+                pool.submit(_walk_chunk_expanded if expand else _walk_chunk, sd)
+                for sd in subdirs
+            ]
+            for fut in chunk_futures:
+                if expand:
+                    paths, sizes, missed = fut.result()
+                    for p, s in zip(paths, sizes):
+                        acc[0] += 1
+                        acc[1] += s
+                        tick(s)
+                        yield detail_row(p, s, rule)
+                else:
+                    c, t, missed = fut.result()
+                    acc[0] += c
+                    acc[1] += t
+                    tick(t)
+                acc[2] += missed
+        else:
+            for sd in subdirs:
+                missed: list = []
+                for fpath, fsize in _subtree_files(Path(sd), missed):
+                    acc[0] += 1
+                    acc[1] += fsize
+                    tick(fsize)
+                    if expand:
+                        yield detail_row(str(fpath), fsize, rule)
+                acc[2] += len(missed)
+        for e in top_files:
+            try:
+                size = 0 if e.is_symlink() else os.lstat(e.path).st_size
+            except OSError:
+                acc[2] += 1
+                continue
+            acc[0] += 1
+            acc[1] += size
+            tick(size)
+            if expand:
+                yield detail_row(e.path, size, rule)
 
     def scan(directory: Path, rel: str) -> Iterator[WalkedPath]:
         try:
@@ -1049,9 +1265,11 @@ def walk_excluded(
 
         def drain():
             for fut in futures:
-                for path, size, is_dir, r, files, detail in fut.result():
+                for (path, size, is_dir, r, files, detail,
+                     unknown, partial) in fut.result():
                     yield WalkedPath(
-                        path, size, is_dir, r, files, detail=detail
+                        path, size, is_dir, r, files, detail=detail,
+                        unknown=unknown, partial=partial,
                     )
             futures.clear()
 
@@ -1066,83 +1284,80 @@ def walk_excluded(
                 # descended into.
                 is_dir = entry.is_dir(follow_symlinks=False)
                 hit, rule = list_match(patterns, child_path)
+                if reveal:
+                    reveal_hit, reveal_rule = list_match(reveal, child_path)
+                else:
+                    reveal_hit, reveal_rule = False, None
             except (OSError, BadPatternError):
                 # Vanished or unreadable; or a pattern restic would reject
                 # outright, which --lint reports.
                 continue
+            # Which rule decided decides what a row means. The config's rules
+            # come first, exactly as restic receives them: a configured rule
+            # with a different text that matched first has already excluded the
+            # entry, so the candidate pattern adds nothing and wins nothing
+            # here. A candidate whose text duplicates a configured rule *is*
+            # that rule, revealed.
+            deep = (
+                (reveal_hit and not hit)
+                or (hit and rule is not None and rule in reveal_texts)
+            )
+            if reveal_hit and not hit:
+                hit, rule = True, reveal_rule
             if not attribute_rules:
                 rule = None
             if is_dir:
+                if deep:
+                    partial = False
+                    subdirs, top_files, ok = list_children(entry.path)
+                    if not ok:
+                        partial = True
+                    priced = []
+                    for e in subdirs:
+                        # A direct child the config excludes is not what the
+                        # candidate adds: own row, and not priced into the
+                        # reveal rule.
+                        sub_path = f"{child_path}/{e.name}"
+                        try:
+                            s_hit, s_rule = list_match(patterns, sub_path)
+                        except (OSError, BadPatternError):
+                            # Vanished mid-scan: its price was wanted and will
+                            # now stay unknown.
+                            partial = True
+                            continue
+                        if s_hit and not (
+                            s_rule is not None and s_rule in reveal_texts
+                        ):
+                            yield WalkedPath(
+                                sub_path, 0, True,
+                                s_rule if attribute_rules else None,
+                                0, unknown=True,
+                            )
+                            partial = True
+                            continue
+                        priced.append(e.path)
+                    acc = [0, 0, 0]
+                    yield from price_pieces(priced, top_files, rule, acc)
+                    yield WalkedPath(
+                        child_path, acc[1], True, rule, acc[0],
+                        partial=partial or acc[2] > 0,
+                    )
+                    continue
+                if hit and shallow:
+                    # Restic's walker prunes regardless of what the subtree
+                    # holds, so the report needn't read it either: one row,
+                    # unknown totals, and the whole subtree skipped.
+                    yield WalkedPath(child_path, 0, True, rule, 0, unknown=True)
+                    continue
                 if hit:
-                    total = 0
-                    count = 0
-                    subdirs = []
-                    top_files = []
-                    try:
-                        with os.scandir(entry.path) as it:
-                            for e in it:
-                                if e.is_dir(follow_symlinks=False):
-                                    subdirs.append(e.path)
-                                else:
-                                    top_files.append(e)
-                    except (PermissionError, FileNotFoundError, NotADirectoryError):
-                        pass
-                    if pool is not None and len(subdirs) > 1:
-                        chunk_futures = []
-                        for sd in subdirs:
-                            if expand:
-                                chunk_futures.append(
-                                    pool.submit(_walk_chunk_expanded, sd)
-                                )
-                            else:
-                                chunk_futures.append(pool.submit(_walk_chunk, sd))
-                        for fut in chunk_futures:
-                            if expand:
-                                paths, sizes = fut.result()
-                                for p, s in zip(paths, sizes):
-                                    total += s
-                                    count += 1
-                                    tick(s)
-                                    inside = os.path.relpath(p, root)
-                                    yield WalkedPath(
-                                        f"{base}/{inside}", s, False, rule, 1,
-                                        detail=True,
-                                    )
-                            else:
-                                c, t = fut.result()
-                                total += t
-                                count += c
-                                tick(t)
-                    else:
-                        for fpath, fsize in _subtree_files(Path(entry.path)):
-                            total += fsize
-                            count += 1
-                            tick(fsize)
-                            if expand:
-                                inside = os.path.relpath(fpath, root)
-                                yield WalkedPath(
-                                    f"{base}/{inside}", fsize, False, rule, 1,
-                                    detail=True,
-                                )
-                    if pool is not None and len(subdirs) > 1:
-                        for e in top_files:
-                            try:
-                                if e.is_symlink():
-                                    size = 0
-                                else:
-                                    size = os.lstat(e.path).st_size
-                            except OSError:
-                                continue
-                            total += size
-                            count += 1
-                            tick(size)
-                            if expand:
-                                inside = os.path.relpath(e.path, root)
-                                yield WalkedPath(
-                                    f"{base}/{inside}", size, False, rule, 1,
-                                    detail=True,
-                                )
-                    yield WalkedPath(child_path, total, True, rule, count)
+                    subdirs, top_files, ok = list_children(entry.path)
+                    skipped = [] if ok else [entry.path]
+                    acc = [0, 0, 0]
+                    yield from price_pieces(subdirs, top_files, rule, acc)
+                    yield WalkedPath(
+                        child_path, acc[1], True, rule, acc[0],
+                        partial=bool(acc[2] or skipped),
+                    )
                     continue
                 if top_level and pool is not None:
                     # The worker re-roots at `child_rel`, not at `base`: it has
@@ -1151,7 +1366,7 @@ def walk_excluded(
                     futures.append(pool.submit(
                         _scan_subtree,
                         (entry.path, f"{base}/{child_rel}",
-                         attribute_rules, expand, skip),
+                         attribute_rules, expand, skip, shallow),
                     ))
                     # Submission order, not completion order: a reproducible
                     # walk is a reproducible report.

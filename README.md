@@ -485,9 +485,13 @@ what the current rules actually match, and (on request) remove exactly those
 files from existing backups.
 
 ```bash
-# One row per exclude rule, one column per source — instant, local,
-# no network, and the default when you give no selector.
+# One row per exclude rule, one column per source — local, no network, and
+# the default when you give no selector.
 snap-bak show excludes
+
+# Exact sizes for matched directories (the slow walk: one stat per file
+# beneath every rule). The default prints `?` instead — see below.
+snap-bak show excludes --price
 
 # Explicit selectors: each adds a column to the same table
 snap-bak show excludes --snaps      # a column per local btrfs snapshot (local)
@@ -506,6 +510,48 @@ snap-bak show excludes --all --format csv > excludes.csv
 `show` is always read-only — it never creates, removes, or modifies a snapshot or
 a local file. Patterns are linted on every invocation and print **nothing** when
 they are clean, so there is no `--lint` flag to remember.
+
+#### `?`: what the default does not pay for
+
+A directory an exclude rule matches is **pruned unread**, by restic and by this
+walk alike: restic never `readdir`s inside, so nothing beneath it is matched,
+counted or stored. `show` now does the same, which is what makes the default
+local scan cheap on a huge source — and what guarantees the `--live` column
+agrees with what a backup would actually do.
+
+The consequence is that such a directory's size is unknown, and unknown is
+printed as `?` — one spelling, in every format:
+
+```
+TOTAL files   TOTAL bytes           live   exclude pattern
+──────────────────────────────────────────────────────────
+          1          1.9G       1 / 1.9G   *.iso
+          ?             ?              ?   cache
+        1+?        1.9G+?   1+? / 1.9G+?   TOTAL
+```
+
+`--price` walks matched directories for exact totals (the old behaviour);
+`+?` marks a total that is exact only in part — entries that vanished or could
+not be read mid-walk, or, beneath a `--reveal`, children the config already
+excludes. In CSV an unknown cell is empty rather than `0`, which would claim
+"scanned, nothing there"; the sheet's notes and the JSON `rough` key carry the
+same distinction.
+
+#### `--reveal`: what a candidate rule would add
+
+```bash
+# Would these rules be worth adding? Price and list everything they match.
+snap-bak show excludes --reveal 'build/cache/' --reveal '*.iso'
+snap-bak show excludes --reveal-file ~/candidate.ignore
+```
+
+A reveal pattern is a what-if: it is treated as an extra rule, its matches are
+walked whole, priced, and listed file by file (even without `-v`). What the
+config already excludes keeps its own `?` rows — that part is not what the
+candidate adds — and marks the revealed row `+?`. A reveal whose text already
+appears in the config is that rule, revealed all along. Reveal patterns are
+never handed to restic: when they look right, copy them into the `ignore_file`
+to make them real.
 
 ### Trying a change before you make it
 
@@ -565,10 +611,10 @@ worth knowing before you rely on a `!`:
   To keep one file out of a directory that is excluded wholesale, exclude that
   file directly instead of excluding its parent.
 
-`apply` refuses `--excludes-file` and `-e` and says why: rewriting real backups
-against rules the deployment does not use would remove data on the strength of
-an experiment. Review the trial with `show`, then edit the config and apply
-against the real config.
+`apply` refuses `--excludes-file`, `-e`, `--reveal`, `--reveal-file` and
+`--price` and says why: rewriting real backups against rules the deployment does
+not use would remove data on the strength of an experiment. Review the trial
+with `show`, then edit the config and apply against the real config.
 
 ### Reading the output
 
@@ -618,8 +664,10 @@ TOTAL    live   path (relative to the mount point)
 One line per file, paths **relative to the mount point** so a file present in
 three sources appears once rather than three times — which is the whole reason
 for putting the sources side by side. The file-count columns are dropped: every
-line is exactly one file. A matched directory is opened up into its contents, so
-`-v` is also how you see what is inside one.
+line is exactly one file. A matched directory is opened up into its contents —
+which is also how you see what is inside one — only when its contents were
+walked: with `--price`, or for the matches of a `--reveal` pattern. A `?`-priced
+directory was pruned unread, as restic prunes it, so it has no files to list.
 
 #### Output formats
 

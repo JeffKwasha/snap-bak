@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Tests for the excludes planner/executor and the queue that schedules it.
 
 The point of the planner is that there is only one of each. `plan()` decides what

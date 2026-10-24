@@ -505,8 +505,9 @@ removes exactly those files from **existing** snapshots.
 ```
 snap-bak show excludes [--live | --snaps | --repo | --all]
                        [--job NAME] [--json] [--limit N]
-                       [--format text|csv] [-v]
+                       [--format text|csv] [-v] [--price]
                        [--excludes-file PATH] [-e PATTERN]
+                       [--reveal PATTERN]... [--reveal-file PATH]
 snap-bak apply excludes [--now | --later] [--job NAME] [--json] [--limit N]
 ```
 
@@ -514,9 +515,13 @@ Grouped by verb: `show` is read-only, `apply` is the only mutating command.
 Pattern linting runs on every `show`, silently when clean, so there is no
 `--lint` flag — it is not optional, and offering it would imply the modes skip it.
 
-**`show excludes` with no selector defaults to `--live`** — the mode that is
-local and instant, so the common case ("are my patterns sane, and what do they
-hit right now?") costs nothing.
+**`show excludes` with no selector defaults to `--live`.** The default walk is
+shallow, because that is exactly what restic's own walker does: a matched
+directory is pruned unread, so the report pays one `readdir` for a directory
+restic would skip anyway, not a stat per file beneath it. Its size is therefore
+unknown, and unknown is printed as `?` (see *Priced, unpriced, priced in part*).
+`--price` restores the old exact behaviour when the numbers are wanted more than
+the time.
 
 `apply excludes` operates on restic only and **assumes `--repo`**. Passing
 `--live`, `--snaps` or `--all` to it is an error with an explanation, not a flag
@@ -568,19 +573,65 @@ and it can never reach beneath a pruned directory.
 An unreadable trial file exits 1 naming the path. Falling back silently to the
 config's rules would report figures the caller did not ask for.
 
-`apply` refuses `--excludes-file` and `-e` with an explanation: rewriting real
-backups against rules the deployment does not use would remove data on the
-strength of an experiment. The trial belongs to `show`; `apply` acts only on
-what is configured.
+`apply` refuses `--excludes-file`, `-e`, `--reveal`, `--reveal-file` and
+`--price` with an explanation: rewriting real backups against rules the
+deployment does not use would remove data on the strength of an experiment. The
+trial and the survey belong to `show`; `apply` acts only on what is configured.
 
 Without `-v`, a trial lists only rows attributed to its **own added rules** — the
 config's rules are already in force and would bury the answer. Totals always
 cover the whole set.
 
+### Priced, unpriced, priced in part
+
+Restic prunes a directory the moment a pattern matches it: it never `readdir`s
+inside, so nothing beneath is matched, counted or stored. `show excludes` used to
+crawl every matched subtree anyway to print exact sizes — on a real `/home` that
+is over a million entries and minutes of I/O the backup itself never pays.
+
+The default `--live`/`--snaps` walk now prunes the same way, so its decisions are
+restic's decisions. A matched directory is one row with unknown counts, printed
+as `?`. **Restic parity is the point**: the report must never suggest `--live`
+knows something a backup would decide differently.
+
+- `?` — the whole number is unknown: the directory was pruned unread (restic's
+  own behaviour), so no size was paid for. One spelling, in every format; empty
+  (not `0`) in CSV, which would otherwise claim "scanned, nothing there".
+- `+?` — the price covers only part of what the rule matched: entries vanished
+  or could not be read mid-walk, or a revealed directory contains children the
+  configuration already excludes. Both numbers carry `+?` where they are printed
+  separately; the console cell puts it at the end.
+
+`--price` walks matched directories for exact totals — the old behaviour, and the
+only way to fill in a `?`. It costs a stat per file beneath every rule, which is
+what made the default slow.
+
+`--reveal PATTERN` (repeatable) and `--reveal-file PATH` are the what-if
+counterpart: treat PATTERN as an extra rule and show everything it would newly
+exclude. A revealed directory is descended, priced whole, and — even without
+`-v` — listed file by file. Two precedence rules keep the answer honest:
+
+- **A reveal pattern whose text is already a configured rule *is* that rule,
+  revealed all along**: the directory is descended as if it had always been
+  reveal.
+- **Everything else follows restic's order: the config's patterns come first.**
+  A different configured rule that matches first has already removed the entry,
+  so the candidate adds nothing there. Inside a revealed directory the direct
+  children the config already excludes get their own unpriced rows (they are not
+  what the candidate adds) and mark the revealed row `+?`. Deeper rules are not
+  re-consulted: restic pruned the directory at the match, so nothing beneath it
+  was ever evaluated — pricing the whole subtree under the revealed rule is the
+  parity-true answer.
+
+A reveal pattern is never handed to restic or `apply`: run the survey, then copy
+the pattern into the job's `ignore_file` to make it real.
+
 | Selector | Source | Cost |
 |----------|--------|------|
-| *(default)* | `--live` — live filesystem walk | instant, local |
-| `--snaps` | every local btrfs snapshot dir | local, one stat per match |
+| *(default)* | `--live` — live filesystem walk, matched directories pruned unread | local; one `readdir` per directory, cheapest |
+| `--price` | the same walk, descending into matched directories | local; adds one stat per file beneath every rule |
+| `--reveal` / `--reveal-file` | the same walk, descending only into the revealed matches, listed | local; adds the revealed subtrees' stats |
+| `--snaps` | every local btrfs snapshot dir | local, one walk per snapshot |
 | `--repo` | files stored in restic snapshots | **network** (`restic snapshots` + `restic ls` per snapshot) |
 | `--all` | every selector above | includes the network path |
 
@@ -879,8 +930,10 @@ code, and the retained queue entry with its attempt count.
 
 | Step | Cost |
 |------|------|
-| `--live` | local walk; cost scales with file count x pattern count |
-| `--snaps` | local; one stat per matched file per snapshot |
+| `--live` | local walk; matching cost scales with entry count x pattern count (matched directories are pruned unread, so nothing beneath them is scanned, matched or stat'd) |
+| `--price` | the same walk plus one stat per file beneath every matched directory — the old always-exact cost |
+| `--reveal` | the same walk plus the revealed subtrees' stats |
+| `--snaps` | local; one walk per snapshot |
 | `--repo` | network: metadata only, cache-warm; seconds–minutes |
 | `rewrite` | metadata/tree-scale: new tree blobs + index entries only, since file data is shared with the original snapshot |
 | `prune` | **the cost centre**: repacks and re-uploads every pack holding excluded chunks; takes restic's exclusive lock; minutes to hours on rclone backends |
@@ -895,7 +948,11 @@ Two consequences that are load-bearing for anyone optimising this:
   watch. A pattern's `**` expansion is resolved once and memoised, keyed on the
   resolved parts rather than the pattern text (mid-expansion children of one
   pattern share both, so keying on the text returns one child's shapes for
-  another).
+  another). Segment matching is memoised too (`segment_match`), keyed on its
+  full input — pattern text and segment — because both recur constantly
+  (`share`, `lib`, extensions: ~97% hits on a real `/home`); it is pure, so the
+  cache cannot change an answer, and on the config's own patterns it matched
+  2.4x faster than uncached.
 - **`--repo` issues one `restic ls --long` per stored snapshot and must not be
   "optimised" into `restic ls <snap>:<subdir>` calls.** Each restic invocation
   costs ~0.75s before doing any work — it loads the index and tree — so N pruned
@@ -1028,6 +1085,9 @@ unaffected.
 | `--snaps` | Add a column per local btrfs snapshot |
 | `--repo` | Add a column per snapshot stored in restic (network) |
 | `--all` | Every selector above, in one table |
+| `--price` | Walk matched directories for exact totals; the default prunes them unread and prints `?` |
+| `--reveal PATTERN` | What-if: treat PATTERN as a rule, price its matches whole and list them (repeatable) |
+| `--reveal-file PATH` | A file of `--reveal` patterns, `ignore_file` syntax |
 | `--excludes-file PATH` | Add a working pattern file's rules, same syntax as `ignore_file` |
 | `-e, --exclude PATTERN` | Add one rule, repeatable |
 | `--format text\|csv\|markdown` | How to render the grid; only `text` is fitted to the terminal |
@@ -1036,8 +1096,9 @@ unaffected.
 | `--json` | Machine-readable output; one document for the whole invocation |
 | `--limit N` | Bound the per-file rows under `-v`; rule rows and totals cover everything |
 
-With no selector, `show` runs `--live`: the mode that is local and instant, so
-the common case costs nothing.
+With no selector, `show` runs `--live`: a local, shallow walk that prunes matched
+directories unread exactly as restic does — local, but not "instant", because the
+walk itself still costs the source's directory tree.
 
 `apply` (mutating; restic only):
 
@@ -1051,8 +1112,8 @@ the common case costs nothing.
 
 `--live`, `--snaps` and `--all` are **refused** by `apply` with an explanation,
 since they name sources apply never removes files from. So are
-`--excludes-file` and `-e`, since a trial rule set must never drive a rewrite of
-real backups.
+`--excludes-file`, `-e`, `--reveal`, `--reveal-file` and `--price`, since a trial
+or survey rule set must never drive a rewrite of real backups.
 
 ### Exit codes
 

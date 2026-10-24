@@ -9,11 +9,11 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterator
 
 import json5
 from dateutil.relativedelta import relativedelta
@@ -99,7 +99,11 @@ def _parse_quantity(value, units: dict, what: str) -> int:
     if isinstance(value, int):
         return value
     if not isinstance(value, str):
-        raise ValueError(f"{what} must be an integer or a human-readable value")
+        # ValueError, not TypeError: this is config validation, and every
+        # invalid value - of any kind - must land on the callers' one handler.
+        raise ValueError(  # noqa: TRY004
+            f"{what} must be an integer or a human-readable value"
+        )
     m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([a-z]*)\s*", value, re.IGNORECASE)
     if not m:
         raise ValueError(
@@ -165,7 +169,7 @@ Snapshot = snapshot.Snapshot
 def build_retention_exponential(n: int = 1) -> list[datetime]:
     """Generate tier boundaries at exponential intervals: 1h, 2h, 4h, 8h..."""
     now = datetime.now(timezone.utc)
-    return [now - relativedelta(hours=2**i) for i in range(0, n)]
+    return [now - relativedelta(hours=2**i) for i in range(n)]
 
 
 def build_retention_datetimes(
@@ -177,19 +181,19 @@ def build_retention_datetimes(
 ) -> list[datetime]:
     """Calendar-based retention boundaries; each tier starts after the previous."""
     now = datetime.now(timezone.utc)
-    hours = [now - relativedelta(hours=i) for i in range(0, hourly)]
-    days = [now - relativedelta(hours=hourly, days=i) for i in range(0, daily)]
+    hours = [now - relativedelta(hours=i) for i in range(hourly)]
+    days = [now - relativedelta(hours=hourly, days=i) for i in range(daily)]
     weeks = [
-        now - relativedelta(hours=hourly, days=daily, weeks=i) for i in range(0, weekly)
+        now - relativedelta(hours=hourly, days=daily, weeks=i) for i in range(weekly)
     ]
     months = [
         now - relativedelta(hours=hourly, days=daily, weeks=weekly, months=i)
-        for i in range(0, monthly)
+        for i in range(monthly)
     ]
     years = [
         now
         - relativedelta(hours=hourly, days=daily, weeks=weekly, months=monthly, years=i)
-        for i in range(0, yearly)
+        for i in range(yearly)
     ]
     return list(set(hours + days + weeks + months + years))
 
@@ -393,7 +397,9 @@ class Config(BaseModel):
             sys.exit(EXIT_CONFIG_ERROR)
         try:
             return cls(**load_config_json(path.read_text()))
-        except Exception as e:
+        # Whatever went wrong (bad JSON, pydantic validation, a missing
+        # key), it is a config error for the caller - one exit code.
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Config validation error: {e}")
             sys.exit(EXIT_CONFIG_ERROR)
 

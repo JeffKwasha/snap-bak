@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Unit tests for snap_bak/report.py — the rule-by-source grid and its renderings.
 
 The report's whole job is to let a reader compare sources, so most of what is
@@ -20,13 +19,21 @@ WIDE = 400
 
 
 def build(rules, sources, root="/bak/E", **kwargs):
-    """A sheet from `(kind, [(label, [(path, size, is_dir, rule, files)])])`."""
+    """A sheet from `(kind, [(label, [(path, size, is_dir, rule, files)])])`.
+
+    A row may instead be a dict — `{"path": …, "unknown": True}` etc. — when a
+    test needs the row flags (`unknown`/`partial`); positional tuples stay the
+    common case.
+    """
     sets = []
     for kind, entries in sources:
         found = excludes.ExclusionSet()
         for label, rows in entries:
-            for path, size, is_dir, rule, files in rows:
-                found.add(label, path, size, is_dir, rule, files)
+            for row in rows:
+                if isinstance(row, dict):
+                    found.add(label, **row)
+                else:
+                    found.add(label, *row)
         sets.append((kind, found))
     return report.build("Test", root, rules, sets, **kwargs)
 
@@ -358,6 +365,100 @@ def test_json_reports_a_rule_matching_nothing():
     rule = body["jobs"][0]["rules"][0]
     assert rule["rule"] == "*.never"
     assert rule["total_files"] == 0 and rule["total_bytes"] == 0
+
+
+# --- rough numbers: `?` and `+?` -------------------------------------------
+
+# Cells land in every format with the same two spellings, and only these.
+
+
+def test_an_unpriced_row_reads_question_mark_in_every_format():
+    sheet = build(
+        ["cache"],
+        [("live", [("live", [
+            {"path": "/bak/E/cache", "size": 0, "is_dir": True,
+             "rule": "cache", "files": 0, "unknown": True},
+        ])])],
+    )
+
+    console = report.render([sheet], width=WIDE)
+    row = next(l for l in console.splitlines() if "cache" in l)
+    assert "?" in row
+
+    markdown = report.render([sheet], fmt="markdown")
+    assert "| ? | ? |" in markdown, "split files/bytes cells both say ?"
+
+    csv_rows = list(csv.DictReader(io.StringIO(report.render([sheet], fmt="csv"))))
+    assert csv_rows[0]["live_files"] == ""
+    assert csv_rows[0]["live_bytes"] == ""
+
+    body = json.loads(report.render([sheet], as_json=True))
+    rule = body["jobs"][0]["rules"][0]
+    assert rule["sources"]["live"] == {"files": 0, "bytes": 0, "rough": "?"}
+    assert rule["rough"] == "?"
+    assert body["jobs"][0]["totals"]["rough"] == {"live": "?"}
+
+
+def test_a_partial_row_appends_question_to_the_price():
+    """`+?` goes on the bytes — the price — only; the files number stays plain.
+    One spelling, everywhere."""
+    sheet = build(
+        ["cache"],
+        [("live", [("live", [
+            {"path": "/bak/E/cache", "size": 140, "is_dir": True,
+             "rule": "cache", "files": 2, "partial": True},
+        ])])],
+    )
+    console = report.render([sheet], width=WIDE)
+    row = next(l for l in console.splitlines() if "cache" in l)
+    assert "+?" in row
+
+    markdown = report.render([sheet], fmt="markdown")
+    data_row = next(l for l in markdown.splitlines() if l.startswith("| `cache`"))
+    # A partial price qualifies every number it touches: the file count is as
+    # incomplete as the byte total, so both carry `+?` in the split columns.
+    assert "| 2+? | 140+? |" in data_row
+
+    csv_rows = list(csv.DictReader(io.StringIO(report.render([sheet], fmt="csv"))))
+    assert csv_rows[0]["live_bytes"] == "140", "a known part is a real integer"
+
+    body = json.loads(report.render([sheet], as_json=True))
+    cell = body["jobs"][0]["rules"][0]["sources"]["live"]
+    assert cell == {"files": 2, "bytes": 140, "rough": "+?"}
+
+
+def test_a_priced_and_an_unpriced_rule_share_a_plus_question_total():
+    """The TOTAL column sums a priced rule and an unpriced one: the number
+    exists but does not cover everything, so the total row says `+?`."""
+    sheet = build(
+        ["cache", "*.tmp"],
+        [("live", [("live", [
+            {"path": "/bak/E/a.tmp", "size": 3, "is_dir": False,
+             "rule": "*.tmp", "files": 1},
+            {"path": "/bak/E/cache", "size": 0, "is_dir": True,
+             "rule": "cache", "files": 0, "unknown": True},
+        ])])],
+    )
+    console = report.render([sheet], width=WIDE)
+    total = next(
+        l for l in console.splitlines() if l.rstrip().endswith("TOTAL")
+    )
+    assert "+?" in total
+    tmp_row = next(l for l in console.splitlines() if "*.tmp" in l)
+    assert "+?" not in tmp_row, "the priced rule's own cell is exact"
+
+    body = json.loads(report.render([sheet], as_json=True))
+    assert body["jobs"][0]["totals"] == {
+        "rules": 2, "files": 1, "bytes": 3, "rough": {"live": "+?"},
+    }
+    # And a fully-priced document keeps the old shape: no rough keys at all.
+    clean = json.loads(report.render([build(["*.tmp"], [])], as_json=True))
+    assert "rough" not in clean["jobs"][0]["totals"]
+    assert all(
+        "rough" not in cell
+        for rule in clean["jobs"][0]["rules"]
+        for cell in rule["sources"].values()
+    )
 
 
 def test_no_rules_and_no_sources_is_still_a_readable_table():

@@ -6,6 +6,7 @@ Imports config, excludes, restic and snapshot; must not import cli.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import logging
@@ -174,11 +175,14 @@ def _write_lock_info(job_name=None, snapshot_name=None):
         else None,
     }
     try:
-        try:
-            fh = open(config.GLOBAL_LOCK_FILE, "r+")
-        except FileNotFoundError:
-            fh = open(config.GLOBAL_LOCK_FILE, "w")
-        with fh:
+        # ExitStack, not a bare `with open(...)`: the file may not exist yet and
+        # the two modes (`r+`, then `w` as the fallback) cannot both be tried in
+        # one `with` header. The handle is still closed on every path.
+        with contextlib.ExitStack() as stack:
+            try:
+                fh = stack.enter_context(open(config.GLOBAL_LOCK_FILE, "r+"))
+            except FileNotFoundError:
+                fh = stack.enter_context(open(config.GLOBAL_LOCK_FILE, "w"))
             fh.seek(0)
             fh.truncate()
             fh.write(json.dumps(info, indent=2))
@@ -237,14 +241,13 @@ def _resolve_lock_contention(stuck_threshold, stuck_wait) -> bool:
         deadline = time.time() + stuck_wait
         while time.time() < deadline:
             time.sleep(config.STUCK_POLL_INTERVAL)
-            probe = open(config.GLOBAL_LOCK_FILE, "a+")
-            try:
-                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                probe.close()
+            with open(config.GLOBAL_LOCK_FILE, "a+") as probe:
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    continue
                 logger.info("Stuck lock released; proceeding.")
                 return True
-            except IOError:
-                probe.close()
         logger.error(
             f"STUCK WAIT EXCEEDED: lock not released within {stuck_wait}s. Giving up."
         )
@@ -277,7 +280,7 @@ class GlobalLock:
             fh = open(config.GLOBAL_LOCK_FILE, "a+")
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except IOError:
+            except OSError:
                 fh.close()
                 if _resolve_lock_contention(self._stuck_threshold, self._stuck_wait):
                     continue
@@ -458,9 +461,7 @@ def check_password_file(repo: config.Repo) -> None:
         logger.warning(f"Cannot stat password file {repo.password_file}: {e}")
 
 
-_CACHE_KEYWORDS = (
-    "unable|cannot|could not|can't|error|warning|failed|denied|permission|locate|open|missing"
-).split("|")
+_CACHE_KEYWORDS = ["unable", "cannot", "could not", "can't", "error", "warning", "failed", "denied", "permission", "locate", "open", "missing"]
 
 
 def _median(values):
@@ -479,7 +480,10 @@ def half_window_remaining(rj) -> bool:
     window = rj.window
     if window is None:
         return True  # no window configured: never time-boxed
-    now = datetime.now()
+    # Naive on purpose: windows are configured as local wall-clock times
+    # ("02:00"-"06:00"), and comparing them to an aware "now" would silently
+    # shift the window by the machine's UTC offset.
+    now = datetime.now()  # noqa: DTZ005
     minutes = now.hour * 60 + now.minute
     length = (window.end_min - window.start_min) % (24 * 60) or 24 * 60
     if window.start_min < window.end_min:
@@ -637,7 +641,8 @@ class Runner:
             result = self.run_command(cmd, timeout=config.REPO_CHECK_TIMEOUT)
             data = json.loads(result.stdout)
             return data if isinstance(data, dict) else {}
-        except Exception as e:
+        # The wrapper is optional; any failure disables one gate, never the run.
+        except Exception as e:  # noqa: BLE001
             logger.warning(
                 f"Disabling power-saving gate: wrapper status unavailable ({e}); "
                 f"proceeding without power-saving snapshot gate"
@@ -720,7 +725,8 @@ class Runner:
             return None
         try:
             self._forget_only(self.repo)
-        except Exception as e:
+        # Retention is reported, not fatal: the backup that ran is intact.
+        except Exception as e:  # noqa: BLE001
             msg = str(e)
             logger.error(f"Retention failed: {msg}")
             self._write_status(
@@ -746,7 +752,7 @@ class Runner:
             self.run_command(self._restic_cmd("prune"))
         except Exception as e:
             msg = str(e)
-            logger.error(f"Prune failed for {self.repo.path}: {msg}", exc_info=True)
+            logger.exception(f"Prune failed for {self.repo.path}: {msg}")
             self._write_status(
                 "retention_failed",
                 msg,
@@ -887,7 +893,8 @@ class Runner:
             )
             summary = restic.last_json_line(result.stdout)
             return int(summary.get("total_size", 0)) if summary else 0
-        except Exception as e:
+        # A size probe is advisory; failing it reports 0 rather than aborting.
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Could not measure repo {repo.name} size ({e}); assuming 0")
             return 0
 
@@ -939,7 +946,10 @@ class Runner:
         )
 
     def within_backup_window(self) -> bool:
-        return self.window is None or self.window.contains(datetime.now())
+        # Naive local time, matching Window.parse's wall-clock semantics; an
+        # aware "now" would shift the window by the UTC offset (same reason as
+        # half_window_remaining above).
+        return self.window is None or self.window.contains(datetime.now())  # noqa: DTZ005
 
     def _delay(self, reason):
         if not self.delay.delayed:
@@ -1136,7 +1146,7 @@ class Runner:
                 )
         except Exception as e:
             msg = str(e)
-            logger.error(f"Backup failed: {msg}", exc_info=True)
+            logger.exception(f"Backup failed: {msg}")
             self._write_status(
                 "failed",
                 msg,
