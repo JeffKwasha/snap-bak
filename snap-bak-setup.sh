@@ -296,8 +296,9 @@ fi
 chown root:"$SERVICE_GROUP" "$SNAPBAK_DIR/excludes/home.ignore" 2>/dev/null || true
 chmod 0640 "$SNAPBAK_DIR/excludes/home.ignore" 2>/dev/null || true
 
-# rclone config for the service user (restic -> rclone remotes). the operator copies the
-# real rclone.conf in; the dir must exist and be writable by the service user.
+# rclone config for the service user (restic -> rclone remotes). The operator
+# copies the real rclone.conf in; the dir must exist and be writable by the
+# service user.
 mkdir -p "$SNAPBAK_DIR/.config/rclone"
 chown "$SERVICE_USER":"$SERVICE_GROUP" "$SNAPBAK_DIR/.config/rclone"
 chmod 0750 "$SNAPBAK_DIR/.config/rclone"
