@@ -1,15 +1,27 @@
 [project]
 name = "snap-bak"
-version = "0.1.0"
+version = "0.5.0"
 description = "Btrfs Snapshot -> Restic Backup Orchestrator"
-requires-python = ">=3.10"
-dependencies = ["pydantic>=2.0", "python-dateutil>=2.0", "json5>=0.9"]
+requires-python = ">=3.14"
+dependencies = [
+    "pydantic>=2.0",
+    "python-dateutil>=2.0",
+    "json5>=0.9",
+    "rich>=13",
+]
 
 [project.scripts]
-snap-bak = "scripts.snap_bak:main"
+snap-bak = "snap_bak.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["snap_bak"]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "pytest>=8",
+    "pytest-xdist>=3",
+]
 
 [build-system]
 requires = ["setuptools>=61.0"]
@@ -17,6 +29,25 @@ build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]
 tmp_path_retention_policy = "none"
+# The suite is almost entirely waiting on `restic` subprocesses (~0.7s each,
+# ~130 of them), so it is bound by process count, not by CPU inside pytest.
+# Running it on one core left 15 of 16 idle and took 1.5 minutes. `-n auto`
+# makes the plain `pytest` command finish in well under a minute, and changes
+# no test code. Use `-n 0` to run serially when debugging one test.
+addopts = "-n auto"
+
+[tool.ruff.lint.flake8-tidy-imports]
+# Tests must use pytest's tmp_path, which pytest always reaps. tempfile is
+# invisible to that and leaks a directory per test; see tests/AGENTS.md.
+# conftest.py is exempt because it must redirect state before any fixture exists.
+banned-api = { "tempfile.mkdtemp" = { msg = "use pytest's tmp_path/tmp_path_factory" }, "tempfile.mkstemp" = { msg = "use pytest's tmp_path/tmp_path_factory" } }
+
+[tool.ruff.lint.per-file-ignores]
+"tests/conftest.py" = ["TID251"]
+# Backup windows are naive local wall-clock times by design (see
+# half_window_remaining), so tests must build naive datetimes to exercise them.
+# An "aware" fixture datetime would silently shift the window under test.
+"tests/*" = ["DTZ001", "DTZ005"]
 
 [tool.pyright]
 venvPath = "."

@@ -36,9 +36,11 @@ Check global conditions once per run. If invalid, log error and exit.
 ```
 - Config/status file(s) exist, valid syntax
 - required files and directories exist with correct owner/group/permissions
-- directories exist: Snapshot, Mount, status (restic cache is only warned about —
-  restic recreates it, so a missing cache dir is not fatal)
-- password files are not accessible by group/other (hard gate, exit 4)
+- directories exist: Snapshot, Mount, status (the restic cache dir + its
+  `.cache` symlink are provisioned by setup, not checked at runtime)
+- password files are readable only by the owner and (optionally) the snap-bak
+  service group; never by other users or with group write/execute (hard gate,
+  exit 4)
 - Global Lock (prevent concurrent exec)
 ```
 
@@ -110,6 +112,28 @@ gracefully instead of failing.
 Create new btrfs snapshot of `source_subvolume` at `{snapshot_dir}/{name}` for each job
 Only one snapshot per `snapshot_interval` seconds per job.
 
+A scheduled snapshot is **suppressed** when the power-saving gate says so:
+
+1. **Disk spun down (power saving).** The wrapper's `status <job>` op resolves
+   the source's btrfs pool to its physical disks (from kernel state:
+   `/proc/self/mountinfo`, `/sys/fs/btrfs/<uuid>/devices`, `/sys/class/block`)
+   and reports `any_spun_down`. If **any** rotational disk in the pool is spun
+   down (`standby`/`slumber`/`powered_off`/`offline`/`sleep`), the snapshot is
+   skipped — creating it would wake that drive. This gate makes no disk I/O at
+   all (no btrfs calls, no snapshot-dir listing), so the drive stays asleep.
+   Other states (`running`/`active`/`live`/`parked`) and unreadable states are
+   never treated as spin-down; unknown pools fail open.
+2. **No changes.** When the pool is not spun down, the wrapper compares the
+   source's btrfs `Generation` with the latest snapshot's. Equal generations
+   mean the source is unchanged since that snapshot, so the new snapshot would
+   capture nothing and is skipped.
+
+Both gates **fail open**: an error or indeterminate result falls back to the
+historic behavior (create when the interval has elapsed). A fresh install (no
+snapshot yet) always creates one. Config per job: `skip_snapshot_if_idle`
+(default `true`) disables the spun-down-disk gate only; the no-change gate is
+always on. Backups are independent of these gates and still run on schedule.
+
 ### Phase 5: Cleanup Local Snapshots (btrfs)
 
 Retention is a choice of how timeslot boundaries are distributed — picking a
@@ -159,7 +183,7 @@ reason). `never` = manual only. `before` is deliberately unsupported: it would
 update before knowing whether any backup will happen.
 
 Duration and size fields (`stuck_threshold`, `stuck_wait`, `size_limit`,
-`snapshot_interval`, `backup_interval`, `timeout`) accept either a bare
+`snapshot_interval`, `backup_interval`) accept either a bare
 integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 `"1w"`, `"200GB"`, `"1.5TiB"`. Units: durations `s m h d w`; sizes
 `b k/kb/kib m/mb/mib g/gb/gib t/tb/tib p/pb/pib` (binary multiples).
@@ -186,7 +210,7 @@ integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 | `size_limit` | int/string | 0 | Max repo size (0 = unlimited). Int bytes or e.g. `"200GB"` |
 | `latency_ms` | int | 100 | Estimated latency for ETA calculation |
 | `throughput_mbps` | int | 1 | Estimated throughput for ETA calculation (seeding hint) |
-| `restic_options` | list | `[]` | Extra restic CLI flags for every command against this repo |
+| `restic_options` | list | `[]` | Extra restic CLI flags against this repo; global options apply to every command, backup-only options to `backup` alone |
 
 ### Job Schema
 
@@ -205,7 +229,6 @@ integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
   "backup_window_end": "06:00",
   "ignore_file": "/opt/snap-bak/excludes/data.ignore",
   "excludes": ["*.tmp", "*.cache", ".DS_Store"],
-  "timeout": "24h",
   "tag": "data",
   "restic_options": []
 }
@@ -213,12 +236,13 @@ integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 
 | Field | Type | Default | Constraint | Description |
 |-------|------|---------|------------|-------------|
-| `name` | string | required | `[A-Za-z0-9_-]` | Job id; must be filesystem-safe (`<state>/<name>_status.json`, restic tag). Does NOT set the mount point |
+| `name` | string | required | `[A-Za-z0-9_-]` | Job id; must be filesystem-safe (`<state>/<name>.json`, restic tag). Does NOT set the mount point |
 | `snapshot_dir` | string | required | must exist | Path to btrfs snapshot directory |
 | `source_subvolume` | string | required | — | Btrfs subvolume to snapshot; mount point = `<mount_base>/<last component>` |
 | `repo` | string | required | must reference repo.name | Repo to backup to |
 | `priority` | int | `100` | `ge=1` | Job priority (higher = more important) |
 | `snapshot_interval` | int/string | `3600` | `ge=900` | Seconds between snapshots, or e.g. `"2h"` |
+| `skip_snapshot_if_idle` | bool | `true` | — | Power saving: skip snapshot creation when any disk in the source's btrfs pool is physically spun down (never wake it), and never snapshot an unchanged subvolume. See Power Saving. |
 | `backup_retention` | dict | `{}` | — | Restic retention policy (e.g., `{"daily": 6}`) |
 | `snapshot_retention` | dict | `{"fn":"exponential","config":{"n":5}}` | — | Local snapshot retention strategy |
 | `backup_interval` | int/string | `3600` | `ge=1` | Seconds between backups, or e.g. `"1w"` |
@@ -226,9 +250,8 @@ integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 | `backup_window_end` | string | `null` | `HH:MM` format | Backup window end (optional) |
 | `ignore_file` | string | `""` | — | Restic exclude-from file |
 | `excludes` | list | `[]` | — | Restic exclude patterns |
-| `timeout` | int/string | `86400` | `ge=1` | Subprocess timeout: seconds or e.g. `"24h"` |
 | `tag` | string | job name | `[A-Za-z0-9_-]` | Restic tag override |
-| `restic_options` | list | `[]` | — | Extra restic CLI flags for this job |
+| `restic_options` | list | `[]` | — | Extra restic CLI flags for this job; global options apply to every command, backup-only options to `backup` alone |
 
 The planning state fields that appear in the status file — `delayed`,
 `delayed_reason`, `protected_snapshot`, `missed_slots` — are part of the
@@ -236,16 +259,23 @@ program's interface: they are persisted in the status file and never read from
 config.
 
 `restic_options` on both Repo and Job are appended verbatim to restic
-command lines (repo options first, then job options). Flags snap-bak manages
-itself are filtered out with a warning if a config author sets them:
+command lines (repo options first, then job options). Options in restic's
+global set (`RESTIC_GLOBAL_FLAGS` in `src/snap_bak/restic.py`, derived from
+`restic --help`) apply to every restic command; **all other options are
+backup-only** and apply to the `backup` subcommand alone. The `--exclude-file`
+and `--exclude` flags (from `ignore_file`/`excludes`) apply to `backup` **and**
+`rewrite` — the two subcommands that take a file set — and to no other
+subcommand (e.g. `forget` rejects them). Flags snap-bak
+manages itself are filtered out with a warning if a config author sets them:
 `-r/--repo`, `--password-file`, `--json`, `--dry-run`, `--tag`, `--keep-*`,
-`--prune`, `--exclude`, `--exclude-file`.
+`--prune`, `--exclude`, `--exclude-file`, `--forget`.
 
 ---
 
 ## Status File
 
-Per-job status stored at `/opt/snap-bak/state/<job_name>_status.json`.
+Per-job state stored at `/opt/snap-bak/state/<job_name>.json` — the last status
+plus that job's queued work.
 
 ### Schema
 
@@ -274,7 +304,7 @@ are present on failure. All fields except `job`, `status`, `timestamp`, and
 The `delayed` group carries the delayed-job state (see Delayed Job Handling):
 `delayed` is true while the job cannot proceed; `delayed_reason` is
 `"unreachable"` or `"size_limit"`; `protected_snapshot` names the exact
-snapshot to retry (same `YYYY-MM-DD_HH:MM` format as the snapshot naming rule);
+snapshot to retry (same `YYYY-MM-DD_HH:MMZ` format as the snapshot naming rule);
 `missed_slots` counts missed backup slots and feeds the priority system. On
 success the group resets to `delayed=false`, `delayed_reason=null`,
 `protected_snapshot=null`, `missed_slots=0`.
@@ -300,7 +330,7 @@ success the group resets to `delayed=false`, `delayed_reason=null`,
 | 1 | EXIT_ERROR | General | Unexpected error |
 | 2 | EXIT_CONFIG_ERROR | Config | Config validation failed |
 | 3 | EXIT_MOUNT_ERROR | Mount | Mount base not found |
-| 4 | EXIT_PERMISSION_ERROR | Permission | Password file readable by group/other |
+| 4 | EXIT_PERMISSION_ERROR | Permission | Password file readable by a group other than snap-bak, or by other |
 | 30 | EXIT_TEMP_UNREACHABLE | Temporary | Repo unreachable (may self-rectify) |
 | 31 | EXIT_TEMP_SIZE_LIMIT | Temporary | Repo over size_limit (may self-rectify) |
 | 40 | EXIT_PERM_TIMEOUT | Permanent | Backup not completed in window |
@@ -408,7 +438,7 @@ B runs first (400), then C (200), then A (100).
 
 ## Snapshot Naming
 
-- Format: `YYYY-MM-DD_HH:MM`
+- Format: `YYYY-MM-DD_HH:MMZ`
 - This is the only accepted format. Snapshots with any other naming convention are ignored.
 
 ### Selection Logic
@@ -442,6 +472,508 @@ and reviewed.
 
 ---
 
+## Excludes: Inspection & Application
+
+### Purpose
+
+`ignore_file` / `excludes` decide what a **future** backup skips. Files already
+uploaded before a rule was added stay in the repo forever, because restic's
+forget/prune retention works on whole snapshots, never on a file subset.
+This feature answers "what do my current rules match?" and, on request,
+removes exactly those files from **existing** snapshots.
+
+### Invariants
+
+1. **The local filesystem is never modified.** Every `show` mode is a read-only
+   walk; `apply` never touches the live subvolume, `snapshot_dir`, or any btrfs
+   snapshot. Patterns are only ever applied to restic snapshots. The only local
+   write any of them performs is restic's own cache, and restic's repository
+   lock file is created and released per invocation — both restic-managed.
+2. **Snapshots are never mounted to test patterns.** Matching runs against the
+   path *strings* restic stored, so no mount can race an in-flight backup.
+3. **Editing `excludes` alone changes nothing retroactively.** Removal requires
+   an explicit `apply` (`--now` / `--later`). There is no config key that
+   schedules it.
+4. **No persistent config key arms removal implicitly.** The default is `off`.
+5. **The dry-run and the run are the same plan.** `plan()` decides scope and
+   `execute()` performs it; `show excludes --repo`, the `apply` dry-run, and
+   every mutating path call that one pair. A selector that would target the live
+   filesystem or local snapshots is refused by `apply` rather than ignored.
+
+### Commands
+
+```
+snap-bak show excludes [--live | --snaps | --repo | --all]
+                       [--job NAME] [--json] [--limit N]
+                       [--format text|csv] [-v] [--price]
+                       [--excludes-file PATH] [-e PATTERN]
+                       [--reveal PATTERN]... [--reveal-file PATH]
+snap-bak apply excludes [--now | --later] [--job NAME] [--json] [--limit N]
+```
+
+Grouped by verb: `show` is read-only, `apply` is the only mutating command.
+Pattern linting runs on every `show`, silently when clean, so there is no
+`--lint` flag — it is not optional, and offering it would imply the modes skip it.
+
+**`show excludes` with no selector defaults to `--live`.** The default walk is
+shallow, because that is exactly what restic's own walker does: a matched
+directory is pruned unread, so the report pays one `readdir` for a directory
+restic would skip anyway, not a stat per file beneath it. Its size is therefore
+unknown, and unknown is printed as `?` (see *Priced, unpriced, priced in part*).
+`--price` restores the old exact behaviour when the numbers are wanted more than
+the time.
+
+`apply excludes` operates on restic only and **assumes `--repo`**. Passing
+`--live`, `--snaps` or `--all` to it is an error with an explanation, not a flag
+that is quietly discarded: those name sources `apply` never removes files from.
+
+### Trial pattern sets
+
+`--excludes-file PATH` and `-e PATTERN` let `show` evaluate a working rule set
+without the root-owned config being edited. They **add to** the job's patterns
+rather than replacing them, and the config is never modified — not even when the
+command is a dry-run.
+
+Both take **exactly the syntax an `ignore_file` uses**: one restic exclude
+pattern per line, `#` comments, `!` negation, `$VAR` expansion. A rule can be
+copied between the two unchanged, which is the point: working in a file is the
+normal way to edit patterns, and re-typing dozens of `-e` arguments is not.
+
+Effective order, which is the part that constrains what a trial can express:
+
+```
+config patterns  →  --excludes-file patterns  →  -e patterns
+```
+
+Duplicates are dropped keeping first occurrence (`dict.fromkeys`), so a rule
+named both on the command line and in the file is one rule, announced once. Not
+a plain `set`: restic applies `!` negation sequentially, so order changes
+answers and a set would silently reorder the user's rules.
+
+Two consequences, which are easy to assume otherwise and cut in opposite
+directions:
+
+- **A trial's `!` does override a config rule naming the same target.**
+  Negation is sequential and the trial's rules are evaluated after the config's,
+  so `-e '!cache'` cancels a configured `cache`. What a trial cannot do is
+  *reorder* — the effective order is fixed at `config → file → -e`.
+- **A trial's `!` cannot reach *inside* a directory an earlier pattern already
+  matched.** Those patterns run first and prune the directory, so restic never
+  descends and the later `!` has nothing to act on — the same prune semantics as
+  any other walk (see *Pattern matching*). Both `!node_modules/keepme/` and
+  `!node_modules/keepme/vital.js` are therefore ignored once `node_modules/`
+  matches. The negation that works is one naming the **directory itself**, in the
+  same file and after the exclusion (`logs/` then `!logs/`, which does restore
+  the directory and its contents). To keep one file out of a directory excluded
+  wholesale, exclude that file directly rather than its parent.
+
+So a trial set is not strictly "tightening only": it can cancel a rule outright,
+and it can never reach beneath a pruned directory.
+
+An unreadable trial file exits 1 naming the path. Falling back silently to the
+config's rules would report figures the caller did not ask for.
+
+`apply` refuses `--excludes-file`, `-e`, `--reveal`, `--reveal-file` and
+`--price` with an explanation: rewriting real backups against rules the
+deployment does not use would remove data on the strength of an experiment. The
+trial and the survey belong to `show`; `apply` acts only on what is configured.
+
+Without `-v`, a trial lists only rows attributed to its **own added rules** — the
+config's rules are already in force and would bury the answer. Totals always
+cover the whole set.
+
+### Priced, unpriced, priced in part
+
+Restic prunes a directory the moment a pattern matches it: it never `readdir`s
+inside, so nothing beneath is matched, counted or stored. `show excludes` used to
+crawl every matched subtree anyway to print exact sizes — on a real `/home` that
+is over a million entries and minutes of I/O the backup itself never pays.
+
+The default `--live`/`--snaps` walk now prunes the same way, so its decisions are
+restic's decisions. A matched directory is one row with unknown counts, printed
+as `?`. **Restic parity is the point**: the report must never suggest `--live`
+knows something a backup would decide differently.
+
+- `?` — the whole number is unknown: the directory was pruned unread (restic's
+  own behaviour), so no size was paid for. One spelling, in every format; empty
+  (not `0`) in CSV, which would otherwise claim "scanned, nothing there".
+- `+?` — the price covers only part of what the rule matched: entries vanished
+  or could not be read mid-walk, or a revealed directory contains children the
+  configuration already excludes. Both numbers carry `+?` where they are printed
+  separately; the console cell puts it at the end.
+
+`--price` walks matched directories for exact totals — the old behaviour, and the
+only way to fill in a `?`. It costs a stat per file beneath every rule, which is
+what made the default slow.
+
+`--reveal PATTERN` (repeatable) and `--reveal-file PATH` are the what-if
+counterpart: treat PATTERN as an extra rule and show everything it would newly
+exclude. A revealed directory is descended, priced whole, and — even without
+`-v` — listed file by file. Two precedence rules keep the answer honest:
+
+- **A reveal pattern whose text is already a configured rule *is* that rule,
+  revealed all along**: the directory is descended as if it had always been
+  reveal.
+- **Everything else follows restic's order: the config's patterns come first.**
+  A different configured rule that matches first has already removed the entry,
+  so the candidate adds nothing there. Inside a revealed directory the direct
+  children the config already excludes get their own unpriced rows (they are not
+  what the candidate adds) and mark the revealed row `+?`. Deeper rules are not
+  re-consulted: restic pruned the directory at the match, so nothing beneath it
+  was ever evaluated — pricing the whole subtree under the revealed rule is the
+  parity-true answer.
+
+A reveal pattern is never handed to restic or `apply`: run the survey, then copy
+the pattern into the job's `ignore_file` to make it real.
+
+| Selector | Source | Cost |
+|----------|--------|------|
+| *(default)* | `--live` — live filesystem walk, matched directories pruned unread | local; one `readdir` per directory, cheapest |
+| `--price` | the same walk, descending into matched directories | local; adds one stat per file beneath every rule |
+| `--reveal` / `--reveal-file` | the same walk, descending only into the revealed matches, listed | local; adds the revealed subtrees' stats |
+| `--snaps` | every local btrfs snapshot dir | local, one walk per snapshot |
+| `--repo` | files stored in restic snapshots | **network** (`restic snapshots` + `restic ls` per snapshot) |
+| `--all` | every selector above | includes the network path |
+
+A selector adds a **column**, not a separate report: the same table is rendered
+from whichever sources were scanned, and one invocation emits exactly one
+document. Two JSON objects on stdout is not a JSON document, and three CSV
+headers is not a table.
+
+`--limit N` bounds the per-file rows under `-v`; rule rows and every total cover
+the full set.
+
+### Pattern matching
+
+`src/snap_bak/excludes.py` is a faithful port of restic's own exclusion engine
+(`internal/filter`, matching restic 0.19.1) so listings agree with what restic
+would do. restic's documentation of pattern syntax is the authority.
+
+CI installs the **newest** restic release rather than pinning 0.19.1: when
+restic's behaviour changes, the integration tests fail and the port gets fixed
+in the same change. A pinned old binary would hide the divergence until a user
+hit it against their own restic.
+
+Negation and prune behaviour are **not** documented upstream — restic describes
+pattern syntax and says nothing about `!` or about what a matched directory does
+to later rules. Those rules below are therefore the volatile kind: a restic
+release may change them, and the port is expected to follow rather than to be
+argued with. See `docs/verification.md` for what was established and when.
+
+Ported semantics:
+
+- Per-segment Go `filepath.Match` — `*` never crosses `/`, plus `?`, `[a-z]`,
+  `[^a]`, `\` escapes. Deliberately **not** Python `fnmatch`.
+- A pattern with no leading `/` matches at **any** path offset (`Trash` matches
+  `/bak/home/Trash/x`); a leading `/` anchors to the root.
+- A **trailing `/` is ignored**: `foo/` ≡ `foo`. It is not a directories-only
+  marker, so `foo/` also matches a *file* named `foo`.
+- `**` must be a complete path component (`foo/**/bar`, not `foo**`), and
+  matches any number of intermediate directories.
+- `!` prefix negates. Negation is sequential and the **last match wins**:
+  `--exclude '*' --exclude '!keep.txt'` keeps only `keep.txt`.
+- Patterns are `filepath.Clean`ed, so `/foo/../bar` ≡ `/bar`.
+- `ignore_file` lines are trimmed; blanks and `#` comments dropped; `$VAR` is
+  expanded and `$$` yields a literal `$`. `~` is **not** expanded — use
+  `$HOME`.
+
+Errors during inspection are reported but never fatal: an unreadable directory,
+a file that vanishes mid-walk, or a pattern restic itself would reject (caught
+and reported by the lint that runs on every `show`) all degrade to "skip this
+path" rather than aborting
+the run.
+
+Directory matching prunes the walk, mirroring restic's walker: it does not
+descend into an excluded directory, so a `!` pattern cannot re-include something
+inside one. Symlinks are never followed: restic stores a link as a link, so
+following one would name paths the repo does not contain.
+
+Because pruning is what restic does, the rule order is load-bearing and cannot
+be worked around by reordering later patterns: the excluding pattern is
+evaluated first and the subtree is never visited, so nothing after it applies
+inside — including a `!` naming a path beneath it. Only a `!` naming the
+directory itself, ordered after the exclusion, restores it. Note this is not the
+same as negation in general, which is sequential and does let a later `!` cancel
+an earlier rule on the *same* target. This is why a trial pattern set's reach is
+bounded — see *Trial pattern sets*.
+
+### Path basis
+
+Backups run `restic backup <mount_base>/<source basename>`, so stored paths are
+`/bak/<name>/...`. **All matching uses that mount-point path.** `--live` and
+`--snaps` map live paths onto their mount-point equivalent before matching, so
+every mode answers the same question: *what would the next backup skip?*
+
+Consequence: a relative pattern (`*.tmp`, `Trash`) behaves identically
+everywhere, while an anchored pattern (`/bak/home/Trash`) is anchored to the
+backup root. The lint that runs on every `show` flags anchored patterns that
+can never match that root —
+the common authoring mistake of writing `/home/user/x` when the root is
+`/bak/data`.
+
+### The report
+
+One row per **exclude rule**, one column pair (`files / bytes`) per **source**,
+with a total row. This is the layout the whole feature exists for: a rule that
+drops 40k files from the live filesystem and 3 from what restic stored has either
+never been deployed or has stopped matching, and the difference is invisible
+unless both numbers are on one page.
+
+```
+TOTAL files   TOTAL bytes        live   snap:2026-01-22_10:00Z   restic:a1b2c3d4   exclude pattern
+───────────────────────────────────────────────────────────────────────────────────────────────
+      4223       8.1T    8 / 28.8K   8 / 28.8K     15 / 4.5G   cache
+       135       1.0M  123 / 987 B  135 / 1.0M    12 /  77 B   *.tmp
+         0         0        0 / 0     0 / 0          0 / 0     *.iso
+         3       4.5G        0 / 0     0 / 0          3 / 4.5G  + *.never-deployed
+      4361       13.1T 131 / 29.8M  143 / 1.0M    30 / 4.5G   TOTAL
+```
+
+**Every configured rule gets a row, including one that matches nothing.** The
+zero row is the finding: it is what separates "not deployed yet" from "stopped
+matching", and a report that omits it cannot express either. A rule added by a
+trial is marked `+` rather than the config's own rules being hidden — the table
+exists to be read against them.
+
+### What counts as a file
+
+A file is a **non-directory entry restic stores**: a regular file, a symlink, or
+a hardlink. Established against restic 0.19.1 (see `docs/verification.md`):
+
+| Kind | Counted as a file | Bytes |
+|------|-------------------|-------|
+| regular file | yes | `lstat` size, matching `restic ls --long` |
+| symlink | yes | **0** — the node restic stores, reported at 0 by `restic ls --long` |
+| hardlink | yes, once per path | full size per path, matching restic's own `ls` |
+| directory | **never** | 0 |
+
+Consequences that are load-bearing:
+
+- **A symlink priced by `lstat` would make `--live` and `--repo` disagree** about
+  the same file: `lstat` reports the length of the *target path*, which is not a
+  payload restic holds.
+- **A hardlink is counted once per path**, which is what keeps the two columns
+  equal — `restic ls` reports every hardlinked path at full size. The figure
+  therefore overstates what `prune` reclaims by exactly the shared blocks. The
+  post-prune `stats` delta remains the authoritative reclaimed figure.
+- **A directory is never a file**, so a matched empty directory reports 0 and a
+  matched populated one reports its subtree. Counting directories would make the
+  total depend on layout rather than on data.
+
+`restic ls --long` renders a symlink as `path -> target`, with Go's capital-`L`
+mode. The arrow is part of the rendered line, not the name, so it is split off —
+otherwise a symlink matches no pattern and silently never appears in a `--repo`
+report at all.
+
+### `-v`: the file sheet
+
+A second table, one line per excluded file, paths **relative to the mount point**
+— relative, because that is the only form in which a file present in three
+sources appears once instead of three times, which is the entire point of putting
+the sources side by side. The file-count columns are dropped: every line is
+exactly one file.
+
+A matched directory is opened up into its contents, which costs nothing extra on
+the `--repo` path (the listing already holds every path) and one traversal on the
+walk path (`_subtree_totals` reports each file as it counts it). Expanded files
+are attributed to the rule that matched the **directory**, because restic pruned
+it and no pattern ever reached them.
+
+### Output formats
+
+| Format | Columns | Units | Fitted |
+|--------|---------|-------|--------|
+| `text` (default) | fitted to the terminal, oldest dropped first | abbreviated to ≤4 chars | yes |
+| `markdown` | every column | abbreviated | no |
+| `csv` | union of every job's columns | raw integers | no |
+| `--json` | every column | raw integers | no |
+
+Only the console is fitted. Whole source columns are dropped — never truncated
+mid-number — and what they held is stated underneath, so a fitted table never
+reads as a complete one. A terminal's row per source is `files / bytes`; the
+console puts the numeric columns before the rule or path, which are the columns
+of unbounded width and may be folded at the right without disturbing a number.
+
+`--format csv` emits one header for the whole invocation, built as the union of
+every job's source columns: two jobs rarely share a snapshot set, and a header
+per job is not a table any importer accepts. `--json` emits **one** document
+holding the lint results, every job and every source.
+
+### `apply excludes`
+
+Dry-run by default: prints affected snapshot IDs, projected bytes, and the exact
+`restic rewrite` command that `--now` would run. Only `--now` and the scheduled
+run mutate.
+
+`--later` **queues** the rewrite as `rewrite-drop-excluded-files` on that job's
+state file, after checking there is genuinely something to do: a job whose repo
+has no snapshots holding excluded files is refused rather than queued. An empty
+repo means the store went empty or retention took everything, which is a
+problem to notice, not a rewrite to schedule. Queuing a task that is already
+queued is an error, not a silent no-op.
+
+Execution order (each step is separately failure-isolated):
+
+1. **Plan** — `apply.plan()`, the same call `show excludes --repo` and the
+   dry-run use, so what the user approves is what runs.
+2. **Preflight** — repo reachable (`restic cat config`; rc 10/12 abort before any
+   write) and unlocked (rc 11 abort). Nothing has been modified at this point.
+3. **Rewrite** — a single `restic rewrite <ids> --exclude-file … --exclude …
+   --forget`. Rewritten snapshots keep their original time, host and tag, so
+   retention keeps working. restic adds a `rewrite` tag only when `--forget`
+   is *not* used, so `--forget` keeps the tag set exactly as it was.
+4. **Prune** — one `restic prune` per repo to actually reclaim the space. The
+   measured duration is logged: prune is the expensive step, and seeing how long
+   it took is how an operator judges whether the gate is set too generously.
+
+**Contention.** A scheduled apply runs inside the GlobalLock the run already
+holds, because that lock is what guards local btrfs snapshots as well. `--now`
+deliberately takes no lock and adds no `--retry-lock`: restic serializes on the
+repository's own lock, so a contended `--now` fails immediately with rc 11 and the
+answer is `--later`, which rides the next scheduled run. restic's own lock is
+what prevents repo corruption; a second lock would duplicate it, not strengthen
+it.
+
+`--forget` is used in the same command deliberately: a standalone
+`restic forget <ids>` would **also apply retention policies** to the group and
+could delete snapshots beyond the intent. `--forget` removes exactly the
+rewritten originals.
+
+All affected snapshot IDs go into **one** `rewrite` invocation rather than a
+loop, so the repo is opened once and the work is all-or-nothing per snapshot:
+a snapshot restic could not rewrite keeps its original and its files. Only
+snapshots that actually hold a match are rewritten — the test is a per-snapshot
+membership check against the collected set, not "did this snapshot introduce a
+path we had not seen", which with restic's newest-first listing would rewrite one
+snapshot and leave every older copy in place.
+
+Failure behaviour: a failed rewrite leaves the originals in place; a failed
+prune leaves data merely unreclaimed. Both are safe to retry. A snapshot with
+zero matching files is skipped, so repeated runs converge and never re-upload
+identical trees.
+
+Outcomes are reported as `apply.Outcome`, deliberately a different type from
+`job.Result` (the one `exit_code()` consumes), so an apply can never move the
+run's exit code or be mistaken for a backup result.
+
+### Arming a scheduled cleanup
+
+There is exactly one arming mechanism: the queue. `--later` adds a task to that
+job's state file; the next eligible run performs it and removes the entry. There
+is no config key that schedules this, so editing `excludes` alone can never
+rewrite history.
+
+| Mechanism | Scope | Meaning |
+|-----------|-------|---------|
+| `--later` | one-shot | the next eligible run does this, then forgets it |
+
+`--now` performs it immediately and clears any matching queue entry.
+
+A task that fails or is delayed **keeps** its entry, so it is retried at the next
+eligible window, with `attempts` and the last restic exit code recorded so a
+persistent failure escalates in the log rather than retrying nightly in silence.
+The attempt count deliberately does not gate the retry: the window gates already
+bound how often this runs — at most once per eligible window — and the operation
+is idempotent, so re-running is safe.
+
+A task name is declared once, by the handler that implements it
+(`@todo.task("rewrite-drop-excluded-files")`), and the registry is built from
+those declarations, so a name cannot drift from the function it names. Names are
+stored verbatim in the state file and read by a human wondering what a queued
+run will do, so they read as the restic operation plus its goal.
+
+### Run-time gate
+
+Queued work runs only when **all** hold, evaluated after backups complete,
+cheapest first:
+
+1. The job has something queued.
+2. The job has excludes to apply.
+3. Inside the job's backup window.
+4. At least **half** the window length remains.
+5. Repo reachable and unlocked.
+6. At least one snapshot actually contains a matching file.
+
+`rewrite` is metadata-scale — it rebuilds and re-uploads *tree* blobs only; file
+data blobs stay shared with the original snapshot — which is what makes a cheap
+gate sufficient. No duration estimate is needed.
+
+Phase order is **backups → queued work → retention(forget) → prune**, and the
+work phase registers its repos into the prune set alongside retention's, so a
+single prune per repo reclaims both. A repo whose job has no `backup_retention`
+is still pruned if a task made data there unreferenced.
+
+Queued work is the only thing this phase runs, and it is the only work a user
+asked for by name, so its outcome joins the run's own results and reaches the
+exit-code ladder. A task that fails or is delayed reports non-zero; a task that
+found nothing to do reports as an ordinary skip and changes nothing. The ladder
+accumulates with `any()` over all results, so a task can never mask a backup
+outcome.
+
+A repo that is missing, locked or unreadable (restic 10/11/12) is a *temporary*
+problem and reports as `delayed` (exit 30) — it may well be fine on the next
+window. Any other restic failure reports as `failed` (exit 41), because it will
+not fix itself until the config changes.
+
+**A check, not a gate.** The backup that just ran used the job's current
+excludes, so its snapshot should hold nothing to remove. If the plan finds
+matches in the newest snapshot anyway, the run logs a warning: the backup path is
+not honouring the excludes. The rewrite still proceeds — the data ends up
+correct — but the bug gets named instead of being quietly cleaned up after.
+
+A dry run reports and returns without touching the queue at all: simulating a run
+must not consume the request the real run is waiting for.
+
+Failures are never retried by a counter. A transient repo problem (unreachable,
+locked) breaks every restic operation in the run equally, so the ordinary run
+logic already handles it and the next eligible window simply tries again; the
+operation is idempotent, so re-running is safe. What snap-bak must not do is
+retry silently forever — hence the loud log naming the failing phase and exit
+code, and the retained queue entry with its attempt count.
+
+### IO & duration
+
+| Step | Cost |
+|------|------|
+| `--live` | local walk; matching cost scales with entry count x pattern count (matched directories are pruned unread, so nothing beneath them is scanned, matched or stat'd) |
+| `--price` | the same walk plus one stat per file beneath every matched directory — the old always-exact cost |
+| `--reveal` | the same walk plus the revealed subtrees' stats |
+| `--snaps` | local; one walk per snapshot |
+| `--repo` | network: metadata only, cache-warm; seconds–minutes |
+| `rewrite` | metadata/tree-scale: new tree blobs + index entries only, since file data is shared with the original snapshot |
+| `prune` | **the cost centre**: repacks and re-uploads every pack holding excluded chunks; takes restic's exclusive lock; minutes to hours on rclone backends |
+
+`rewrite` not being data-scale is what makes the cheap run-time gate sufficient
+— no duration estimate is needed to decide whether it fits in the window.
+
+Two consequences that are load-bearing for anyone optimising this:
+
+- **`**` patterns are the cost driver, not the tree size.** Pattern count
+  multiplies path count, so an ignore file with many `**` rules is the thing to
+  watch. A pattern's `**` expansion is resolved once and memoised, keyed on the
+  resolved parts rather than the pattern text (mid-expansion children of one
+  pattern share both, so keying on the text returns one child's shapes for
+  another). Segment matching is memoised too (`segment_match`), keyed on its
+  full input — pattern text and segment — because both recur constantly
+  (`share`, `lib`, extensions: ~97% hits on a real `/home`); it is pure, so the
+  cache cannot change an answer, and on the config's own patterns it matched
+  2.4x faster than uncached.
+- **`--repo` issues one `restic ls --long` per stored snapshot and must not be
+  "optimised" into `restic ls <snap>:<subdir>` calls.** Each restic invocation
+  costs ~0.75s before doing any work — it loads the index and tree — so N pruned
+  calls lose to one full listing at any N above two, and on a remote backend that
+  fixed cost is a network round trip.
+
+Neither `restic backup --dry-run` nor `find` can substitute: `--dry-run` reports
+only what it **kept** (never an excluded path), and `find` has no equivalent for
+`!` negation.
+
+A long scan reports progress to stderr about once a second, and only when
+stderr is a terminal or `-v` was passed — a piped or journalled run wants
+results, not commentary, and commentary would corrupt `--json` / `--format csv`.
+
+---
+
 ## Global Lock
 
 ### Purpose
@@ -469,20 +1001,44 @@ per-job lock would add complexity without additional protection.
 ## State & Runtime Directories
 
 ```
-<install>                # root-owned: program, wrapper, config
-  snap_bak.py            # orchestrator (root:root 0644)
-  snap-bak-io            # sudo wrapper (root:root 0755)
+<install>                # root-owned: package, wrapper, config
+  snap_bak/              # Python package (imported as `snap_bak`; root:root 0644)
+    __init__.py
+    cli.py               # entry point / orchestration
+    config.py            # config loading + models
+    excludes.py          # restic exclusion-engine port + inspection
+    job.py               # backup engine
+    report.py            # the rule-by-source report and its renderings
+    restic.py            # restic command building
+    snapshot.py          # snapshot domain model
+  sudo-exec.py            # sudo wrapper (root:root 0755)
   config.json            # root-owned, validated by the wrapper
 
 <install>/state          # owned by snap-bak: runtime state
   snap-bak.lock          # Global lock file
   throughput.json        # Per-repo transfer-rate history
-  <job_name>_status.json # Per-job status
+  <job_name>.json        # Per-job state: last status + that job's queued work
 
 <install>/excludes       # ignore_file location (root:snap-bak)
-<install>/passwords      # per-repo restic password files (owned by snap-bak)
-<install>/cache          # restic cache (RESTIC_CACHE_DIR)
+<install>/passwords      # per-repo restic password files (owned by the admin, group snap-bak)
+<install>/cache          # restic cache (service-owned, real dir)
+<install>/.cache         # symlink -> cache; restic's implicit $HOME/.cache default
 ```
+
+One file per job, holding both that job's last status and the work queued
+against it. Keeping them together is deliberate: an entry in `queued` *is* the
+record that the work was requested, so nothing else has to remember it, and
+there is no record of completed work anywhere. An empty queue is the only thing
+that means "nothing outstanding".
+
+`write_status` rewrites the whole document on every status transition, so
+`queued` is the one key carried forward (`job._CARRIED_FORWARD_KEYS`).
+
+State for a job that has left the config is deleted once it has been gone for
+`state_retention_days` (default 90). A job still in the config is never reaped —
+its file is rewritten every run, and reaping it would reset the missed-slot
+escalation that drives priority. Queued work is never reaped: an entry is a
+request from a human.
 
 All paths are relative to the install directory (`<install>`, production
 `/opt/snap-bak`). The `restic` and `rclone` binaries are optional (rclone only
@@ -504,8 +1060,14 @@ continues.
 ### Usage
 
 ```bash
-snap-bak [OPTIONS]
+snap-bak [OPTIONS]                    # one run: validate, plan, backup, retain
+snap-bak show excludes [OPTIONS]      # read-only: what do the rules match?
+snap-bak apply excludes [OPTIONS]     # dry-run; --now applies, --later arms
 ```
+
+`show` / `apply` are subcommands. A bare `snap-bak` (no subcommand) is the
+normal run, so the systemd service (`ExecStart=python3 -m snap_bak.cli`) is
+unaffected.
 
 ### Options
 
@@ -517,6 +1079,59 @@ snap-bak [OPTIONS]
 | `-l, --list-jobs` | List configured jobs and exit |
 | `--log-file` | Also write logs to this file (default: stderr only; captured by systemd journal) |
 
+### `show excludes` / `apply excludes` options
+
+`show` (read-only):
+
+| Flag | Description |
+|------|-------------|
+| *(always run)* | Static pattern diagnostics — silent when clean, so no flag |
+| `--live` | Add the live filesystem as a column (default) |
+| `--snaps` | Add a column per local btrfs snapshot |
+| `--repo` | Add a column per snapshot stored in restic (network) |
+| `--all` | Every selector above, in one table |
+| `--price` | Walk matched directories for exact totals; the default prunes them unread and prints `?` |
+| `--reveal PATTERN` | What-if: treat PATTERN as a rule, price its matches whole and list them (repeatable) |
+| `--reveal-file PATH` | A file of `--reveal` patterns, `ignore_file` syntax |
+| `--excludes-file PATH` | Add a working pattern file's rules, same syntax as `ignore_file` |
+| `-e, --exclude PATTERN` | Add one rule, repeatable |
+| `--format text\|csv\|markdown` | How to render the grid; only `text` is fitted to the terminal |
+| `-v, --verbose` | Add the per-file sheet under the rule table |
+| `--job NAME` | Restrict to one job |
+| `--json` | Machine-readable output; one document for the whole invocation |
+| `--limit N` | Bound the per-file rows under `-v`; rule rows and totals cover everything |
+
+With no selector, `show` runs `--live`: a local, shallow walk that prunes matched
+directories unread exactly as restic does — local, but not "instant", because the
+walk itself still costs the source's directory tree.
+
+`apply` (mutating; restic only):
+
+| Flag | Description |
+|------|-------------|
+| `--now` | Execute now instead of printing the plan |
+| `--later` | Arm the next normal run to apply |
+| `--job NAME` | Restrict to one job |
+| `--json` | Machine-readable output |
+| `--limit N` | Bound displayed rows/columns; totals still cover everything |
+
+`--live`, `--snaps` and `--all` are **refused** by `apply` with an explanation,
+since they name sources apply never removes files from. So are
+`--excludes-file`, `-e`, `--reveal`, `--reveal-file` and `--price`, since a trial
+or survey rule set must never drive a rewrite of real backups.
+
+### Exit codes
+
+A verb's status reaches the process: `show` and `apply` exit with what they
+return, so a failure is visible to whatever monitors them rather than always
+looking successful.
+
+Inspection uses the shared ladder in `cli.py`, unchanged: 0 on success (including
+"nothing matched"), 2 for a config error, 1 for anything else. `apply --now`
+additionally uses 11/12 (restic's own locked/bad-password codes) when the
+preflight aborts, so a caller can distinguish "refused before touching anything"
+from "failed mid-run".
+
 ### Environment Variables
 
 | Variable | Description | Production value |
@@ -524,9 +1139,9 @@ snap-bak [OPTIONS]
 | `SNAPBAK_CONFIG_FILE` | Config file path | `/opt/snap-bak/config.json` |
 | `SNAPBAK_JOB` | Job name to run | — |
 | `SNAPBAK_SUDO` | Sudo binary used to invoke the wrapper | `sudo` |
-| `SNAPBAK_IO_WRAPPER` | Path to the root-owned wrapper | `/opt/snap-bak/snap-bak-io` |
+| `SUDO_EXEC_PATH` | Path to the root-owned wrapper | `/opt/snap-bak/sudo-exec.py` |
 | `SNAPBAK_STATE_DIR` | State directory override (default: `/opt/snap-bak/state`) | `/opt/snap-bak/state` |
-| `RESTIC_CACHE_DIR` | Restic cache base | `/opt/snap-bak/cache` |
+| `RESTIC_CACHE_DIR` | Restic cache base (not set; restic uses `$HOME/.cache` → `/opt/snap-bak/.cache` → `/opt/snap-bak/cache`) | — |
 
 ---
 
@@ -534,18 +1149,18 @@ snap-bak [OPTIONS]
 
 Btrfs snapshot create/delete and mount/umount require root. snap-bak runs as
 an unprivileged service user and delegates these to a **root-owned wrapper**
-(`snap-bak-io`), reachable via a single static sudoers rule:
+(`sudo-exec.py`), reachable via a single static sudoers rule:
 
 ```
-snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/snap-bak-io
+snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/sudo-exec.py
 ```
 
 A bare command name (no arguments listed) matches any arguments, per
 sudoers(5). This is valid on both sudo-rs and sudo.ws; a trailing `*` is
 deliberately NOT used because sudo-rs mishandles it. The wrapper:
 
-- Accepts only `snapshot|delete|mount|umount <job> [snapshot]` and
-  `update-restic`.
+- Accepts only `snapshot|delete|mount|umount <job> [snapshot]`, `status <job>`,
+  and `update-restic`.
 - Validates `<job>` against the root-owned `/opt/snap-bak/config.json`.
 - Validates `[snapshot]` against `^\d{4}-\d{2}-\d{2}_\d{2}:\d{2}$`.
 - Confines every path under the job's `snapshot_dir` / `mount_base`
@@ -571,13 +1186,13 @@ Because the wrapper derives paths from config at runtime, changing
 
 Invariants snap-bak must never breach:
 
-1. **Least privilege.** Only `snap-bak-io` performs privileged operations.
+1. **Least privilege.** Only `sudo-exec.py` performs privileged operations.
    snap-bak is granted none of them; sudo permits only the wrapper.
-2. **Root-owned files.** `snap-bak-io`, `config.json`, and the restic binary
+2. **Root-owned files.** `sudo-exec.py`, `config.json`, and the restic binary
    are root-owned, not writable by group/other — the wrapper is the root
    boundary, config is its trusted input, and restic carries
    `cap_dac_read_search`. Writable by snap-bak ⇒ trivial root escalation.
-3. **Trust boundary.** `snap-bak-io` is trusted, snap-bak is not. The wrapper
+3. **Trust boundary.** `sudo-exec.py` is trusted, snap-bak is not. The wrapper
    validates every argument against root-owned config; privileged ops never
    trust snap-bak-supplied paths/arguments.
 4. **Update trust delegated to restic.** `restic self-update` verifies the
@@ -588,13 +1203,13 @@ Invariants snap-bak must never breach:
    is executable only by root and snap-bak. — [file capabilities](https://restic.readthedocs.io/en/stable/080_examples.html#using-file-capabilities)
 
 **NOTE:** anyone able to run the restic binary with `cap_dac_read_search=+ep`
-can read files bypassing permissions. Only `snap-bak-io` may run it, and it
+can read files bypassing permissions. Only `sudo-exec.py` may run it, and it
 sets restic's source/destination itself — without trusted control over
 restic's arguments, snap-bak could "back up" secret files to Mallory.
 
 **TODO:** snap-bak currently runs restic directly, building source/repo args
-from config (snap_bak.py). Requirement 5's "wrapper sets destination itself"
-is not yet implemented — restic must be invoked via `snap-bak-io` so its args
+from config (job.py). Requirement 5's "wrapper sets destination itself"
+is not yet implemented — restic must be invoked via `sudo-exec.py` so its args
 come only from root-owned config.
 
 ---
@@ -618,7 +1233,16 @@ come only from root-owned config.
 - Snapshot selection
 - Repo throughput learning
 - Restic option filtering / reserved-flag rejection
-- snap-bak-io wrapper validation and path confinement
+- Exclude pattern matching (port of restic's `internal/filter` golden cases)
+- Exclude pattern-file parsing (comments, `$VAR`, `$$`)
+- Exclude lint diagnostics (unanchored/anchored/never-matching patterns)
+- `restic ls --long` parsing (filenames with spaces, UTF-8)
+- Per-snapshot excludes table rendering + `--limit` truncation
+- Queued-task dispatch: arming, duplicate refusal, success clearing the entry,
+  failure retaining it with an attempt count, unknown task names
+- `apply excludes` gate logic (injected clock)
+- `apply excludes` end-to-end against a throwaway local restic repo
+- sudo-exec.py wrapper validation and path confinement
 - Failed backup handling
 - Config model
 - Config loading
@@ -636,9 +1260,10 @@ uv run pytest -q
 
 snap-bak supports:
 
-- Python ≥ 3.10
+- Python ≥ 3.14
 - pydantic >= 2.0 (config models)
 - python-dateutil (relativedelta for retention calculations)
 - json5 (JSONC config parsing)
-- restic (backup tool)
+- rich (terminal rendering of the reports)
+- restic (backup tool), installed at /usr/local/bin/restic
 - btrfs-progs (snapshot management)
