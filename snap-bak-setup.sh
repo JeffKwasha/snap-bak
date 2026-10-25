@@ -21,6 +21,16 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# The interpreter the service and the wrapper will share. python3 by default;
+# PYTHON_BIN overrides it for a virtualenv or a non-system install.
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 2>/dev/null)}"
+if [ -z "$PYTHON_BIN" ] || [ ! -x "$PYTHON_BIN" ]; then
+    echo "[!] No python3 on PATH and PYTHON_BIN is unset." >&2
+    echo "    Install Python 3.14 or newer, or point PYTHON_BIN at one:" >&2
+    echo "      sudo PYTHON_BIN=/path/to/python3 ./snap-bak-setup.sh" >&2
+    exit 1
+fi
+
 # --- CONFIGURATION ---
 SERVICE_USER="snap-bak"
 SERVICE_GROUP="snap-bak"
@@ -37,18 +47,24 @@ CACHE_DIR="$SNAPBAK_DIR/cache"
 PKG_SRC="$(dirname "$(readlink -f "$0")")/src/snap_bak"
 WRAPPER_SRC="$(dirname "$(readlink -f "$0")")/src/sudo-exec.py"
 
-# --- 0. PYTHON DEPENDENCIES (for system python3) ---
-# The service runs /usr/bin/python3 and the wrapper runs 'env python3', so
-# both share the system interpreter and both need pydantic + json5 importable
-# (json5 parses the JSONC config via config.py, shared by the root wrapper).
-echo "[*] Checking Python dependencies (pydantic, python-dateutil, json5)..."
-if ! python3 -c "import pydantic, dateutil, json5" &>/dev/null; then
-    echo "[*] Installing Python dependencies with pip3..."
-    python3 -m pip install --quiet pydantic python-dateutil json5
+# --- 0. PYTHON DEPENDENCIES (for configured Python) ---
+# The service and wrapper share one configured interpreter (PYTHON_BIN), and
+# both need pydantic, json5, rich etc. importable. json5 parses the JSONC
+# config via config.py, shared by the root wrapper; rich backs the reports.
+echo "[*] Checking Python dependencies (pydantic, python-dateutil, json5, rich)..."
+if ! "$PYTHON_BIN" -c "import pydantic, dateutil, json5, rich" &>/dev/null; then
+    echo "[*] Installing Python dependencies with pip..."
+    "$PYTHON_BIN" -m pip install --quiet pydantic python-dateutil json5 rich
 fi
-if ! python3 -c "import pydantic, dateutil, json5" &>/dev/null; then
-    echo "[!] Failed to install Python dependencies. Install them manually:" >&2
-    echo "    python3 -m pip install pydantic python-dateutil json5" >&2
+if ! "$PYTHON_BIN" -c "import pydantic, dateutil, json5, rich" &>/dev/null; then
+    echo "[!] Python dependencies are not importable by $PYTHON_BIN." >&2
+    echo "    If pip is externally managed (PEP 668, stock Debian/Ubuntu), do" >&2
+    echo "    not fight it: create a virtualenv and re-run with PYTHON_BIN." >&2
+    echo "      sudo python3 -m venv /opt/snap-bak/venv" >&2
+    echo "      sudo /opt/snap-bak/venv/bin/pip install pydantic python-dateutil json5 rich" >&2
+    echo "      sudo PYTHON_BIN=/opt/snap-bak/venv/bin/python ./snap-bak-setup.sh" >&2
+    echo "    Otherwise install them manually:" >&2
+    echo "      $PYTHON_BIN -m pip install pydantic python-dateutil json5 rich" >&2
     exit 1
 fi
 
@@ -103,9 +119,11 @@ chown -R root:root "$PKG_PATH"
 chmod 0755 "$PKG_PATH"
 find "$PKG_PATH" -type f -exec chmod 0644 {} \;
 install -o root -g root -m 0755 "$WRAPPER_SRC" "$WRAPPER_PATH"
+# Deploy the wrapper on the same interpreter that owns the dependencies.
+sed -i "1s|^#!.*|#!$PYTHON_BIN|" "$WRAPPER_PATH"
 echo "[*] Installed $PKG_PATH (root:root 0644) and $WRAPPER_PATH (root:root 0755)."
 
-# --- 1d. VERIFY/UPDDATE RESTIC (setcap + self-update via the wrapper) ---
+# --- 1d. VERIFY/UPDATE RESTIC (setcap + self-update via the wrapper) ---
 # The wrapper is the single code path for restic trust + setcap (see its
 # 'update-restic' op). Running it here (a) ensures the setcap we rely on is in
 # place and (b) never duplicates that logic. Fails hard if restic is missing,
@@ -275,6 +293,8 @@ if [ ! -f "$SNAPBAK_DIR/excludes/home.ignore" ]; then
 *.cache
 EOF
 fi
+chown root:"$SERVICE_GROUP" "$SNAPBAK_DIR/excludes/home.ignore" 2>/dev/null || true
+chmod 0640 "$SNAPBAK_DIR/excludes/home.ignore" 2>/dev/null || true
 
 # rclone config for the service user (restic -> rclone remotes). the operator copies the
 # real rclone.conf in; the dir must exist and be writable by the service user.
@@ -326,7 +346,7 @@ User=$SERVICE_USER
 Group=$SERVICE_GROUP
 WorkingDirectory=$SNAPBAK_DIR
 Environment=SNAPBAK_CONFIG_FILE=$CONFIG_FILE
-ExecStart=/usr/bin/python3 -m snap_bak.cli
+ExecStart=$PYTHON_BIN -m snap_bak.cli
 
 [Install]
 WantedBy=multi-user.target
@@ -347,9 +367,17 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+# Ensure generated unit files are readable regardless of root's umask.
+chmod 0644 "/etc/systemd/system/$SERVICE_NAME.service" "/etc/systemd/system/$SERVICE_NAME.timer"
+
 # --- 6. FINALIZE ---
 echo "[*] Reloading systemd daemon..."
 systemctl daemon-reload
+if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled "$SERVICE_NAME.service" >/dev/null 2>&1; then
+    echo "[!] $SERVICE_NAME.service is currently enabled. Migrate to the timer:"
+    echo "    sudo systemctl disable --now $SERVICE_NAME.service"
+    echo "    sudo systemctl enable --now $SERVICE_NAME.timer"
+fi
 
 echo ""
 echo "===================================================="
@@ -371,5 +399,9 @@ echo "    (or owner-only chmod 600). The gate rejects other groups/other access.
 echo " 3. Copy your rclone config to $SNAPBAK_DIR/.config/rclone/rclone.conf (chmod 600)."
 echo " 4. Ensure snapshot_dir paths exist (btrfs snapshots are created as root via the wrapper)."
 echo " 5. Ensure restic repo path is accessible by $SERVICE_USER (read/write)."
-echo " 6. Enable the timer: sudo systemctl enable --now $SERVICE_NAME"
+echo " 6. If an older setup enabled the oneshot service itself, disable it now:"
+echo "       sudo systemctl disable --now $SERVICE_NAME.service"
+echo "    Then enable the timer (do NOT enable the bare service name; systemd"
+echo "    treats an unsuffixed name as .service, not .timer):"
+echo "       sudo systemctl enable --now $SERVICE_NAME.timer"
 echo "===================================================="

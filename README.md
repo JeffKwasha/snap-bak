@@ -46,8 +46,10 @@ unmount, delete, restic update) goes through the root wrapper
 Prerequisites: restic at `/usr/local/bin/restic` (a distro package lands in
 `/usr/bin`, which the wrapper rejects; download the release binary and
 `sudo install -m755 restic /usr/local/bin/restic`), and Python 3.14 with the
-dependencies importable by the interpreter the service will use. If the system
-Python is externally managed (Debian/Ubuntu), give the script a virtualenv:
+dependencies importable by the interpreter the service will use — `python3` by
+default, or whatever `PYTHON_BIN` names. If the system Python is externally
+managed (Debian/Ubuntu), give the script a virtualenv; it will not create one
+for you, and it exits with these instructions rather than guessing:
 
 ```bash
 sudo python3 -m venv /opt/snap-bak/venv
@@ -61,6 +63,11 @@ Otherwise run the copy in the clone:
 chmod +x snap-bak-setup.sh
 sudo ./snap-bak-setup.sh
 ```
+
+The clone is the install source: the setup script installs the package **and**
+the root wrapper `sudo-exec.py`, which every privileged operation (mount,
+snapshot, unmount, delete, restic update) goes through. snap-bak cannot run
+without it, so a plain `pip install` is not a supported deployment.
 
 What `snap-bak-setup.sh` does:
 
