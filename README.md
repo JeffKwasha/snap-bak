@@ -987,3 +987,9 @@ of restic's own pattern-matching golden cases, pattern-file parsing, lint
 diagnostics, table rendering, and an end-to-end apply against a throwaway local
 restic repo in a temp directory). No remote restic or actual Btrfs operations
 are required.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE). Parts of the exclusion engine are
+derived from restic (BSD-2-Clause) and Go's `path/filepath` (BSD-3-Clause);
+their notices are reproduced in [NOTICE](NOTICE).

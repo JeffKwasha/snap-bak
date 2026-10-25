@@ -56,5 +56,8 @@ handled in one place.
 
 ### Notes
 
+- Licensed under the Apache License 2.0 (`LICENSE`). The exclusion engine ports
+  restic's matcher and Go's `filepath.Match`; their BSD notices are reproduced
+  in `NOTICE`.
 - This is the first public release; there is no documented upgrade path from
   earlier private builds.

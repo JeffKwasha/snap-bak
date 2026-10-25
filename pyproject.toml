@@ -2,6 +2,8 @@
 name = "snap-bak"
 version = "0.5.0"
 description = "Btrfs Snapshot -> Restic Backup Orchestrator"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.14"
 dependencies = [
     "pydantic>=2.0",
