@@ -40,9 +40,7 @@ _VALUE_FLAGS = {"-c", "--config", "-j", "--job", "--log-file", "--limit"}
 def _find_subcommand(argv: list[str]) -> int | None:
     """Index of the subcommand in argv, or None.
 
-    Skips global flags and their values so a subcommand may follow them. Stops at
-    the first non-flag argument that is not a subcommand, since that is a normal
-    run's positional (of which there are none, so it means "not a subcommand").
+    Skips global flags and their values so a subcommand may follow them.
     """
     i = 0
     while i < len(argv):
