@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import functools
 import json
 import logging
 import os
@@ -263,19 +264,31 @@ def _resolve_lock_contention(stuck_threshold, stuck_wait) -> bool:
     return True
 
 
-def _lock_transition(what: str) -> str:
-    """The acquire/release line: which build took the lock, and the file's mtime.
+@functools.cache
+def _program_mtime() -> str:
+    """When the running package was last written, as an ISO 8601 timestamp.
 
-    The mtime is the value stuck detection ages, in ISO form so a journal line
-    can be compared with the lock file without guessing the timezone.
+    The version cannot answer this on its own: a deployed copy can be replaced
+    without a version bump, and a hand edit is not a release at all. The newest
+    mtime among the package's own files is the only signal of which build is
+    actually running.
     """
-    try:
-        mtime = datetime.fromtimestamp(
-            config.GLOBAL_LOCK_FILE.stat().st_mtime, UTC
-        ).isoformat()
-    except OSError:
-        mtime = "absent"
-    return f"Global lock {what} (version {__version__}, lock mtime {mtime})."
+    newest = 0.0
+    for path in Path(__file__).resolve().parent.glob("*.py"):
+        try:
+            newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            continue
+    if not newest:
+        return "unknown"
+    return datetime.fromtimestamp(newest, UTC).isoformat()
+
+
+def _lock_transition(what: str) -> str:
+    """The acquire/release line: which build took the lock, and when it was written."""
+    return (
+        f"Global lock {what} (version {__version__}, program mtime {_program_mtime()})."
+    )
 
 
 class GlobalLock:

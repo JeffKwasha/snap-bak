@@ -7,10 +7,10 @@ All notable changes to snap-bak are documented here. Versions follow
 
 ### Added
 
-- The global-lock acquire and release lines log the running version and the lock
-  file's modification time as an ISO 8601 timestamp. The mtime is the value
-  stuck detection already ages, so a lock can be tied to the build that last
-  wrote it.
+- The global-lock acquire and release lines log the running version and the
+  newest modification time among the installed package files, as an ISO 8601
+  timestamp. That is the last program update, so a replaced or hand-edited
+  install can be told apart even when the version was never bumped.
 
 ### Fixed
 

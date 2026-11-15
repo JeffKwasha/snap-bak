@@ -984,9 +984,10 @@ Prevents multiple snap-bak instances from running simultaneously.
 
 - Lock file: `<state>/snap-bak.lock`, an advisory `flock` (`LOCK_EX|LOCK_NB`).
   Records the holder PID and timestamps for stuck detection.
-- Both transitions log the running version and the lock file's modification time
-  as an ISO 8601 timestamp. The mtime is the value stuck detection ages, so a
-  lock in the journal can be tied to the build that last wrote it.
+- Both transitions log the running version and the newest modification time among
+  the installed package files, as an ISO 8601 timestamp. That mtime is the last
+  program update, so a lock in the journal can be tied to the build that wrote it
+  even when the version was never bumped.
 - `stuck_threshold` (config, default 3600s): lock age beyond which the holder
   is considered stuck.
 - `stuck_wait` (config, default 300s): total time to keep re-checking a stuck

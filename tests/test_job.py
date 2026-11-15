@@ -423,15 +423,16 @@ def test_a_missing_snapshot_dir_is_caught_before_anything_is_written(
 
 
 class TestGlobalLockLog:
-    def test_both_lines_name_the_version_and_the_lock_mtime(
+    def test_both_lines_name_the_version_and_the_program_mtime(
         self, tmp_path, monkeypatch, caplog
     ):
-        lock_file = tmp_path / "snap-bak.lock"
-        monkeypatch.setattr(config, "GLOBAL_LOCK_FILE", lock_file)
+        monkeypatch.setattr(config, "GLOBAL_LOCK_FILE", tmp_path / "snap-bak.lock")
+        package = Path(job_mod.__file__).resolve().parent
+        newest = max(p.stat().st_mtime for p in package.glob("*.py"))
+        program_mtime = datetime.fromtimestamp(newest, UTC).isoformat()
         with caplog.at_level(logging.INFO):
             lock = job_mod.GlobalLock()
             lock.__enter__()
-            mtime = datetime.fromtimestamp(lock_file.stat().st_mtime, UTC).isoformat()
             lock.__exit__(None, None, None)
 
         lines = [
@@ -442,4 +443,4 @@ class TestGlobalLockLog:
         assert len(lines) == 2
         for line in lines:
             assert __version__ in line
-            assert mtime in line
+            assert program_mtime in line

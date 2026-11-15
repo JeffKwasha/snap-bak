@@ -180,7 +180,7 @@ install -o root -g root -m 0755 "$WRAPPER_SRC" "$WRAPPER_PATH"
 # Deploy the wrapper on the same interpreter that owns the dependencies.
 sed -i "1s|^#!.*|#!$PYTHON_BIN|" "$WRAPPER_PATH"
 # The deploy is a copy, not a wheel, so there is no dist-info for the package to
-# read. This marker is what `snap-bak --version` and the lock log lines report.
+# read. This marker is what `snap-bak --version` reports.
 INSTALLED_VERSION="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$REPO_ROOT/pyproject.toml" | head -n 1)"
 printf '%s\n' "${INSTALLED_VERSION:-unknown}" > "$VERSION_FILE"
 chown root:root "$VERSION_FILE"
