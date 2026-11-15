@@ -1014,6 +1014,14 @@ per-job lock would add complexity without additional protection.
   sudo-exec.py            # sudo wrapper (root:root 0755)
   config.json            # root-owned, validated by the wrapper
 
+<install>/rollback       # root-only copies of installs this script replaced
+  <timestamp>-XXXXXX/    # one per setup run; never reaped
+    snap_bak/            # the package as it was
+    sudo-exec.py         # the wrapper as it was (when it existed)
+    snap-bak.service     # the unit files as they were (when they existed)
+    snap-bak.timer
+    restore.sh           # puts the above back; run as root
+
 <install>/state          # owned by snap-bak: runtime state
   snap-bak.lock          # Global lock file
   throughput.json        # Per-repo transfer-rate history
@@ -1039,6 +1047,13 @@ State for a job that has left the config is deleted once it has been gone for
 its file is rewritten every run, and reaping it would reset the missed-slot
 escalation that drives priority. Queued work is never reaped: an entry is a
 request from a human.
+
+`rollback` is written only by the setup script, and only when it replaces an
+existing package. Each directory is a complete copy of the program, the wrapper
+and the unit files, plus the `restore.sh` that puts them back; config, state,
+cache, passwords and excludes are outside it because an upgrade never touches
+them. Nothing reaps these directories, so an operator deletes them by hand once
+the new install has proven itself.
 
 All paths are relative to the install directory (`<install>`, production
 `/opt/snap-bak`). The `restic` and `rclone` binaries are optional (rclone only

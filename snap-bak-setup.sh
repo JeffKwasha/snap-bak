@@ -42,10 +42,59 @@ PKG_PATH="$SNAPBAK_DIR/snap_bak"
 SERVICE_NAME="snap-bak"
 STATE_DIR="$SNAPBAK_DIR/state"
 CACHE_DIR="$SNAPBAK_DIR/cache"
+UNIT_DIR="/etc/systemd/system"
+ROLLBACK_ROOT="$SNAPBAK_DIR/rollback"
 
 # Source files co-located with this setup script (repo layout: src/snap_bak/).
 PKG_SRC="$(dirname "$(readlink -f "$0")")/src/snap_bak"
 WRAPPER_SRC="$(dirname "$(readlink -f "$0")")/src/sudo-exec.py"
+
+# Copy the install that is about to be replaced, and write the script that puts
+# it back. Config, state, cache, passwords and excludes stay out of the copy:
+# an upgrade never modifies them, so a rollback never restores them.
+save_previous_install() {
+    [ -d "$PKG_PATH" ] || return 0
+    local dest
+    local unit
+    mkdir -p "$ROLLBACK_ROOT"
+    dest="$(mktemp -d "$ROLLBACK_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
+    cp -a "$PKG_PATH" "$dest/snap_bak"
+    if [ -f "$WRAPPER_PATH" ]; then
+        cp -a "$WRAPPER_PATH" "$dest/sudo-exec.py"
+    fi
+    for unit in "$SERVICE_NAME.service" "$SERVICE_NAME.timer"; do
+        if [ -f "$UNIT_DIR/$unit" ]; then
+            cp -a "$UNIT_DIR/$unit" "$dest/$unit"
+        fi
+    done
+    cat > "$dest/restore.sh" <<EOF
+#!/bin/bash
+set -e
+if [ "\$EUID" -ne 0 ]; then
+    echo "restore.sh must run as root." >&2
+    exit 1
+fi
+systemctl stop $SERVICE_NAME.timer || true
+rm -rf "$PKG_PATH"
+cp -a "$dest/snap_bak" "$PKG_PATH"
+if [ -f "$dest/sudo-exec.py" ]; then
+    install -o root -g root -m 0755 "$dest/sudo-exec.py" "$WRAPPER_PATH"
+fi
+for unit in $SERVICE_NAME.service $SERVICE_NAME.timer; do
+    if [ -f "$dest/\$unit" ]; then
+        install -o root -g root -m 0644 "$dest/\$unit" "$UNIT_DIR/\$unit"
+    fi
+done
+chown -R root:root "$PKG_PATH"
+systemctl daemon-reload
+if systemctl is-enabled --quiet $SERVICE_NAME.timer 2>/dev/null; then
+    systemctl start $SERVICE_NAME.timer
+fi
+EOF
+    chmod 0755 "$dest/restore.sh"
+    chown -R root:root "$dest"
+    echo "[*] Previous install saved to $dest (undo: sudo $dest/restore.sh)"
+}
 
 # --- 0. PYTHON DEPENDENCIES (for configured Python) ---
 # The service and wrapper share one configured interpreter (PYTHON_BIN), and
@@ -108,6 +157,7 @@ fi
 # The package is installed as a directory (imported as `snap_bak`); systemd
 # runs `python3 -m snap_bak.cli`. Remove any stale flat-installed files from the
 # pre-package layout, then install the package and the wrapper.
+save_previous_install
 rm -rf "$PKG_PATH"
 for stale in cli.py config.py job.py restic.py snapshot.py; do
     rm -f "$SNAPBAK_DIR/$stale"
@@ -335,7 +385,7 @@ fi
 
 # --- 4. CREATE SYSTEMD SERVICE ---
 echo "[*] Creating systemd service: $SERVICE_NAME.service"
-cat <<EOF > "/etc/systemd/system/$SERVICE_NAME.service"
+cat <<EOF > "$UNIT_DIR/$SERVICE_NAME.service"
 [Unit]
 Description=Snap-Bak Backup Orchestrator
 After=network-online.target
@@ -356,7 +406,7 @@ EOF
 # --- 5. CREATE SYSTEMD TIMER ---
 TIMER_SCHEDULE="hourly"
 echo "[*] Creating systemd timer: $SERVICE_NAME.timer (Schedule: $TIMER_SCHEDULE)"
-cat <<EOF > "/etc/systemd/system/$SERVICE_NAME.timer"
+cat <<EOF > "$UNIT_DIR/$SERVICE_NAME.timer"
 [Unit]
 Description=Run Snap-Bak Orchestrator periodically
 
@@ -369,7 +419,7 @@ WantedBy=timers.target
 EOF
 
 # Ensure generated unit files are readable regardless of root's umask.
-chmod 0644 "/etc/systemd/system/$SERVICE_NAME.service" "/etc/systemd/system/$SERVICE_NAME.timer"
+chmod 0644 "$UNIT_DIR/$SERVICE_NAME.service" "$UNIT_DIR/$SERVICE_NAME.timer"
 
 # --- 6. FINALIZE ---
 echo "[*] Reloading systemd daemon..."

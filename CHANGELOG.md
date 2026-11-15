@@ -3,6 +3,17 @@
 All notable changes to snap-bak are documented here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] — 2026-11-15
+
+### Added
+
+- `snap-bak-setup.sh` saves the install it is about to replace under
+  `/opt/snap-bak/rollback/<UTC timestamp>-XXXXXX/`, with the package, the
+  wrapper, the unit files and a `restore.sh` that puts them back. Config,
+  state, cache, passwords and excludes are not copied: an upgrade never
+  modifies them, so a rollback never has to restore them. This gives an
+  upgrade of an existing install a one-command undo.
+
 ## [0.5.0] — 2026-10-25 — first public release
 
 snap-bak orchestrates btrfs snapshots and restic backups: local snapshots for
@@ -33,6 +44,13 @@ handled in one place.
   permission gate for restic password files.
 - **An agent skill** (`.opencode/skills/snap-bak/`) describing how to verify a
   deployment and work out an exclude change.
+
+### Fixed
+
+- The root wrapper reports every device in the btrfs pool hosting a job's
+  source, not only the devices listed before the mounted one. On a multi-device
+  pool the power-saving gate could miss a spun-down disk and start a snapshot
+  that woke it.
 
 ### Behaviour worth knowing
 

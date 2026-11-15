@@ -121,6 +121,17 @@ The setup script is **idempotent** — re-running it is safe: it skips the user,
 group, and existing `config.json` (so your edits are preserved), refreshes the
 program + unit files, re-validates sudoers and re-runs the restic update.
 
+Before it replaces the program, it saves the previous install under
+`/opt/snap-bak/rollback/<UTC timestamp>-XXXXXX/` with the package, the wrapper,
+the unit files and a `restore.sh`. To undo an upgrade:
+
+```bash
+sudo /opt/snap-bak/rollback/<UTC timestamp>-XXXXXX/restore.sh
+```
+
+The saved copy holds no config, state, cache or passwords, because an upgrade
+never modifies those.
+
 ## How It Works
 
 ### What snap-bak does
