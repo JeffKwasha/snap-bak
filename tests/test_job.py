@@ -1,5 +1,6 @@
 """Tests for snap_bak.job: errors, lock helpers, status, Runner decisions."""
 
+import logging
 import subprocess
 import types
 from datetime import UTC, datetime
@@ -7,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from snap_bak import config
+from snap_bak import __version__, config
 from snap_bak import job as job_mod
 from snap_bak.job import (
     CredentialsError,
@@ -419,3 +420,26 @@ def test_a_missing_snapshot_dir_is_caught_before_anything_is_written(
         Runner(broken).create_snapshot()
     assert caught.value.code == config.EXIT_CONFIG_ERROR
     assert "Snapshot directory does not exist" in caplog.text
+
+
+class TestGlobalLockLog:
+    def test_both_lines_name_the_version_and_the_lock_mtime(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        lock_file = tmp_path / "snap-bak.lock"
+        monkeypatch.setattr(config, "GLOBAL_LOCK_FILE", lock_file)
+        with caplog.at_level(logging.INFO):
+            lock = job_mod.GlobalLock()
+            lock.__enter__()
+            mtime = datetime.fromtimestamp(lock_file.stat().st_mtime, UTC).isoformat()
+            lock.__exit__(None, None, None)
+
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("Global lock")
+        ]
+        assert len(lines) == 2
+        for line in lines:
+            assert __version__ in line
+            assert mtime in line

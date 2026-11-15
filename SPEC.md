@@ -984,6 +984,9 @@ Prevents multiple snap-bak instances from running simultaneously.
 
 - Lock file: `<state>/snap-bak.lock`, an advisory `flock` (`LOCK_EX|LOCK_NB`).
   Records the holder PID and timestamps for stuck detection.
+- Both transitions log the running version and the lock file's modification time
+  as an ISO 8601 timestamp. The mtime is the value stuck detection ages, so a
+  lock in the journal can be tied to the build that last wrote it.
 - `stuck_threshold` (config, default 3600s): lock age beyond which the holder
   is considered stuck.
 - `stuck_wait` (config, default 300s): total time to keep re-checking a stuck
@@ -1013,11 +1016,13 @@ per-job lock would add complexity without additional protection.
     snapshot.py          # snapshot domain model
   sudo-exec.py            # sudo wrapper (root:root 0755)
   config.json            # root-owned, validated by the wrapper
+  VERSION                # version this install was built from (setup writes it)
 
 <install>/rollback       # root-only copies of installs this script replaced
   <timestamp>-XXXXXX/    # one per setup run; never reaped
     snap_bak/            # the package as it was
     sudo-exec.py         # the wrapper as it was (when it existed)
+    VERSION              # the version marker as it was
     snap-bak.service     # the unit files as they were (when they existed)
     snap-bak.timer
     restore.sh           # puts the above back; run as root
@@ -1049,11 +1054,11 @@ escalation that drives priority. Queued work is never reaped: an entry is a
 request from a human.
 
 `rollback` is written only by the setup script, and only when it replaces an
-existing package. Each directory is a complete copy of the program, the wrapper
-and the unit files, plus the `restore.sh` that puts them back; config, state,
-cache, passwords and excludes are outside it because an upgrade never touches
-them. Nothing reaps these directories, so an operator deletes them by hand once
-the new install has proven itself.
+existing package. Each directory is a complete copy of the program, the wrapper,
+the version marker and the unit files, plus the `restore.sh` that puts them
+back; config, state, cache, passwords and excludes are outside it because an
+upgrade never touches them. Nothing reaps these directories, so an operator
+deletes them by hand once the new install has proven itself.
 
 All paths are relative to the install directory (`<install>`, production
 `/opt/snap-bak`). The `restic` and `rclone` binaries are optional (rclone only

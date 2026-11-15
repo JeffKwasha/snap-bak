@@ -74,7 +74,8 @@ What `snap-bak-setup.sh` does:
 1. Verifies you are `root`, and that Python can import its dependencies.
 2. Creates the `snap-bak` user/group and `/opt/snap-bak`.
 3. Installs the orchestrator package to `/opt/snap-bak/snap_bak/` (root:root
-   0644) and the wrapper to `/opt/snap-bak/sudo-exec.py` (root:root 0755).
+   0644), the wrapper to `/opt/snap-bak/sudo-exec.py` (root:root 0755), and
+   records the version it installed in `/opt/snap-bak/VERSION`.
 4. Validates `/usr/local/bin/restic`, self-updates it to the newest release,
    and applies `cap_dac_read_search` (the wrapper's `update-restic` op).
 5. Writes an annotated example config to `/opt/snap-bak/config.json`.
@@ -123,7 +124,7 @@ program + unit files, re-validates sudoers and re-runs the restic update.
 
 Before it replaces the program, it saves the previous install under
 `/opt/snap-bak/rollback/<UTC timestamp>-XXXXXX/` with the package, the wrapper,
-the unit files and a `restore.sh`. To undo an upgrade:
+the version marker, the unit files and a `restore.sh`. To undo an upgrade:
 
 ```bash
 sudo /opt/snap-bak/rollback/<UTC timestamp>-XXXXXX/restore.sh

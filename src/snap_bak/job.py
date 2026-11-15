@@ -21,7 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TextIO
 
-from snap_bak import config, excludes, restic, snapshot
+from snap_bak import __version__, config, excludes, restic, snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +263,21 @@ def _resolve_lock_contention(stuck_threshold, stuck_wait) -> bool:
     return True
 
 
+def _lock_transition(what: str) -> str:
+    """The acquire/release line: which build took the lock, and the file's mtime.
+
+    The mtime is the value stuck detection ages, in ISO form so a journal line
+    can be compared with the lock file without guessing the timezone.
+    """
+    try:
+        mtime = datetime.fromtimestamp(
+            config.GLOBAL_LOCK_FILE.stat().st_mtime, UTC
+        ).isoformat()
+    except OSError:
+        mtime = "absent"
+    return f"Global lock {what} (version {__version__}, lock mtime {mtime})."
+
+
 class GlobalLock:
     """Exclusive, non-blocking flock with stuck-instance resolution."""
 
@@ -288,15 +303,15 @@ class GlobalLock:
                 break
         self._fh: TextIO | None = fh
         _write_lock_info()
-        logger.info("Global lock acquired.")
+        logger.info(_lock_transition("acquired"))
         return self
 
     def __exit__(self, *exc):
         if self._fh is not None:
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
             self._fh.close()
+        logger.info(_lock_transition("released"))
         config.GLOBAL_LOCK_FILE.unlink(missing_ok=True)
-        logger.info("Global lock released.")
 
 
 def touch_global_lock(job_name=None, snapshot_name=None):

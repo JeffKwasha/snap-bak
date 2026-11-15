@@ -3,6 +3,22 @@
 All notable changes to snap-bak are documented here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.2] — 2026-11-15
+
+### Added
+
+- The global-lock acquire and release lines log the running version and the lock
+  file's modification time as an ISO 8601 timestamp. The mtime is the value
+  stuck detection already ages, so a lock can be tied to the build that last
+  wrote it.
+
+### Fixed
+
+- A copied install reports its real version instead of `unknown`. The setup
+  script writes `/opt/snap-bak/VERSION` from `pyproject.toml`, and the package
+  reads it when no package metadata exists. The rollback copy includes the file,
+  so restoring an older install also restores the version it reports.
+
 ## [0.5.1] — 2026-11-15
 
 ### Added

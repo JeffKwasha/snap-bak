@@ -37,6 +37,7 @@ SERVICE_GROUP="snap-bak"
 SNAPBAK_DIR="/opt/snap-bak"
 MOUNT_BASE="/bak"
 CONFIG_FILE="$SNAPBAK_DIR/config.json"
+VERSION_FILE="$SNAPBAK_DIR/VERSION"
 WRAPPER_PATH="$SNAPBAK_DIR/sudo-exec.py"
 PKG_PATH="$SNAPBAK_DIR/snap_bak"
 SERVICE_NAME="snap-bak"
@@ -46,8 +47,9 @@ UNIT_DIR="/etc/systemd/system"
 ROLLBACK_ROOT="$SNAPBAK_DIR/rollback"
 
 # Source files co-located with this setup script (repo layout: src/snap_bak/).
-PKG_SRC="$(dirname "$(readlink -f "$0")")/src/snap_bak"
-WRAPPER_SRC="$(dirname "$(readlink -f "$0")")/src/sudo-exec.py"
+REPO_ROOT="$(dirname "$(readlink -f "$0")")"
+PKG_SRC="$REPO_ROOT/src/snap_bak"
+WRAPPER_SRC="$REPO_ROOT/src/sudo-exec.py"
 
 # Copy the install that is about to be replaced, and write the script that puts
 # it back. Config, state, cache, passwords and excludes stay out of the copy:
@@ -61,6 +63,9 @@ save_previous_install() {
     cp -a "$PKG_PATH" "$dest/snap_bak"
     if [ -f "$WRAPPER_PATH" ]; then
         cp -a "$WRAPPER_PATH" "$dest/sudo-exec.py"
+    fi
+    if [ -f "$VERSION_FILE" ]; then
+        cp -a "$VERSION_FILE" "$dest/VERSION"
     fi
     for unit in "$SERVICE_NAME.service" "$SERVICE_NAME.timer"; do
         if [ -f "$UNIT_DIR/$unit" ]; then
@@ -79,6 +84,9 @@ rm -rf "$PKG_PATH"
 cp -a "$dest/snap_bak" "$PKG_PATH"
 if [ -f "$dest/sudo-exec.py" ]; then
     install -o root -g root -m 0755 "$dest/sudo-exec.py" "$WRAPPER_PATH"
+fi
+if [ -f "$dest/VERSION" ]; then
+    install -o root -g root -m 0644 "$dest/VERSION" "$VERSION_FILE"
 fi
 for unit in $SERVICE_NAME.service $SERVICE_NAME.timer; do
     if [ -f "$dest/\$unit" ]; then
@@ -171,6 +179,12 @@ find "$PKG_PATH" -type f -exec chmod 0644 {} \;
 install -o root -g root -m 0755 "$WRAPPER_SRC" "$WRAPPER_PATH"
 # Deploy the wrapper on the same interpreter that owns the dependencies.
 sed -i "1s|^#!.*|#!$PYTHON_BIN|" "$WRAPPER_PATH"
+# The deploy is a copy, not a wheel, so there is no dist-info for the package to
+# read. This marker is what `snap-bak --version` and the lock log lines report.
+INSTALLED_VERSION="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$REPO_ROOT/pyproject.toml" | head -n 1)"
+printf '%s\n' "${INSTALLED_VERSION:-unknown}" > "$VERSION_FILE"
+chown root:root "$VERSION_FILE"
+chmod 0644 "$VERSION_FILE"
 echo "[*] Installed $PKG_PATH (root:root 0644) and $WRAPPER_PATH (root:root 0755)."
 
 # --- 1d. VERIFY/UPDATE RESTIC (setcap + self-update via the wrapper) ---
