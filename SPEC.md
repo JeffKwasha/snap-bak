@@ -494,23 +494,25 @@ removes exactly those files from **existing** snapshots.
 
 ### Invariants
 
-1. **The local filesystem is never modified.** Every `show` mode is a read-only
+1. [[R-EXCL-01]] **The local filesystem is never modified.** Every `show` mode is a read-only
    walk; `apply` never touches the live subvolume, `snapshot_dir`, or any btrfs
    snapshot. Patterns are only ever applied to restic snapshots. The only local
    write any of them performs is restic's own cache, and restic's repository
    lock file is created and released per invocation — both restic-managed.
-2. **Snapshots are never mounted to test patterns.** Matching runs against the
+2. [[R-EXCL-02]] **Snapshots are never mounted to test patterns.** Matching runs against the
    path *strings* restic stored, so no mount can race an in-flight backup.
-3. **Editing `excludes` alone changes nothing retroactively.** Removal requires
+3. [[R-EXCL-03]] **Editing `excludes` alone changes nothing retroactively.** Removal requires
    an explicit `apply` (`--now` / `--later`). There is no config key that
    schedules it.
-4. **No persistent config key arms removal implicitly.** The default is `off`.
-5. **The dry-run and the run are the same plan.** `plan()` decides scope and
+4. [[R-EXCL-04]] **No persistent config key arms removal implicitly.** The default is `off`.
+5. [[R-EXCL-05]] **The dry-run and the run are the same plan.** `plan()` decides scope and
    `execute()` performs it; `show excludes --repo`, the `apply` dry-run, and
    every mutating path call that one pair. A selector that would target the live
    filesystem or local snapshots is refused by `apply` rather than ignored.
 
 ### Commands
+
+[[R-EXCL-06]]
 
 ```
 snap-bak show excludes [--live | --snaps | --repo | --all]
@@ -521,53 +523,57 @@ snap-bak show excludes [--live | --snaps | --repo | --all]
 snap-bak apply excludes [--now | --later] [--job NAME] [--json] [--limit N]
 ```
 
-Grouped by verb: `show` is read-only, `apply` is the only mutating command.
-Pattern linting runs on every `show`, silently when clean, so there is no
-`--lint` flag — it is not optional, and offering it would imply the modes skip it.
+[[R-EXCL-07]] Grouped by verb: `show` is read-only, `apply` is the only mutating
+command. [[R-EXCL-08]] Pattern linting runs on every `show`, silently when clean,
+so there is no `--lint` flag — it is not optional, and offering it would imply
+the modes skip it.
 
-**`show excludes` with no selector defaults to `--live`.** The default walk is
-shallow, because that is exactly what restic's own walker does: a matched
-directory is pruned unread, so the report pays one `readdir` for a directory
-restic would skip anyway, not a stat per file beneath it. Its size is therefore
-unknown, and unknown is printed as `?` (see *Priced, unpriced, priced in part*).
-`--price` restores the old exact behaviour when the numbers are wanted more than
-the time.
+[[R-EXCL-09]] **`show excludes` with no selector defaults to `--live`.**
+[[R-EXCL-10]] The default walk is shallow, because that is exactly what restic's
+own walker does: a matched directory is pruned unread, so the report pays one
+`readdir` for a directory restic would skip anyway, not a stat per file beneath
+it. Its size is therefore unknown, and unknown is printed as `?` (see *Priced,
+unpriced, priced in part*). [[R-EXCL-11]] `--price` restores the old exact
+behaviour when the numbers are wanted more than the time.
 
-`apply excludes` operates on restic only and **assumes `--repo`**. Passing
-`--live`, `--snaps` or `--all` to it is an error with an explanation, not a flag
-that is quietly discarded: those name sources `apply` never removes files from.
+[[R-EXCL-12]] `apply excludes` operates on restic only and **assumes `--repo`**.
+Passing `--live`, `--snaps` or `--all` to it is an error with an explanation, not
+a flag that is quietly discarded: those name sources `apply` never removes files
+from.
 
 ### Trial pattern sets
 
-`--excludes-file PATH` and `-e PATTERN` let `show` evaluate a working rule set
-without the root-owned config being edited. They **add to** the job's patterns
-rather than replacing them, and the config is never modified — not even when the
-command is a dry-run.
+[[R-EXCL-13]] `--excludes-file PATH` and `-e PATTERN` let `show` evaluate a
+working rule set without the root-owned config being edited. They **add to** the
+job's patterns rather than replacing them, and the config is never modified — not
+even when the command is a dry-run.
 
-Both take **exactly the syntax an `ignore_file` uses**: one restic exclude
-pattern per line, `#` comments, `!` negation, `$VAR` expansion. A rule can be
-copied between the two unchanged, which is the point: working in a file is the
-normal way to edit patterns, and re-typing dozens of `-e` arguments is not.
+[[R-EXCL-14]] Both take **exactly the syntax an `ignore_file` uses**: one restic
+exclude pattern per line, `#` comments, `!` negation, `$VAR` expansion. A rule
+can be copied between the two unchanged, which is the point: working in a file
+is the normal way to edit patterns, and re-typing dozens of `-e` arguments is
+not.
 
-Effective order, which is the part that constrains what a trial can express:
+[[R-EXCL-15]] Effective order, which is the part that constrains what a trial can
+express:
 
 ```
 config patterns  →  --excludes-file patterns  →  -e patterns
 ```
 
-Duplicates are dropped keeping first occurrence (`dict.fromkeys`), so a rule
-named both on the command line and in the file is one rule, announced once. Not
-a plain `set`: restic applies `!` negation sequentially, so order changes
-answers and a set would silently reorder the user's rules.
+[[R-EXCL-16]] Duplicates are dropped keeping first occurrence (`dict.fromkeys`),
+so a rule named both on the command line and in the file is one rule, announced
+once. Not a plain `set`: restic applies `!` negation sequentially, so order
+changes answers and a set would silently reorder the user's rules.
 
 Two consequences, which are easy to assume otherwise and cut in opposite
 directions:
 
-- **A trial's `!` does override a config rule naming the same target.**
+- [[R-EXCL-17]] **A trial's `!` does override a config rule naming the same target.**
   Negation is sequential and the trial's rules are evaluated after the config's,
   so `-e '!cache'` cancels a configured `cache`. What a trial cannot do is
   *reorder* — the effective order is fixed at `config → file → -e`.
-- **A trial's `!` cannot reach *inside* a directory an earlier pattern already
+- [[R-EXCL-18]] **A trial's `!` cannot reach *inside* a directory an earlier pattern already
   matched.** Those patterns run first and prune the directory, so restic never
   descends and the later `!` has nothing to act on — the same prune semantics as
   any other walk (see *Pattern matching*). Both `!node_modules/keepme/` and
@@ -580,17 +586,17 @@ directions:
 So a trial set is not strictly "tightening only": it can cancel a rule outright,
 and it can never reach beneath a pruned directory.
 
-An unreadable trial file exits 1 naming the path. Falling back silently to the
-config's rules would report figures the caller did not ask for.
+[[R-EXCL-19]] An unreadable trial file exits 1 naming the path. Falling back
+silently to the config's rules would report figures the caller did not ask for.
 
-`apply` refuses `--excludes-file`, `-e`, `--reveal`, `--reveal-file` and
-`--price` with an explanation: rewriting real backups against rules the
+[[R-EXCL-20]] `apply` refuses `--excludes-file`, `-e`, `--reveal`, `--reveal-file`
+and `--price` with an explanation: rewriting real backups against rules the
 deployment does not use would remove data on the strength of an experiment. The
 trial and the survey belong to `show`; `apply` acts only on what is configured.
 
-Without `-v`, a trial lists only rows attributed to its **own added rules** — the
-config's rules are already in force and would bury the answer. Totals always
-cover the whole set.
+[[R-EXCL-21]] Without `-v`, a trial lists only rows attributed to its **own added
+rules** — the config's rules are already in force and would bury the answer.
+Totals always cover the whole set.
 
 ### Priced, unpriced, priced in part
 
@@ -599,42 +605,42 @@ inside, so nothing beneath is matched, counted or stored. `show excludes` used t
 crawl every matched subtree anyway to print exact sizes — on a real `/home` that
 is over a million entries and minutes of I/O the backup itself never pays.
 
-The default `--live`/`--snaps` walk now prunes the same way, so its decisions are
-restic's decisions. A matched directory is one row with unknown counts, printed
-as `?`. **Restic parity is the point**: the report must never suggest `--live`
-knows something a backup would decide differently.
+[[R-EXCL-22]] The default `--live`/`--snaps` walk now prunes the same way, so its
+decisions are restic's decisions. A matched directory is one row with unknown
+counts, printed as `?`. **Restic parity is the point**: the report must never
+suggest `--live` knows something a backup would decide differently.
 
-- `?` — the whole number is unknown: the directory was pruned unread (restic's
+- [[R-EXCL-23]] `?` — the whole number is unknown: the directory was pruned unread (restic's
   own behaviour), so no size was paid for. One spelling, in every format; empty
   (not `0`) in CSV, which would otherwise claim "scanned, nothing there".
-- `+?` — the price covers only part of what the rule matched: entries vanished
+- [[R-EXCL-24]] `+?` — the price covers only part of what the rule matched: entries vanished
   or could not be read mid-walk, or a revealed directory contains children the
   configuration already excludes. Both numbers carry `+?` where they are printed
   separately; the console cell puts it at the end.
 
-`--price` walks matched directories for exact totals — the old behaviour, and the
-only way to fill in a `?`. It costs a stat per file beneath every rule, which is
-what made the default slow.
+[[R-EXCL-11]] `--price` walks matched directories for exact totals — the old
+behaviour, and the only way to fill in a `?`. It costs a stat per file beneath
+every rule, which is what made the default slow.
 
-`--reveal PATTERN` (repeatable) and `--reveal-file PATH` are the what-if
-counterpart: treat PATTERN as an extra rule and show everything it would newly
-exclude. A revealed directory is descended, priced whole, and — even without
-`-v` — listed file by file. Two precedence rules keep the answer honest:
+[[R-EXCL-25]] `--reveal PATTERN` (repeatable) and `--reveal-file PATH` are the
+what-if counterpart: treat PATTERN as an extra rule and show everything it would
+newly exclude. A revealed directory is descended, priced whole, and — even
+without `-v` — listed file by file. Two precedence rules keep the answer honest:
 
-- **A reveal pattern whose text is already a configured rule *is* that rule,
+- [[R-EXCL-26]] **A reveal pattern whose text is already a configured rule *is* that rule,
   revealed all along**: the directory is descended as if it had always been
   reveal.
-- **Everything else follows restic's order: the config's patterns come first.**
+- [[R-EXCL-27]] **Everything else follows restic's order: the config's patterns come first.**
   A different configured rule that matches first has already removed the entry,
-  so the candidate adds nothing there. Inside a revealed directory the direct
+  so the candidate adds nothing there. [[R-EXCL-28]] Inside a revealed directory the direct
   children the config already excludes get their own unpriced rows (they are not
-  what the candidate adds) and mark the revealed row `+?`. Deeper rules are not
+  what the candidate adds) and mark the revealed row `+?`. [[R-EXCL-29]] Deeper rules are not
   re-consulted: restic pruned the directory at the match, so nothing beneath it
   was ever evaluated — pricing the whole subtree under the revealed rule is the
   parity-true answer.
 
-A reveal pattern is never handed to restic or `apply`: run the survey, then copy
-the pattern into the job's `ignore_file` to make it real.
+[[R-EXCL-30]] A reveal pattern is never handed to restic or `apply`: run the
+survey, then copy the pattern into the job's `ignore_file` to make it real.
 
 | Selector | Source | Cost |
 |----------|--------|------|
@@ -645,13 +651,13 @@ the pattern into the job's `ignore_file` to make it real.
 | `--repo` | files stored in restic snapshots | **network** (`restic snapshots` + `restic ls` per snapshot) |
 | `--all` | every selector above | includes the network path |
 
-A selector adds a **column**, not a separate report: the same table is rendered
-from whichever sources were scanned, and one invocation emits exactly one
-document. Two JSON objects on stdout is not a JSON document, and three CSV
-headers is not a table.
+[[R-EXCL-31]] A selector adds a **column**, not a separate report: the same
+table is rendered from whichever sources were scanned, and one invocation emits
+exactly one document. Two JSON objects on stdout is not a JSON document, and
+three CSV headers is not a table.
 
-`--limit N` bounds the per-file rows under `-v`; rule rows and every total cover
-the full set.
+[[R-EXCL-32]] `--limit N` bounds the per-file rows under `-v`; rule rows and
+every total cover the full set.
 
 ### Pattern matching
 

@@ -126,3 +126,35 @@ Conventions:
 | [[R-WINDOW-03]] | SPEC.md | Backup Window |
 | [[R-WINDOW-04]] | SPEC.md | Backup Window |
 | [[R-WINDOW-05]] | SPEC.md | Backup Window |
+| [[R-EXCL-01]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-02]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-03]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-04]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-05]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-06]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-07]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-08]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-09]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-10]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-11]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-12]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-13]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-14]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-15]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-16]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-17]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-18]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-19]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-20]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-21]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-22]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-23]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-24]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-25]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-26]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-27]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-28]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-29]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-30]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-31]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-EXCL-32]] | SPEC.md | Excludes: Inspection & Application |
