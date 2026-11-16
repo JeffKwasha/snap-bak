@@ -423,13 +423,15 @@ If multiple jobs share a repo:
 
 ### Effective Priority
 
+[[R-PRIORITY-01]]
+
 ```
 effective_priority = job.priority × (job.missed_slots + 1)
 ```
 
-- Higher effective priority processed first
-- `missed_slots` accumulates when a job is delayed
-- Reset to 0 on success
+- [[R-PRIORITY-02]] Higher effective priority processed first
+- [[R-PRIORITY-03]] `missed_slots` accumulates when a job is delayed
+- [[R-PRIORITY-04]] Reset to 0 on success
 - Default priority: 100
 
 ### Example
@@ -446,18 +448,18 @@ B runs first (400), then C (200), then A (100).
 
 ## Snapshot Naming
 
-- Format: `YYYY-MM-DD_HH:MMZ`
-- This is the only accepted format. Snapshots with any other naming convention are ignored.
+- [[R-SNAP-01]] Format: `YYYY-MM-DD_HH:MMZ`
+- [[R-SNAP-02]] This is the only accepted format. Snapshots with any other naming convention are ignored.
 
 ### Selection Logic
 
-1. **Normal backup**: Find oldest snapshot within `backup_interval` seconds
-2. **Fallback**: If none within interval, use latest snapshot
-3. **Delayed retry**: Use exact same snapshot (from `protected_snapshot` field)
+1. [[R-SNAP-03]] **Normal backup**: Find oldest snapshot within `backup_interval` seconds
+2. [[R-SNAP-04]] **Fallback**: If none within interval, use latest snapshot
+3. [[R-SNAP-05]] **Delayed retry**: Use exact same snapshot (from `protected_snapshot` field)
 
 ### Safety Rule
 
-**Never backup a snapshot newer than 12 hours old.**
+[[R-SNAP-06]] **Never backup a snapshot newer than 12 hours old.**
 
 A snapshot younger than 12 hours is skipped (never failed), so a snapshot just
 created by the scheduler is only uploaded after it has had time to be noticed
@@ -469,14 +471,14 @@ and reviewed.
 
 ### Format
 
-- `backup_window_start`: `HH:MM` (e.g., `"22:00"`)
-- `backup_window_end`: `HH:MM` (e.g., `"06:00"`)
+- [[R-WINDOW-01]] `backup_window_start`: `HH:MM` (e.g., `"22:00"`)
+- [[R-WINDOW-02]] `backup_window_end`: `HH:MM` (e.g., `"06:00"`)
 
 ### Support
 
-- Same-day windows (e.g., 09:00 to 17:00)
-- Overnight windows (e.g., 22:00 to 06:00)
-- No window = always allowed
+- [[R-WINDOW-03]] Same-day windows (e.g., 09:00 to 17:00)
+- [[R-WINDOW-04]] Overnight windows (e.g., 22:00 to 06:00)
+- [[R-WINDOW-05]] No window = always allowed
 
 ---
 

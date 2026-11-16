@@ -111,3 +111,18 @@ Conventions:
 | [[R-DELAY-10]] | SPEC.md | Delayed Job Handling |
 | [[R-DELAY-11]] | SPEC.md | Delayed Job Handling |
 | [[R-DELAY-12]] | SPEC.md | Delayed Job Handling |
+| [[R-PRIORITY-01]] | SPEC.md | Priority System |
+| [[R-PRIORITY-02]] | SPEC.md | Priority System |
+| [[R-PRIORITY-03]] | SPEC.md | Priority System |
+| [[R-PRIORITY-04]] | SPEC.md | Priority System |
+| [[R-SNAP-01]] | SPEC.md | Snapshot Naming |
+| [[R-SNAP-02]] | SPEC.md | Snapshot Naming |
+| [[R-SNAP-03]] | SPEC.md | Snapshot Naming |
+| [[R-SNAP-04]] | SPEC.md | Snapshot Naming |
+| [[R-SNAP-05]] | SPEC.md | Snapshot Naming |
+| [[R-SNAP-06]] | SPEC.md | Snapshot Naming |
+| [[R-WINDOW-01]] | SPEC.md | Backup Window |
+| [[R-WINDOW-02]] | SPEC.md | Backup Window |
+| [[R-WINDOW-03]] | SPEC.md | Backup Window |
+| [[R-WINDOW-04]] | SPEC.md | Backup Window |
+| [[R-WINDOW-05]] | SPEC.md | Backup Window |
