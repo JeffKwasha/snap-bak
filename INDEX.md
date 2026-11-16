@@ -231,3 +231,5 @@ Conventions:
 | [[R-EXCL-66]] | SPEC.md | The report, What counts as a file, -v, Output formats |
 | [[R-EXCL-67]] | SPEC.md | The report, What counts as a file, -v, Output formats |
 | [[R-EXCL-68]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-THROUGHPUT-01]] | SPEC.md | Throughput History |
+| [[R-THROUGHPUT-02]] | SPEC.md | Throughput History |

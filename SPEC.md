@@ -1101,9 +1101,9 @@ used.
 
 ## Throughput History
 
-Transfer rate statistics are kept per repo to provide stable backup time
-estimates. If the state directory is unwritable, the rate is logged and the run
-continues.
+[[R-THROUGHPUT-01]] Transfer rate statistics are kept per repo to provide stable
+backup time estimates. [[R-THROUGHPUT-02]] If the state directory is unwritable,
+the rate is logged and the run continues.
 
 ---
 
