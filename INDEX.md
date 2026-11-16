@@ -269,3 +269,20 @@ Conventions:
 | [[R-ENV-04]] | SPEC.md | CLI, Environment Variables |
 | [[R-ENV-05]] | SPEC.md | CLI, Environment Variables |
 | [[R-ENV-06]] | SPEC.md | CLI, Environment Variables |
+| [[R-PRIV-01]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-02]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-03]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-04]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-05]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-06]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-07]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-08]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-09]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-10]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-11]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-12]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-13]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-14]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-15]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-16]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-17]] | SPEC.md | Privileged Operations & Security |

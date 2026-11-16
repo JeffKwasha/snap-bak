@@ -1203,65 +1203,67 @@ locked/bad-password codes) when the preflight aborts, so a caller can distinguis
 
 ## Privileged Operations & Security
 
-Btrfs snapshot create/delete and mount/umount require root. snap-bak runs as
-an unprivileged service user and delegates these to a **root-owned wrapper**
-(`sudo-exec.py`), reachable via a single static sudoers rule:
+[[R-PRIV-01]] Btrfs snapshot create/delete and mount/umount require root.
+snap-bak runs as an unprivileged service user and delegates these to a
+**root-owned wrapper** (`sudo-exec.py`), reachable via a single static sudoers
+rule:
 
 ```
 snap-bak ALL=(root) NOPASSWD:/opt/snap-bak/sudo-exec.py
 ```
 
-A bare command name (no arguments listed) matches any arguments, per
-sudoers(5). This is valid on both sudo-rs and sudo.ws; a trailing `*` is
+[[R-PRIV-02]] A bare command name (no arguments listed) matches any arguments,
+per sudoers(5). This is valid on both sudo-rs and sudo.ws; a trailing `*` is
 deliberately NOT used because sudo-rs mishandles it. The wrapper:
 
-- Accepts only `snapshot|delete|mount|umount <job> [snapshot]`, `status <job>`,
+- [[R-PRIV-03]] Accepts only `snapshot|delete|mount|umount <job> [snapshot]`, `status <job>`,
   and `update-restic`.
-- Validates `<job>` against the root-owned `/opt/snap-bak/config.json`.
-- Validates `[snapshot]` against `^\d{4}-\d{2}-\d{2}_\d{2}:\d{2}$`.
-- Confines every path under the job's `snapshot_dir` / `mount_base`
+- [[R-PRIV-04]] Validates `<job>` against the root-owned `/opt/snap-bak/config.json`.
+- [[R-PRIV-05]] Validates `[snapshot]` against `^\d{4}-\d{2}-\d{2}_\d{2}:\d{2}$`.
+- [[R-PRIV-06]] Confines every path under the job's `snapshot_dir` / `mount_base`
   (via `os.path.realpath` traversal guard).
-- Executes `btrfs`, `mount`, `umount` with config-derived paths.
-- Mounts snapshots read-only at `<mount_base>/<source_subvolume last
+- [[R-PRIV-07]] Executes `btrfs`, `mount`, `umount` with config-derived paths.
+- [[R-PRIV-08]] Mounts snapshots read-only at `<mount_base>/<source_subvolume last
   component>` using `mount -o bind,ro` (btrfs has no uid/gid mount options).
   The mount point always mirrors the real filesystem path (e.g.
   `/mnt/data` -> `<mount_base>/data`) and stays stable across
   backups (restic change-tracking keys on the source path); it is never
   configurable. `<name>` is only a display id and does not affect the mount
   point.
-- `update-restic` validates that the restic binary is a root-owned regular
+- [[R-PRIV-09]] `update-restic` validates that the restic binary is a root-owned regular
   file in a root-owned, non-writable directory (rejecting symlinks and
   group/other-writable paths), runs `restic self-update` (GPG-verified), and
   re-applies `setcap cap_dac_read_search=+ep` — restic reads root-owned
-  snapshots via this capability. Exit codes: `0` ok, `2` self-update failed
-  (existing binary retained, setcap applied), `3` binary missing/unusable,
-  `4` setcap failed.
+  snapshots via this capability. [[R-PRIV-10]] Exit codes: `0` ok, `2`
+  self-update failed (existing binary retained, setcap applied), `3` binary
+  missing/unusable, `4` setcap failed.
 
-Because the wrapper derives paths from config at runtime, changing
+[[R-PRIV-11]] Because the wrapper derives paths from config at runtime, changing
 `mount_base` or `snapshot_dir` never requires editing sudoers.
 
 Invariants snap-bak must never breach:
 
-1. **Least privilege.** Only `sudo-exec.py` performs privileged operations.
+1. [[R-PRIV-12]] **Least privilege.** Only `sudo-exec.py` performs privileged operations.
    snap-bak is granted none of them; sudo permits only the wrapper.
-2. **Root-owned files.** `sudo-exec.py`, `config.json`, and the restic binary
+2. [[R-PRIV-13]] **Root-owned files.** `sudo-exec.py`, `config.json`, and the restic binary
    are root-owned, not writable by group/other — the wrapper is the root
    boundary, config is its trusted input, and restic carries
    `cap_dac_read_search`. Writable by snap-bak ⇒ trivial root escalation.
-3. **Trust boundary.** `sudo-exec.py` is trusted, snap-bak is not. The wrapper
+3. [[R-PRIV-14]] **Trust boundary.** `sudo-exec.py` is trusted, snap-bak is not. The wrapper
    validates every argument against root-owned config; privileged ops never
    trust snap-bak-supplied paths/arguments.
-4. **Update trust delegated to restic.** `restic self-update` verifies the
+4. [[R-PRIV-15]] **Update trust delegated to restic.** `restic self-update` verifies the
    download against the PGP key embedded in the binary and the GPG-signed
    `SHA256SUMS`. snap-bak adds no signature checks and must not bypass
    restic's. — [stable releases](https://restic.readthedocs.io/en/stable/020_installation.html#stable-releases)
-5. **restic execution restricted.** The binary (with `cap_dac_read_search=+ep`)
+5. [[R-PRIV-16]] **restic execution restricted.** The binary (with `cap_dac_read_search=+ep`)
    is executable only by root and snap-bak. — [file capabilities](https://restic.readthedocs.io/en/stable/080_examples.html#using-file-capabilities)
 
-**NOTE:** anyone able to run the restic binary with `cap_dac_read_search=+ep`
-can read files bypassing permissions. Only `sudo-exec.py` may run it, and it
-sets restic's source/destination itself — without trusted control over
-restic's arguments, snap-bak could "back up" secret files to Mallory.
+[[R-PRIV-17]] **NOTE:** anyone able to run the restic binary with
+`cap_dac_read_search=+ep` can read files bypassing permissions. Only
+`sudo-exec.py` may run it, and it sets restic's source/destination itself —
+without trusted control over restic's arguments, snap-bak could "back up"
+secret files to Mallory.
 
 **TODO:** snap-bak currently runs restic directly, building source/repo args
 from config (job.py). Requirement 5's "wrapper sets destination itself"
