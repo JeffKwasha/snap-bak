@@ -3,6 +3,24 @@
 All notable changes to snap-bak are documented here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] — 2026-11-16
+
+### Changed
+
+- The install is a standard Python one. The setup script creates
+  `/opt/snap-bak/venv` from the base interpreter, pip-installs the project and
+  its dependencies into it, and the unit, the wrapper and the launcher run that
+  interpreter. PEP 668 never applies and the system Python is never modified.
+- `snap-bak --version` reports the installed distribution's metadata. The
+  `VERSION` marker and the copy layout are gone; the first run after 0.6
+  removes both and backs them up so the migration can be rolled back.
+- `python3 -m venv` must work (Debian/Ubuntu: `python3-venv`), and the first
+  install needs PyPI access for the build backend and the dependencies.
+
+### Removed
+
+- The copied `snap_bak/` package directory and the `VERSION` file.
+
 ## [0.6.0] — 2026-11-15
 
 ### Added

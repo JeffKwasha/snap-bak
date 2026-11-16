@@ -22,7 +22,7 @@ snap-bak [-c CONFIG] [-j JOB] [-n] [--log-file PATH] [-l] [--version] [show|appl
 | `-n, --dry-run` | Preflight and plan, but no upload and no deletion |
 | `--log-file PATH` | Also write logs to a file (default: stderr only) |
 | `-l, --list-jobs` | Print resolved job names and exit |
-| `--version` | Print the installed version (the `VERSION` marker, else package metadata) and exit |
+| `--version` | Print the installed distribution version and exit |
 
 With no subcommand, snap-bak performs a full scheduled run.
 

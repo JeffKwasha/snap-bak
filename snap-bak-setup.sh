@@ -21,8 +21,9 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# The interpreter the service and the wrapper will share. python3 by default;
-# PYTHON_BIN overrides it for a virtualenv or a non-system install.
+# The interpreter that creates the venv. python3 by default; PYTHON_BIN
+# overrides it for a non-system install. The venv it creates is what the
+# service, the wrapper and the command actually run.
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 2>/dev/null)}"
 if [ -z "$PYTHON_BIN" ] || [ ! -x "$PYTHON_BIN" ]; then
     echo "[!] No python3 on PATH and PYTHON_BIN is unset." >&2
@@ -37,10 +38,12 @@ SERVICE_GROUP="snap-bak"
 SNAPBAK_DIR="/opt/snap-bak"
 MOUNT_BASE="/bak"
 CONFIG_FILE="$SNAPBAK_DIR/config.json"
-VERSION_FILE="$SNAPBAK_DIR/VERSION"
+VERSION_FILE="$SNAPBAK_DIR/VERSION"   # legacy marker; removed by this install
 CLI_PATH="/usr/local/bin/snap-bak"
 WRAPPER_PATH="$SNAPBAK_DIR/sudo-exec.py"
-PKG_PATH="$SNAPBAK_DIR/snap_bak"
+PKG_PATH="$SNAPBAK_DIR/snap_bak"      # legacy copy layout; removed by this install
+VENV_DIR="$SNAPBAK_DIR/venv"
+VENV_PY="$VENV_DIR/bin/python"
 SERVICE_NAME="snap-bak"
 STATE_DIR="$SNAPBAK_DIR/state"
 CACHE_DIR="$SNAPBAK_DIR/cache"
@@ -52,21 +55,43 @@ REPO_ROOT="$(dirname "$(readlink -f "$0")")"
 PKG_SRC="$REPO_ROOT/src/snap_bak"
 WRAPPER_SRC="$REPO_ROOT/src/sudo-exec.py"
 
-# Copy the install that is about to be replaced, and write the script that puts
-# it back. Config, state, cache, passwords and excludes stay out of the copy:
-# an upgrade never modifies them, so a rollback never restores them.
+# Where the installed distribution lives today, for the rollback copy. Empty
+# until there is a venv.
+EXISTING_SITE=""
+if [ -x "$VENV_PY" ]; then
+    EXISTING_SITE="$("$VENV_PY" -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)"
+fi
+
+# Snapshot the install that is about to be replaced, with a script that puts it
+# back. Config, state, cache, passwords and excludes stay out of the copy: an
+# upgrade never modifies them, so a rollback never restores them. Both install
+# shapes are handled, because the first run after the venv migration must be
+# able to put the legacy copy layout back.
 save_previous_install() {
-    [ -d "$PKG_PATH" ] || return 0
+    if [ ! -d "$PKG_PATH" ] && [ ! -d "${EXISTING_SITE:-}/snap_bak" ] && [ ! -f "$WRAPPER_PATH" ]; then
+        return 0
+    fi
     local dest
     local unit
+    local meta
     mkdir -p "$ROLLBACK_ROOT"
     dest="$(mktemp -d "$ROLLBACK_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
-    cp -a "$PKG_PATH" "$dest/snap_bak"
-    if [ -f "$WRAPPER_PATH" ]; then
-        cp -a "$WRAPPER_PATH" "$dest/sudo-exec.py"
+    if [ -d "$PKG_PATH" ]; then
+        cp -a "$PKG_PATH" "$dest/legacy-snap_bak"
     fi
     if [ -f "$VERSION_FILE" ]; then
         cp -a "$VERSION_FILE" "$dest/VERSION"
+    fi
+    if [ -n "${EXISTING_SITE:-}" ] && [ -d "$EXISTING_SITE/snap_bak" ]; then
+        cp -a "$EXISTING_SITE/snap_bak" "$dest/snap_bak"
+        for meta in "$EXISTING_SITE"/snap_bak-*.dist-info; do
+            if [ -e "$meta" ]; then
+                cp -a "$meta" "$dest/"
+            fi
+        done
+    fi
+    if [ -f "$WRAPPER_PATH" ]; then
+        cp -a "$WRAPPER_PATH" "$dest/sudo-exec.py"
     fi
     if [ -f "$CLI_PATH" ]; then
         cp -a "$CLI_PATH" "$dest/snap-bak"
@@ -84,13 +109,27 @@ if [ "\$EUID" -ne 0 ]; then
     exit 1
 fi
 systemctl stop $SERVICE_NAME.timer || true
-rm -rf "$PKG_PATH"
-cp -a "$dest/snap_bak" "$PKG_PATH"
+if [ -d "$dest/legacy-snap_bak" ]; then
+    rm -rf "$PKG_PATH"
+    cp -a "$dest/legacy-snap_bak" "$PKG_PATH"
+    chown -R root:root "$PKG_PATH"
+    if [ -f "$dest/VERSION" ]; then
+        install -o root -g root -m 0644 "$dest/VERSION" "$VERSION_FILE"
+    fi
+    rm -rf "$VENV_DIR"
+fi
+if [ -d "$dest/snap_bak" ] && [ -d "$EXISTING_SITE" ]; then
+    rm -rf "$EXISTING_SITE/snap_bak" "$EXISTING_SITE"/snap_bak-*.dist-info
+    cp -a "$dest/snap_bak" "$EXISTING_SITE/snap_bak"
+    for meta in "$dest"/snap_bak-*.dist-info; do
+        if [ -e "\$meta" ]; then
+            cp -a "\$meta" "$EXISTING_SITE/"
+        fi
+    done
+    chown -R root:root "$EXISTING_SITE"
+fi
 if [ -f "$dest/sudo-exec.py" ]; then
     install -o root -g root -m 0755 "$dest/sudo-exec.py" "$WRAPPER_PATH"
-fi
-if [ -f "$dest/VERSION" ]; then
-    install -o root -g root -m 0644 "$dest/VERSION" "$VERSION_FILE"
 fi
 if [ -f "$dest/snap-bak" ]; then
     install -o root -g root -m 0755 "$dest/snap-bak" "$CLI_PATH"
@@ -102,7 +141,6 @@ for unit in $SERVICE_NAME.service $SERVICE_NAME.timer; do
         install -o root -g root -m 0644 "$dest/\$unit" "$UNIT_DIR/\$unit"
     fi
 done
-chown -R root:root "$PKG_PATH"
 systemctl daemon-reload
 if systemctl is-enabled --quiet $SERVICE_NAME.timer 2>/dev/null; then
     systemctl start $SERVICE_NAME.timer
@@ -113,24 +151,44 @@ EOF
     echo "[*] Previous install saved to $dest (undo: sudo $dest/restore.sh)"
 }
 
-# --- 0. PYTHON DEPENDENCIES (for configured Python) ---
-# The service and wrapper share one configured interpreter (PYTHON_BIN), and
-# both need pydantic, json5, rich etc. importable. json5 parses the JSONC
-# config via config.py, shared by the root wrapper; rich backs the reports.
-echo "[*] Checking Python dependencies (pydantic, python-dateutil, json5, rich)..."
-if ! "$PYTHON_BIN" -c "import pydantic, dateutil, json5, rich" &>/dev/null; then
-    echo "[*] Installing Python dependencies with pip..."
-    "$PYTHON_BIN" -m pip install --quiet pydantic python-dateutil json5 rich
+# --- 0. SOURCE CHECK AND ROLLBACK COPY ---
+if [ ! -d "$PKG_SRC" ]; then
+    echo "[!] Cannot find $PKG_SRC. Run this script from the repo root." >&2
+    exit 1
 fi
-if ! "$PYTHON_BIN" -c "import pydantic, dateutil, json5, rich" &>/dev/null; then
-    echo "[!] Python dependencies are not importable by $PYTHON_BIN." >&2
-    echo "    If pip is externally managed (PEP 668, stock Debian/Ubuntu), do" >&2
-    echo "    not fight it: create a virtualenv and re-run with PYTHON_BIN." >&2
-    echo "      sudo python3 -m venv /opt/snap-bak/venv" >&2
-    echo "      sudo /opt/snap-bak/venv/bin/pip install pydantic python-dateutil json5 rich" >&2
-    echo "      sudo PYTHON_BIN=/opt/snap-bak/venv/bin/python ./snap-bak-setup.sh" >&2
-    echo "    Otherwise install them manually:" >&2
-    echo "      $PYTHON_BIN -m pip install pydantic python-dateutil json5 rich" >&2
+if [ ! -f "$WRAPPER_SRC" ]; then
+    echo "[!] Cannot find $WRAPPER_SRC. Run this script from the repo root." >&2
+    exit 1
+fi
+# Before anything is replaced, so the venv install below cannot overwrite the
+# package the rollback needs.
+save_previous_install
+
+# --- 0b. VIRTUALENV & PACKAGE ---
+echo "[*] Checking $PYTHON_BIN..."
+if ! "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)'; then
+    echo "[!] snap-bak needs Python 3.14 or newer; $PYTHON_BIN is older." >&2
+    exit 1
+fi
+PYVER="$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo 3.14)"
+echo "[*] Creating the virtualenv at $VENV_DIR..."
+if ! "$PYTHON_BIN" -m venv "$VENV_DIR" 2>/dev/null; then
+    echo "[!] $PYTHON_BIN cannot create a virtualenv (ensurepip is missing)." >&2
+    echo "    Debian/Ubuntu: sudo apt install python$PYVER-venv" >&2
+    echo "    Then re-run this script." >&2
+    exit 1
+fi
+if ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
+    echo "[!] $VENV_DIR has no pip. Install the venv package for $PYTHON_BIN and re-run." >&2
+    exit 1
+fi
+# The distribution, its console script and its dependencies, all inside the
+# venv. --force-reinstall so a re-run picks up the current tree even when the
+# version was not bumped.
+echo "[*] Installing snap-bak and its dependencies into $VENV_DIR..."
+if ! "$VENV_PY" -m pip install --quiet --upgrade --force-reinstall "$REPO_ROOT"; then
+    echo "[!] pip could not install $REPO_ROOT." >&2
+    echo "    It needs PyPI access for the build backend and the dependencies." >&2
     exit 1
 fi
 
@@ -162,53 +220,26 @@ mkdir -p "$SNAPBAK_DIR"
 chown root:root "$SNAPBAK_DIR"
 chmod 0755 "$SNAPBAK_DIR"
 
-# --- 1b. INSTALL MANAGED PROGRAM & WRAPPER ---
-if [ ! -d "$PKG_SRC" ]; then
-    echo "[!] Cannot find $PKG_SRC. Run this script from the repo root." >&2
-    exit 1
-fi
-if [ ! -f "$WRAPPER_SRC" ]; then
-    echo "[!] Cannot find $WRAPPER_SRC. Run this script from the repo root." >&2
-    exit 1
-fi
-# The package is installed as a directory (imported as `snap_bak`); systemd
-# runs `python3 -m snap_bak.cli`. Remove any stale flat-installed files from the
-# pre-package layout, then install the package and the wrapper.
-save_previous_install
-rm -rf "$PKG_PATH"
-for stale in cli.py config.py job.py restic.py snapshot.py; do
-    rm -f "$SNAPBAK_DIR/$stale"
-done
-cp -r "$PKG_SRC" "$PKG_PATH"
-# Drop dev bytecode so we never install .pyc built for the wrong interpreter.
-find "$PKG_PATH" -type d -name __pycache__ -exec rm -rf {} +
-chown -R root:root "$PKG_PATH"
-chmod 0755 "$PKG_PATH"
-find "$PKG_PATH" -type f -exec chmod 0644 {} \;
+# --- 1b. WRAPPER & COMMAND ---
+# The distribution lives in the venv. The copy layout and its version marker are
+# removed after the new unit is in place, so a failure between here and there
+# leaves the previous layout still working.
 install -o root -g root -m 0755 "$WRAPPER_SRC" "$WRAPPER_PATH"
-# Deploy the wrapper on the same interpreter that owns the dependencies.
-sed -i "1s|^#!.*|#!$PYTHON_BIN|" "$WRAPPER_PATH"
-# The deploy is a copy, not a wheel, so there is no dist-info for the package to
-# read. This marker is what `snap-bak --version` reports.
-INSTALLED_VERSION="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$REPO_ROOT/pyproject.toml" | head -n 1)"
-printf '%s\n' "${INSTALLED_VERSION:-unknown}" > "$VERSION_FILE"
-chown root:root "$VERSION_FILE"
-chmod 0644 "$VERSION_FILE"
-# The operator's command. It carries the interpreter, the package path and the
-# production config, so a fresh install needs no PATH edit, no virtualenv and no
-# `-c`. -P keeps the caller's cwd off sys.path, so a stray snap_bak/ cannot
-# shadow the installed package.
+# The wrapper shares the interpreter that owns the dependencies.
+sed -i "1s|^#!.*|#!$VENV_PY|" "$WRAPPER_PATH"
+# The operator's command. -P keeps the caller's cwd off sys.path, so a stray
+# snap_bak/ cannot shadow the installed distribution, and the config is the
+# production one without needing `-c`.
 cat > "$CLI_PATH" <<EOF
 #!/bin/sh
 # Installed by snap-bak-setup.sh. Run it as the service user.
-PYTHONPATH="$SNAPBAK_DIR"
 SNAPBAK_CONFIG_FILE="$CONFIG_FILE"
-export PYTHONPATH SNAPBAK_CONFIG_FILE
-exec "$PYTHON_BIN" -P -m snap_bak.cli "\$@"
+export SNAPBAK_CONFIG_FILE
+exec "$VENV_PY" -P -m snap_bak.cli "\$@"
 EOF
 chown root:root "$CLI_PATH"
 chmod 0755 "$CLI_PATH"
-echo "[*] Installed $PKG_PATH (root:root 0644) and $WRAPPER_PATH (root:root 0755)."
+echo "[*] Installed snap-bak into $VENV_DIR and $WRAPPER_PATH (root:root 0755)."
 echo "[*] Installed $CLI_PATH (run it as $SERVICE_USER: sudo -u $SERVICE_USER snap-bak ...)."
 
 # --- 1d. VERIFY/UPDATE RESTIC (setcap + self-update via the wrapper) ---
@@ -435,7 +466,7 @@ User=$SERVICE_USER
 Group=$SERVICE_GROUP
 WorkingDirectory=$SNAPBAK_DIR
 Environment=SNAPBAK_CONFIG_FILE=$CONFIG_FILE
-ExecStart=$PYTHON_BIN -m snap_bak.cli
+ExecStart=$VENV_PY -P -m snap_bak.cli
 
 [Install]
 WantedBy=multi-user.target
@@ -459,6 +490,15 @@ EOF
 # Ensure generated unit files are readable regardless of root's umask.
 chmod 0644 "$UNIT_DIR/$SERVICE_NAME.service" "$UNIT_DIR/$SERVICE_NAME.timer"
 
+# The unit, the wrapper and the launcher all run the venv now. Remove the copy
+# layout and its marker last, so anything that failed above left the previous
+# unit still working.
+rm -rf "$PKG_PATH"
+rm -f "$VERSION_FILE"
+for stale in cli.py config.py job.py restic.py snapshot.py snap-bak-io; do
+    rm -f "$SNAPBAK_DIR/$stale"
+done
+
 # --- 6. FINALIZE ---
 echo "[*] Reloading systemd daemon..."
 systemctl daemon-reload
@@ -474,6 +514,7 @@ echo " SETUP COMPLETE"
 echo "===================================================="
 echo " User:        $SERVICE_USER"
 echo " Config:      $CONFIG_FILE"
+echo " Venv:        $VENV_DIR"
 echo " State Dir:   $STATE_DIR"
 echo " Cache Dir:   $CACHE_DIR"
 echo " Mount Base:  $MOUNT_BASE"

@@ -45,37 +45,29 @@ unmount, delete, restic update) goes through the root wrapper
 
 Prerequisites: restic at `/usr/local/bin/restic` (a distro package lands in
 `/usr/bin`, which the wrapper rejects; download the release binary and
-`sudo install -m755 restic /usr/local/bin/restic`), and Python 3.14 with the
-dependencies importable by the interpreter the service will use — `python3` by
-default, or whatever `PYTHON_BIN` names. If the system Python is externally
-managed (Debian/Ubuntu), give the script a virtualenv; it will not create one
-for you, and it exits with these instructions rather than guessing:
-
-```bash
-sudo python3 -m venv /opt/snap-bak/venv
-sudo /opt/snap-bak/venv/bin/pip install pydantic python-dateutil json5 rich
-sudo PYTHON_BIN=/opt/snap-bak/venv/bin/python ./snap-bak-setup.sh
-```
-
-Otherwise run the copy in the clone:
+`sudo install -m755 restic /usr/local/bin/restic`), Python 3.14 or newer with
+virtualenv support (`python3-venv` on Debian/Ubuntu), and PyPI access for the
+first install. `python3` is the base interpreter by default; `PYTHON_BIN`
+overrides it for a non-system install.
 
 ```bash
 chmod +x snap-bak-setup.sh
 sudo ./snap-bak-setup.sh
 ```
 
-The clone is the install source: the setup script installs the package **and**
-the root wrapper `sudo-exec.py`, which every privileged operation (mount,
-snapshot, unmount, delete, restic update) goes through. snap-bak cannot run
-without it, so a plain `pip install` is not a supported deployment.
+The clone is the install source. The script creates `/opt/snap-bak/venv` and
+pip-installs the project and its dependencies into it, so the system Python is
+never modified and PEP 668 never applies. It also installs the root wrapper
+`sudo-exec.py`, which every privileged operation (mount, snapshot, unmount,
+delete, restic update) goes through; snap-bak cannot run without it, so a plain
+`pip install` of the project is not a supported deployment.
 
 What `snap-bak-setup.sh` does:
 
-1. Verifies you are `root`, and that Python can import its dependencies.
+1. Verifies you are `root`, and that the base interpreter is 3.14 or newer.
 2. Creates the `snap-bak` user/group and `/opt/snap-bak`.
-3. Installs the orchestrator package to `/opt/snap-bak/snap_bak/` (root:root
-   0644), the wrapper to `/opt/snap-bak/sudo-exec.py` (root:root 0755), and
-   records the version it installed in `/opt/snap-bak/VERSION`.
+3. Creates `/opt/snap-bak/venv`, installs `snap-bak` and its dependencies there,
+   and installs the wrapper to `/opt/snap-bak/sudo-exec.py` (root:root 0755).
 4. Validates `/usr/local/bin/restic`, self-updates it to the newest release,
    and applies `cap_dac_read_search` (the wrapper's `update-restic` op).
 5. Writes an annotated example config to `/opt/snap-bak/config.json`.
@@ -86,9 +78,9 @@ What `snap-bak-setup.sh` does:
    name = any arguments, per sudoers(5)) — valid on both sudo-rs and
    sudo.ws.
 8. Writes `snap-bak.service` (oneshot) and `snap-bak.timer` (hourly).
-9. Writes the launcher `/usr/local/bin/snap-bak`, bound to the interpreter the
-   service uses and to `/opt/snap-bak`, so it reads the production config
-   without a `-c` and cannot be shadowed by a `snap_bak/` in the caller's cwd.
+9. Writes the launcher `/usr/local/bin/snap-bak`, bound to the venv interpreter
+   and the production config, so it reads the config without a `-c` and cannot
+   be shadowed by a `snap_bak/` in the caller's cwd.
 
 Tool commands run as the service user. State, cache, the restic config and the
 sudo wrapper all belong to `snap-bak`, and only that user may call the wrapper
@@ -140,9 +132,9 @@ group, and existing `config.json` (so your edits are preserved), refreshes the
 program + unit files, re-validates sudoers and re-runs the restic update.
 
 Before it replaces the program, it saves the previous install under
-`/opt/snap-bak/rollback/<UTC timestamp>-XXXXXX/` with the package, the wrapper,
-the launcher, the version marker, the unit files and a `restore.sh`. To undo an
-upgrade:
+`/opt/snap-bak/rollback/<UTC timestamp>-XXXXXX/` with the installed package and
+its metadata, the wrapper, the launcher, the unit files and a `restore.sh`. To
+undo an upgrade:
 
 ```bash
 sudo /opt/snap-bak/rollback/<UTC timestamp>-XXXXXX/restore.sh

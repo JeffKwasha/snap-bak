@@ -1005,25 +1005,23 @@ per-job lock would add complexity without additional protection.
 ## State & Runtime Directories
 
 ```
-<install>                # root-owned: package, wrapper, config
-  snap_bak/              # Python package (imported as `snap_bak`; root:root 0644)
-    __init__.py
-    cli.py               # entry point / orchestration
-    config.py            # config loading + models
-    excludes.py          # restic exclusion-engine port + inspection
-    job.py               # backup engine
-    report.py            # the rule-by-source report and its renderings
-    restic.py            # restic command building
-    snapshot.py          # snapshot domain model
+<install>                # root-owned: venv, wrapper, config
+  venv/                  # virtualenv: the base interpreter's binary, its own site-packages
+    bin/python           # what the unit, the wrapper and the launcher run
+    bin/snap-bak         # the console script pip generates (the launcher is the PATH one)
+    lib/pythonX.Y/site-packages/
+      snap_bak/          # the installed package (root:root)
+      snap_bak-<ver>.dist-info/   # METADATA, entry points, RECORD
   sudo-exec.py            # sudo wrapper (root:root 0755)
   config.json            # root-owned, validated by the wrapper
-  VERSION                # version this install was built from (setup writes it)
 
 <install>/rollback       # root-only copies of installs this script replaced
   <timestamp>-XXXXXX/    # one per setup run; never reaped
-    snap_bak/            # the package as it was
+    snap_bak/            # the venv-installed package as it was
+    snap_bak-*.dist-info # its metadata
+    legacy-snap_bak/     # only on the first run after the copy layout
+    VERSION              # the legacy marker, only when it existed
     sudo-exec.py         # the wrapper as it was (when it existed)
-    VERSION              # the version marker as it was
     snap-bak             # the /usr/local/bin launcher as it was (when it existed)
     snap-bak.service     # the unit files as they were (when they existed)
     snap-bak.timer
@@ -1056,11 +1054,13 @@ escalation that drives priority. Queued work is never reaped: an entry is a
 request from a human.
 
 `rollback` is written only by the setup script, and only when it replaces an
-existing package. Each directory is a complete copy of the program, the wrapper,
-the launcher, the version marker and the unit files, plus the `restore.sh` that
-puts them back; config, state, cache, passwords and excludes are outside it
-because an upgrade never touches them. Nothing reaps these directories, so an
-operator deletes them by hand once the new install has proven itself.
+existing install. Each directory is a complete copy of the installed
+distribution and its metadata, the wrapper, the launcher and the unit files,
+plus the `restore.sh` that puts them back; config, state, cache, passwords and
+excludes are outside it because an upgrade never touches them. The first run
+after the copy layout also saves the old `snap_bak/` and `VERSION`, so that
+migration can be undone. Nothing reaps these directories, so an operator deletes
+them by hand once the new install has proven itself.
 
 All paths are relative to the install directory (`<install>`, production
 `/opt/snap-bak`). The `restic` and `rclone` binaries are optional (rclone only
@@ -1088,8 +1088,8 @@ snap-bak apply excludes [OPTIONS]     # dry-run; --now applies, --later arms
 ```
 
 `show` / `apply` are subcommands. A bare `snap-bak` (no subcommand) is the
-normal run, so the systemd service (`ExecStart=python3 -m snap_bak.cli`) is
-unaffected. The installed command is `/usr/local/bin/snap-bak`; tool commands
+normal run, so the systemd service (`ExecStart=<install>/venv/bin/python -P -m
+snap_bak.cli`) is unaffected. The installed command is `/usr/local/bin/snap-bak`; tool commands
 run as the service user, `sudo -u snap-bak snap-bak ...` (see *Deployment
 Contract*).
 
@@ -1289,30 +1289,32 @@ install, with nothing else done. A command that needs more is a bug in the docs
 or the install. The explicitly labelled development option in README is outside
 this contract.
 
-- **Baseline.** Linux with btrfs and systemd, one interpreter with Python 3.14
-  or newer that can import pydantic, python-dateutil, json5 and rich, and restic
-  at `/usr/local/bin/restic` as a real root-owned file. rclone only for
-  `rclone:` repositories. See *Supported Platform & Dependencies*.
+- **Baseline.** Linux with btrfs and systemd, Python 3.14 or newer with
+  virtualenv support (`python3-venv` on Debian/Ubuntu), PyPI access for the
+  first install, and restic at `/usr/local/bin/restic` as a real root-owned
+  file. rclone only for `rclone:` repositories. See *Supported Platform &
+  Dependencies*.
 - **Only install.** A clone plus `snap-bak-setup.sh`, optionally with
-  `PYTHON_BIN`. No pip install of the project, no operator virtualenv, no PATH
-  edit.
-- **Command.** The install writes `/usr/local/bin/snap-bak`, bound to the
-  configured interpreter, `/opt/snap-bak` and `/opt/snap-bak/config.json`. It
-  runs the installed package whatever the caller's cwd contains, so a stray
-  `snap_bak/` cannot shadow it, and bare commands read the production config the
-  same way the service does.
+  `PYTHON_BIN`. No pip install by the operator, no operator-managed virtualenv,
+  no PATH edit.
+- **Command.** The install writes `/usr/local/bin/snap-bak`, bound to the venv
+  interpreter and `/opt/snap-bak/config.json`. It runs the installed
+  distribution whatever the caller's cwd contains, so a stray `snap_bak/`
+  cannot shadow it, and bare commands read the production config the same way
+  the service does.
 - **Operator.** The operator is an administrator with sudo. Tool commands run as
   the service user, `sudo -u snap-bak snap-bak ...`, because state, cache, the
   restic config and the sudo wrapper all belong to that identity. Journal and
   state reads need root. Files passed to the tool (`-c`, `--excludes-file`)
   must be readable by the service user.
-- **Version.** The install records the version it built in
-  `/opt/snap-bak/VERSION`, and `snap-bak --version` reports that file whenever it
-  exists. Installed package metadata is the fallback for a wheel or a source
-  tree, never a claim about a deploy.
+- **Version.** The package is installed as a distribution in
+  `/opt/snap-bak/venv`, and `snap-bak --version` reports that distribution's
+  metadata. There is no separate version file.
 - **Upgrade.** Re-running the script is idempotent, keeps `config.json`, and
   saves the install it replaces under `rollback/` with a `restore.sh` that puts
-  back the package, wrapper, launcher, version marker and unit files.
+  back the installed distribution and its metadata, the wrapper, the launcher
+  and the unit files. The first run after the copy layout also saves the old
+  copy so the migration can be undone.
 
 ---
 
@@ -1320,10 +1322,15 @@ this contract.
 
 snap-bak supports:
 
-- Python ≥ 3.14
+- Python ≥ 3.14 with virtualenv support (`python3 -m venv`; on Debian/Ubuntu
+  the `python3-venv` package)
 - pydantic >= 2.0 (config models)
 - python-dateutil (relativedelta for retention calculations)
 - json5 (JSONC config parsing)
 - rich (terminal rendering of the reports)
 - restic (backup tool), installed at /usr/local/bin/restic
 - btrfs-progs (snapshot management)
+- PyPI access for the first install, for the build backend and the dependencies
+
+The four Python libraries are installed into `/opt/snap-bak/venv` by the setup
+script. They do not need to be importable by the base interpreter.
