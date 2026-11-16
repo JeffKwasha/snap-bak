@@ -268,10 +268,9 @@ def _resolve_lock_contention(stuck_threshold, stuck_wait) -> bool:
 def _program_mtime() -> str:
     """When the running package was last written, as an ISO 8601 timestamp.
 
-    The version cannot answer this on its own: a deployed copy can be replaced
-    without a version bump, and a hand edit is not a release at all. The newest
-    mtime among the package's own files is the only signal of which build is
-    actually running.
+    Fallback for installs that predate the build stamp. The version cannot
+    answer this on its own: a deployed copy can be replaced without a version
+    bump, and a hand edit is not a release at all.
     """
     newest = 0.0
     for path in Path(__file__).resolve().parent.glob("*.py"):
@@ -284,11 +283,23 @@ def _program_mtime() -> str:
     return datetime.fromtimestamp(newest, UTC).isoformat()
 
 
+@functools.cache
+def _build_time() -> str:
+    """The timestamp the install recorded for this distribution.
+
+    A wheel carries no build time, so the setup writes one next to the venv.
+    Installs that predate it fall back to the newest package file.
+    """
+    try:
+        stamped = (Path(sys.prefix) / "BUILD").read_text().strip()
+    except OSError:
+        stamped = ""
+    return stamped or _program_mtime()
+
+
 def _lock_transition(what: str) -> str:
-    """The acquire/release line: which build took the lock, and when it was written."""
-    return (
-        f"Global lock {what} (version {__version__}, program mtime {_program_mtime()})."
-    )
+    """The acquire/release line: which build took the lock, and when it was built."""
+    return f"Global lock {what} (version {__version__}, build {_build_time()})."
 
 
 class GlobalLock:

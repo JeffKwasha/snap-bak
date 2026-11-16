@@ -200,6 +200,16 @@ absent, try again later". 41 means "this will keep failing until you change
 something". Reporting a 30 as a broken backup sends an operator chasing a
 problem that does not exist.
 
+### rclone backends
+
+For a repo whose path starts with `rclone:`, restic execs
+`rclone serve restic --stdio` and finds the binary on the service user's PATH.
+rclone reads `/opt/snap-bak/.config/rclone/rclone.conf`, because that is the
+service user's HOME. A file or link in `/opt/snap-bak` is not on PATH and is
+never used. If such a repo is unreachable, check PATH and the config as the
+service user, or pin the binary in the repo's `restic_options` with
+`--option rclone.program=/absolute/path`.
+
 ### Reading JSON output
 
 `--json` emits **one** document for the whole invocation. Two JSON objects on
@@ -323,6 +333,11 @@ changed` are both normal, and neither is proof that the backup is empty —
 `skip_snapshot_if_idle` suppresses a snapshot whenever the source has not
 changed. A quiet run is only as healthy as the timestamp says it is.
 
+The lock acquire and release lines carry `version <x>` and `build <ISO>`. `build`
+is the timestamp the install recorded for the running distribution, not the lock
+file's mtime. It shows a replaced or hand-edited install that shipped without a
+version bump.
+
 When a run exits 30, the journal will name restic's own code (10 repo does not
 exist, 11 locked, 12 bad password). That code is the actionable part; the wrapper
 maps it to the exit code, so quoting the exit code alone loses it.
@@ -352,6 +367,10 @@ maps it to the exit code, so quoting the exit code alone loses it.
   a large or remote repo.
 - Patterns are linted on every `show` and print nothing when clean, so silence
   there means healthy.
+- **A version or import that looks wrong usually resolved another tree.**
+  `--version` reads `importlib.metadata`; modules come from `sys.path`; the
+  launcher runs `<venv>/bin/python -P -m snap_bak.cli`. Check
+  `snap_bak.__file__` under the same interpreter before suspecting the install.
 
 ## Verification
 
@@ -368,3 +387,38 @@ sudo -u snap-bak snap-bak -c /opt/snap-bak/config.json show excludes --all --job
 For the full reference — every config key, every subcommand flag, and the
 reasoning behind the exit-code ladder — load
 `skill_view("snap-bak", "references/reference.md")`.
+
+## Install and upgrade
+
+The official install is a clone plus `snap-bak-setup.sh`. It creates
+`/opt/snap-bak/venv`, installs the distribution and its dependencies there, and
+writes the wrapper, the launcher and the unit. Re-running is idempotent and
+keeps `config.json`.
+
+Pass `--backup` to keep a rollback copy of the install being replaced. Without
+it no copy is made. The copy holds the installed distribution and its metadata,
+the wrapper, the launcher, the build stamp and the unit files; it never holds
+config, state, cache or passwords. On a layout change, the old layout is removed
+only after the new unit is written, so a failure above leaves the previous unit
+working.
+
+**Baseline rule.** Every install requirement names what consumes it. A
+requirement nothing at runtime needs is dropped for the weaker primitive that
+suffices, and code with no requirement behind it is orphaned.
+
+## Release
+
+Bump `pyproject.toml` only when delivering. While a version is pending, fold
+further changes into its changelog entry; do not cut another version. The
+installed distribution is the only version source; there is no `VERSION` file.
+
+## Development
+
+```bash
+uv run pytest -q        # whole suite, parallel
+uv run pytest -q -n 0   # one test, serially
+```
+
+The suite skips every restic-backed test when the `restic` binary is absent, so
+a green run without restic proves nothing about restic paths. CI installs the
+newest restic so they cannot skip.

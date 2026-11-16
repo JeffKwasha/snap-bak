@@ -18,16 +18,22 @@ All notable changes to snap-bak are documented here. Versions follow
 - SPEC states the deployment contract: baseline, only-install, command,
   operator, version and upgrade requirements. README and the agent skill name
   the service user and run tool commands with `sudo -u snap-bak`.
-- The rollback copy saves the installed distribution and its metadata, the
-  wrapper, the launcher and the unit files. On the first run after the copy
-  layout it also saves the old `snap_bak/` and `VERSION`, so the migration can
-  be undone.
+- With `--backup`, the setup saves the install it replaces (the distribution and
+  its metadata, the wrapper, the launcher, the build stamp and the unit files)
+  under `rollback/`. Without the flag no copy is made. On the first run after
+  the copy layout it also saves the old `snap_bak/` and `VERSION`, so the
+  migration can be undone.
+- The setup records the build timestamp in `/opt/snap-bak/venv/BUILD`, and the
+  lock acquire and release lines report it.
 
 ### Changed
 
 - `snap-bak --version` reports the installed distribution's metadata. The
   `VERSION` marker and the copied `snap_bak/` layout are removed; the unit, the
   wrapper and the launcher run the venv interpreter.
+- The lock lines report `build <ISO>` from the install stamp rather than the
+  newest package-file mtime. A stale install is visible even when the version
+  was not bumped.
 - The first install needs pip on the base interpreter and PyPI access for the
   build backend and the dependencies. ensurepip and `python3-venv` are not
   needed.

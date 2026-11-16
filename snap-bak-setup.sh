@@ -6,7 +6,8 @@
 #
 # USAGE INSTRUCTIONS:
 # 1. Make the script executable: chmod +x snap-bak-setup.sh
-# 2. Run with root privileges: sudo ./snap-bak-setup.sh
+# 2. Run with root privileges: sudo ./snap-bak-setup.sh [--backup]
+#    --backup keeps the install this run replaces under /opt/snap-bak/rollback.
 # 3. After completion, perform the 'NEXT STEPS' listed in the script output.
 #
 # Idempotent: re-running "fixes" the box to match the current repo state while
@@ -20,6 +21,21 @@ if [ "$EUID" -ne 0 ]; then
     echo "    Re-run with: sudo $0" >&2
     exit 1
 fi
+
+# A rollback copy is opt-in: it is a full copy of the previous install, and the
+# operator should know it exists and be able to delete it.
+BACKUP=0
+for arg in "$@"; do
+    case "$arg" in
+        --backup)
+            BACKUP=1
+            ;;
+        *)
+            echo "[!] Unknown argument: $arg (only --backup is accepted)." >&2
+            exit 2
+            ;;
+    esac
+done
 
 # The interpreter that creates the venv. python3 by default; PYTHON_BIN
 # overrides it for a non-system install. The venv it creates is what the
@@ -90,6 +106,9 @@ save_previous_install() {
             fi
         done
     fi
+    if [ -f "$VENV_DIR/BUILD" ]; then
+        cp -a "$VENV_DIR/BUILD" "$dest/BUILD"
+    fi
     if [ -f "$WRAPPER_PATH" ]; then
         cp -a "$WRAPPER_PATH" "$dest/sudo-exec.py"
     fi
@@ -126,6 +145,9 @@ if [ -d "$dest/snap_bak" ] && [ -d "$EXISTING_SITE" ]; then
             cp -a "\$meta" "$EXISTING_SITE/"
         fi
     done
+    if [ -f "$dest/BUILD" ]; then
+        install -o root -g root -m 0644 "$dest/BUILD" "$VENV_DIR/BUILD"
+    fi
     chown -R root:root "$EXISTING_SITE"
 fi
 if [ -f "$dest/sudo-exec.py" ]; then
@@ -160,9 +182,11 @@ if [ ! -f "$WRAPPER_SRC" ]; then
     echo "[!] Cannot find $WRAPPER_SRC. Run this script from the repo root." >&2
     exit 1
 fi
-# Before anything is replaced, so the venv install below cannot overwrite the
-# package the rollback needs.
-save_previous_install
+if [ "$BACKUP" -eq 1 ]; then
+    save_previous_install
+else
+    echo "[!] No rollback copy. Pass --backup to keep the install this run replaces."
+fi
 
 # --- 0b. VIRTUALENV & PACKAGE ---
 echo "[*] Checking $PYTHON_BIN..."
@@ -196,6 +220,11 @@ fi
 # that names the base interpreter, which cannot see the venv. The launcher is
 # the command, so drop them.
 rm -rf "${SITE_PACKAGES:?}/bin"
+# The build time is not in the wheel metadata, so record it where the package
+# reads it: <venv>/BUILD via sys.prefix.
+date -u +%Y-%m-%dT%H:%M:%SZ > "$VENV_DIR/BUILD"
+chown root:root "$VENV_DIR/BUILD"
+chmod 0644 "$VENV_DIR/BUILD"
 
 # --- 1. CREATE USER, GROUP & DIRECTORIES ---
 if ! getent group "$SERVICE_GROUP" >/dev/null; then

@@ -51,8 +51,11 @@ default; `PYTHON_BIN` overrides it for a non-system install.
 
 ```bash
 chmod +x snap-bak-setup.sh
-sudo ./snap-bak-setup.sh
+sudo ./snap-bak-setup.sh --backup
 ```
+
+`--backup` keeps a rollback copy of the install this run replaces. Without it,
+no copy is made and the script says so.
 
 The clone is the install source. The script creates `/opt/snap-bak/venv` without
 pip (ensurepip is not needed) and uses the base interpreter's pip to install the
@@ -67,7 +70,8 @@ What `snap-bak-setup.sh` does:
 1. Verifies you are `root`, and that the base interpreter is 3.14 or newer.
 2. Creates the `snap-bak` user/group and `/opt/snap-bak`.
 3. Creates `/opt/snap-bak/venv`, installs `snap-bak` and its dependencies there,
-   and installs the wrapper to `/opt/snap-bak/sudo-exec.py` (root:root 0755).
+   records the build timestamp in `/opt/snap-bak/venv/BUILD`, and installs the
+   wrapper to `/opt/snap-bak/sudo-exec.py` (root:root 0755).
 4. Validates `/usr/local/bin/restic`, self-updates it to the newest release,
    and applies `cap_dac_read_search` (the wrapper's `update-restic` op).
 5. Writes an annotated example config to `/opt/snap-bak/config.json`.
@@ -131,10 +135,10 @@ The setup script is **idempotent** — re-running it is safe: it skips the user,
 group, and existing `config.json` (so your edits are preserved), refreshes the
 program + unit files, re-validates sudoers and re-runs the restic update.
 
-Before it replaces the program, it saves the previous install under
-`/opt/snap-bak/rollback/<UTC timestamp>-XXXXXX/` with the installed package and
-its metadata, the wrapper, the launcher, the unit files and a `restore.sh`. To
-undo an upgrade:
+With `--backup`, before it replaces the program it saves the previous install
+under `/opt/snap-bak/rollback/<UTC timestamp>-XXXXXX/` with the installed package
+and its metadata, the build stamp, the wrapper, the launcher, the unit files and
+a `restore.sh`. Without the flag, no copy is made. To undo an upgrade:
 
 ```bash
 sudo /opt/snap-bak/rollback/<UTC timestamp>-XXXXXX/restore.sh

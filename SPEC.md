@@ -984,10 +984,10 @@ Prevents multiple snap-bak instances from running simultaneously.
 
 - Lock file: `<state>/snap-bak.lock`, an advisory `flock` (`LOCK_EX|LOCK_NB`).
   Records the holder PID and timestamps for stuck detection.
-- Both transitions log the running version and the newest modification time among
-  the installed package files, as an ISO 8601 timestamp. That mtime is the last
-  program update, so a lock in the journal can be tied to the build that wrote it
-  even when the version was never bumped.
+- Both transitions log the running version and the build timestamp the install
+  recorded (`<install>/venv/BUILD`), as ISO 8601. It exposes a replaced or
+  hand-edited install that shipped without a version bump; installs that predate
+  the stamp fall back to the newest package file.
 - `stuck_threshold` (config, default 3600s): lock age beyond which the holder
   is considered stuck.
 - `stuck_wait` (config, default 300s): total time to keep re-checking a stuck
@@ -1008,6 +1008,7 @@ per-job lock would add complexity without additional protection.
 <install>                # root-owned: venv, wrapper, config
   venv/                  # created without pip; the base pip populates it
     bin/python           # what the unit, the wrapper and the launcher run
+    BUILD                # UTC timestamp written at install; the lock line reports it
     lib/pythonX.Y/site-packages/
       snap_bak/          # the installed package (root:root)
       snap_bak-<ver>.dist-info/   # METADATA, entry points, RECORD
@@ -1018,6 +1019,7 @@ per-job lock would add complexity without additional protection.
   <timestamp>-XXXXXX/    # one per setup run; never reaped
     snap_bak/            # the venv-installed package as it was
     snap_bak-*.dist-info # its metadata
+    BUILD                # the build stamp as it was (when it existed)
     legacy-snap_bak/     # only on the first run after the copy layout
     VERSION              # the legacy marker, only when it existed
     sudo-exec.py         # the wrapper as it was (when it existed)
@@ -1308,11 +1310,12 @@ this contract.
 - **Version.** The package is installed as a distribution in
   `/opt/snap-bak/venv`, and `snap-bak --version` reports that distribution's
   metadata. There is no separate version file.
-- **Upgrade.** Re-running the script is idempotent, keeps `config.json`, and
-  saves the install it replaces under `rollback/` with a `restore.sh` that puts
-  back the installed distribution and its metadata, the wrapper, the launcher
-  and the unit files. The first run after the copy layout also saves the old
-  copy so the migration can be undone.
+- **Upgrade.** Re-running the script is idempotent, keeps `config.json`, and,
+  when run with `--backup`, saves the install it replaces under `rollback/` with
+  a `restore.sh` that puts back the installed distribution and its metadata, the
+  wrapper, the launcher, the build stamp and the unit files. Without `--backup`
+  no copy is made. The first run after the copy layout also saves the old copy
+  so the migration can be undone.
 
 ---
 

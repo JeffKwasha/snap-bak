@@ -2,6 +2,7 @@
 
 import logging
 import subprocess
+import sys
 import types
 from datetime import UTC, datetime
 from pathlib import Path
@@ -423,17 +424,18 @@ def test_a_missing_snapshot_dir_is_caught_before_anything_is_written(
 
 
 class TestGlobalLockLog:
-    def test_both_lines_name_the_version_and_the_program_mtime(
+    def test_both_lines_name_the_version_and_the_build_time(
         self, tmp_path, monkeypatch, caplog
     ):
         monkeypatch.setattr(config, "GLOBAL_LOCK_FILE", tmp_path / "snap-bak.lock")
-        package = Path(job_mod.__file__).resolve().parent
-        newest = max(p.stat().st_mtime for p in package.glob("*.py"))
-        program_mtime = datetime.fromtimestamp(newest, UTC).isoformat()
+        (tmp_path / "BUILD").write_text("2026-11-16T12:00:00Z\n")
+        monkeypatch.setattr(sys, "prefix", str(tmp_path))
+        job_mod._build_time.cache_clear()
         with caplog.at_level(logging.INFO):
             lock = job_mod.GlobalLock()
             lock.__enter__()
             lock.__exit__(None, None, None)
+        job_mod._build_time.cache_clear()
 
         lines = [
             r.getMessage()
@@ -443,4 +445,16 @@ class TestGlobalLockLog:
         assert len(lines) == 2
         for line in lines:
             assert __version__ in line
-            assert program_mtime in line
+            assert "build 2026-11-16T12:00:00Z" in line
+
+    def test_without_a_stamp_it_falls_back_to_the_package_mtime(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(sys, "prefix", str(tmp_path))
+        job_mod._build_time.cache_clear()
+        job_mod._program_mtime.cache_clear()
+        package = Path(job_mod.__file__).resolve().parent
+        newest = max(p.stat().st_mtime for p in package.glob("*.py"))
+        assert job_mod._build_time() == datetime.fromtimestamp(newest, UTC).isoformat()
+        job_mod._build_time.cache_clear()
+        job_mod._program_mtime.cache_clear()

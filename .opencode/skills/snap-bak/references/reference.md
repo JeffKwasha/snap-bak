@@ -17,7 +17,7 @@ snap-bak [-c CONFIG] [-j JOB] [-n] [--log-file PATH] [-l] [--version] [show|appl
 
 | Flag | Meaning |
 |------|---------|
-| `-c, --config PATH` | Config file. Default `$SNAPBAK_CONFIG_FILE`, else `/opt/snap-bak/config.json` |
+| `-c, --config PATH` | Config file. Default: `$SNAPBAK_CONFIG_FILE` when set (the launcher and the unit set it), else a path derived from the package location. `systemctl cat snap-bak` shows `WorkingDirectory`, `Environment`, `User` and `ExecStart`. |
 | `-j, --job NAME` | Restrict to one job. Default: all jobs |
 | `-n, --dry-run` | Preflight and plan, but no upload and no deletion |
 | `--log-file PATH` | Also write logs to a file (default: stderr only) |
