@@ -455,6 +455,7 @@ class TestGlobalLockLog:
         job_mod._program_mtime.cache_clear()
         package = Path(job_mod.__file__).resolve().parent
         newest = max(p.stat().st_mtime for p in package.glob("*.py"))
-        assert job_mod._build_time() == datetime.fromtimestamp(newest, UTC).isoformat()
+        expected = datetime.fromtimestamp(newest, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert job_mod._build_time() == expected
         job_mod._build_time.cache_clear()
         job_mod._program_mtime.cache_clear()

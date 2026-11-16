@@ -280,7 +280,7 @@ def _program_mtime() -> str:
             continue
     if not newest:
         return "unknown"
-    return datetime.fromtimestamp(newest, UTC).isoformat()
+    return datetime.fromtimestamp(newest, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @functools.cache
