@@ -982,27 +982,30 @@ Prevents multiple snap-bak instances from running simultaneously.
 
 ### Implementation
 
-- Lock file: `<state>/snap-bak.lock`, an advisory `flock` (`LOCK_EX|LOCK_NB`).
-  Records the holder PID and timestamps for stuck detection.
-- Both transitions log the running version and the build timestamp the install
-  recorded (`<install>/venv/BUILD`), as ISO 8601. It exposes a replaced or
-  hand-edited install that shipped without a version bump; installs that predate
-  the stamp fall back to the newest package file.
-- `stuck_threshold` (config, default 3600s): lock age beyond which the holder
-  is considered stuck.
-- `stuck_wait` (config, default 300s): total time to keep re-checking a stuck
-  lock before giving up.
-- Stuck handling: if the holder PID no longer exists, break the lock and
-  continue. If it still exists, poll (fixed 60s interval) until the lock clears
-  or `stuck_wait` elapses; if `stuck_wait` is exceeded, exit `EXIT_STUCK_WAIT` (51).
+- [[R-LOCK-01]] Lock file: `<state>/snap-bak.lock`, an advisory `flock`
+  (`LOCK_EX|LOCK_NB`). Records the holder PID and timestamps for stuck detection.
+- [[R-LOCK-02]] Both transitions log the running version and the build timestamp
+  the install recorded (`<install>/venv/BUILD`), as ISO 8601. It exposes a
+  replaced or hand-edited install that shipped without a version bump; installs
+  that predate the stamp fall back to the newest package file.
+- [[R-LOCK-03]] `stuck_threshold` (config, default 3600s): lock age beyond which
+  the holder is considered stuck.
+- [[R-LOCK-04]] `stuck_wait` (config, default 300s): total time to keep
+  re-checking a stuck lock before giving up.
+- [[R-LOCK-05]] Stuck handling: if the holder PID no longer exists, break the
+  lock and continue. If it still exists, poll (fixed 60s interval) until the lock
+  clears or `stuck_wait` elapses; if `stuck_wait` is exceeded, exit
+  `EXIT_STUCK_WAIT` (51).
 
-The global lock is the only lock — there is deliberately **no per-job lock**.
-Concurrent snap-bak instances are prevented solely by the global lock; a
-per-job lock would add complexity without additional protection.
+[[R-LOCK-06]] The global lock is the only lock — there is deliberately **no
+per-job lock**. Concurrent snap-bak instances are prevented solely by the global
+lock; a per-job lock would add complexity without additional protection.
 
 ---
 
 ## State & Runtime Directories
+
+[[R-STATE-01]]
 
 ```
 <install>                # root-owned: venv, wrapper, config
@@ -1039,31 +1042,33 @@ per-job lock would add complexity without additional protection.
 <install>/.cache         # symlink -> cache; restic's implicit $HOME/.cache default
 ```
 
-One file per job, holding both that job's last status and the work queued
-against it. Keeping them together is deliberate: an entry in `queued` *is* the
-record that the work was requested, so nothing else has to remember it, and
-there is no record of completed work anywhere. An empty queue is the only thing
-that means "nothing outstanding".
+[[R-STATE-02]] One file per job, holding both that job's last status and the
+work queued against it. Keeping them together is deliberate: an entry in
+`queued` *is* the record that the work was requested, so nothing else has to
+remember it, and there is no record of completed work anywhere. An empty queue
+is the only thing that means "nothing outstanding".
 
-`write_status` rewrites the whole document on every status transition, so
-`queued` is the one key carried forward (`job._CARRIED_FORWARD_KEYS`).
+[[R-STATE-03]] `write_status` rewrites the whole document on every status
+transition, so `queued` is the one key carried forward
+(`job._CARRIED_FORWARD_KEYS`).
 
-State for a job that has left the config is deleted once it has been gone for
-`state_retention_days` (default 90). A job still in the config is never reaped —
-its file is rewritten every run, and reaping it would reset the missed-slot
-escalation that drives priority. Queued work is never reaped: an entry is a
-request from a human.
+[[R-STATE-04]] State for a job that has left the config is deleted once it has
+been gone for `state_retention_days` (default 90). A job still in the config is
+never reaped — its file is rewritten every run, and reaping it would reset the
+missed-slot escalation that drives priority. Queued work is never reaped: an
+entry is a request from a human.
 
-`rollback` is written only by the setup script, and only when it replaces an
-existing install. Each directory is a complete copy of the installed
-distribution and its metadata, the wrapper, the launcher and the unit files,
-plus the `restore.sh` that puts them back; config, state, cache, passwords and
-excludes are outside it because an upgrade never touches them. The first run
-after the copy layout also saves the old `snap_bak/` and `VERSION`, so that
-migration can be undone. Nothing reaps these directories, so an operator deletes
-them by hand once the new install has proven itself.
+[[R-STATE-05]] `rollback` is written only by the setup script, with `--backup`,
+when it replaces an existing install. Each directory is a complete copy of the
+installed distribution and its metadata, the wrapper, the launcher and the unit
+files, plus the `restore.sh` that puts them back; config, state, cache,
+passwords and excludes are outside it because an upgrade never touches them. The
+first run after the copy layout also saves the old `snap_bak/` and `VERSION`, so
+that migration can be undone. Nothing reaps these directories, so an operator
+deletes them by hand once the new install has proven itself.
 
-All paths are relative to the install directory (`<install>`, production
+[[R-STATE-06]] All paths are relative to the install directory (`<install>`,
+production
 `/opt/snap-bak`). The `restic` and `rclone` binaries are optional (rclone only
 if a repo uses an `rclone:` path). No `.local` or `.config` directories are
 used.
@@ -1283,39 +1288,39 @@ uv run pytest -q
 
 ## Deployment Contract
 
-These are requirements on the install, not a description of one host. Every
-command README presents for operating an installed box, and every command in the
-agent skill, must work after a fresh box meets the baseline and runs the official
-install, with nothing else done. A command that needs more is a bug in the docs
-or the install. The explicitly labelled development option in README is outside
-this contract.
+[[R-DEPLOY-01]] These are requirements on the install, not a description of one
+host. Every command README presents for operating an installed box, and every
+command in the agent skill, must work after a fresh box meets the baseline and
+runs the official install, with nothing else done. A command that needs more is
+a bug in the docs or the install. The explicitly labelled development option in
+README is outside this contract.
 
-- **Baseline.** Linux with btrfs and systemd, Python 3.14 or newer with pip,
-  PyPI access for the first install, and restic at `/usr/local/bin/restic` as a
-  real root-owned file. rclone only for `rclone:` repositories. See *Supported
-  Platform & Dependencies*.
-- **Only install.** A clone plus `snap-bak-setup.sh`, optionally with
-  `PYTHON_BIN`. No pip install by the operator, no operator-managed virtualenv,
-  no PATH edit.
-- **Command.** The install writes `/usr/local/bin/snap-bak`, bound to the venv
-  interpreter and `/opt/snap-bak/config.json`. It runs the installed
-  distribution whatever the caller's cwd contains, so a stray `snap_bak/`
-  cannot shadow it, and bare commands read the production config the same way
-  the service does.
-- **Operator.** The operator is an administrator with sudo. Tool commands run as
-  the service user, `sudo -u snap-bak snap-bak ...`, because state, cache, the
-  restic config and the sudo wrapper all belong to that identity. Journal and
-  state reads need root. Files passed to the tool (`-c`, `--excludes-file`)
-  must be readable by the service user.
-- **Version.** The package is installed as a distribution in
+- [[R-DEPLOY-02]] **Baseline.** Linux with btrfs and systemd, Python 3.14 or newer
+  with pip, PyPI access for the first install, and restic at
+  `/usr/local/bin/restic` as a real root-owned file. rclone only for `rclone:`
+  repositories. See *Supported Platform & Dependencies*.
+- [[R-DEPLOY-03]] **Only install.** A clone plus `snap-bak-setup.sh`, optionally
+  with `PYTHON_BIN`. No pip install by the operator, no operator-managed
+  virtualenv, no PATH edit.
+- [[R-DEPLOY-04]] **Command.** The install writes `/usr/local/bin/snap-bak`,
+  bound to the venv interpreter and `/opt/snap-bak/config.json`. It runs the
+  installed distribution whatever the caller's cwd contains, so a stray
+  `snap_bak/` cannot shadow it, and bare commands read the production config the
+  same way the service does.
+- [[R-DEPLOY-05]] **Operator.** The operator is an administrator with sudo. Tool
+  commands run as the service user, `sudo -u snap-bak snap-bak ...`, because
+  state, cache, the restic config and the sudo wrapper all belong to that
+  identity. Journal and state reads need root. Files passed to the tool (`-c`,
+  `--excludes-file`) must be readable by the service user.
+- [[R-DEPLOY-06]] **Version.** The package is installed as a distribution in
   `/opt/snap-bak/venv`, and `snap-bak --version` reports that distribution's
   metadata. There is no separate version file.
-- **Upgrade.** Re-running the script is idempotent, keeps `config.json`, and,
-  when run with `--backup`, saves the install it replaces under `rollback/` with
-  a `restore.sh` that puts back the installed distribution and its metadata, the
-  wrapper, the launcher, the build stamp and the unit files. Without `--backup`
-  no copy is made. The first run after the copy layout also saves the old copy
-  so the migration can be undone.
+- [[R-DEPLOY-07]] **Upgrade.** Re-running the script is idempotent, keeps
+  `config.json`, and, when run with `--backup`, saves the install it replaces
+  under `rollback/` with a `restore.sh` that puts back the installed distribution
+  and its metadata, the wrapper, the launcher, the build stamp and the unit
+  files. Without `--backup` no copy is made. The first run after the copy layout
+  also saves the old copy so the migration can be undone.
 
 ---
 
