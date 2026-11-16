@@ -731,11 +731,11 @@ the common authoring mistake of writing `/home/user/x` when the root is
 
 ### The report
 
-One row per **exclude rule**, one column pair (`files / bytes`) per **source**,
-with a total row. This is the layout the whole feature exists for: a rule that
-drops 40k files from the live filesystem and 3 from what restic stored has either
-never been deployed or has stopped matching, and the difference is invisible
-unless both numbers are on one page.
+[[R-EXCL-48]] One row per **exclude rule**, one column pair (`files / bytes`)
+per **source**, with a total row. This is the layout the whole feature exists
+for: a rule that drops 40k files from the live filesystem and 3 from what restic
+stored has either never been deployed or has stopped matching, and the
+difference is invisible unless both numbers are on one page.
 
 ```
 TOTAL files   TOTAL bytes        live   snap:2026-01-22_10:00Z   restic:a1b2c3d4   exclude pattern
@@ -747,207 +747,213 @@ TOTAL files   TOTAL bytes        live   snap:2026-01-22_10:00Z   restic:a1b2c3d4
       4361       13.1T 131 / 29.8M  143 / 1.0M    30 / 4.5G   TOTAL
 ```
 
-**Every configured rule gets a row, including one that matches nothing.** The
-zero row is the finding: it is what separates "not deployed yet" from "stopped
-matching", and a report that omits it cannot express either. A rule added by a
-trial is marked `+` rather than the config's own rules being hidden — the table
-exists to be read against them.
+[[R-EXCL-49]] **Every configured rule gets a row, including one that matches
+nothing.** The zero row is the finding: it is what separates "not deployed yet"
+from "stopped matching", and a report that omits it cannot express either. A
+rule added by a trial is marked `+` rather than the config's own rules being
+hidden — the table exists to be read against them.
 
 ### What counts as a file
 
-A file is a **non-directory entry restic stores**: a regular file, a symlink, or
-a hardlink. Established against restic 0.19.1 (see `docs/verification.md`):
+[[R-EXCL-50]] A file is a **non-directory entry restic stores**: a regular file,
+a symlink, or a hardlink. Established against restic 0.19.1 (see
+`docs/verification.md`):
 
-| Kind | Counted as a file | Bytes |
-|------|-------------------|-------|
-| regular file | yes | `lstat` size, matching `restic ls --long` |
-| symlink | yes | **0** — the node restic stores, reported at 0 by `restic ls --long` |
-| hardlink | yes, once per path | full size per path, matching restic's own `ls` |
-| directory | **never** | 0 |
+| ID | Kind | Counted as a file | Bytes |
+|----|------|-------------------|-------|
+| [[R-EXCL-51]] | regular file | yes | `lstat` size, matching `restic ls --long` |
+| [[R-EXCL-52]] | symlink | yes | **0** — the node restic stores, reported at 0 by `restic ls --long` |
+| [[R-EXCL-53]] | hardlink | yes, once per path | full size per path, matching restic's own `ls` |
+| [[R-EXCL-54]] | directory | **never** | 0 |
 
 Consequences that are load-bearing:
 
-- **A symlink priced by `lstat` would make `--live` and `--repo` disagree** about
+- [[R-EXCL-55]] **A symlink priced by `lstat` would make `--live` and `--repo` disagree** about
   the same file: `lstat` reports the length of the *target path*, which is not a
   payload restic holds.
-- **A hardlink is counted once per path**, which is what keeps the two columns
+- [[R-EXCL-56]] **A hardlink is counted once per path**, which is what keeps the two columns
   equal — `restic ls` reports every hardlinked path at full size. The figure
   therefore overstates what `prune` reclaims by exactly the shared blocks. The
   post-prune `stats` delta remains the authoritative reclaimed figure.
-- **A directory is never a file**, so a matched empty directory reports 0 and a
+- [[R-EXCL-57]] **A directory is never a file**, so a matched empty directory reports 0 and a
   matched populated one reports its subtree. Counting directories would make the
   total depend on layout rather than on data.
 
-`restic ls --long` renders a symlink as `path -> target`, with Go's capital-`L`
-mode. The arrow is part of the rendered line, not the name, so it is split off —
-otherwise a symlink matches no pattern and silently never appears in a `--repo`
-report at all.
+[[R-EXCL-58]] `restic ls --long` renders a symlink as `path -> target`, with Go's
+capital-`L` mode. The arrow is part of the rendered line, not the name, so it is
+split off — otherwise a symlink matches no pattern and silently never appears in
+a `--repo` report at all.
 
 ### `-v`: the file sheet
 
-A second table, one line per excluded file, paths **relative to the mount point**
-— relative, because that is the only form in which a file present in three
-sources appears once instead of three times, which is the entire point of putting
-the sources side by side. The file-count columns are dropped: every line is
-exactly one file.
+[[R-EXCL-59]] A second table, one line per excluded file, paths **relative to the
+mount point** — relative, because that is the only form in which a file present
+in three sources appears once instead of three times, which is the entire point
+of putting the sources side by side. The file-count columns are dropped: every
+line is exactly one file.
 
-A matched directory is opened up into its contents, which costs nothing extra on
-the `--repo` path (the listing already holds every path) and one traversal on the
-walk path (`_subtree_totals` reports each file as it counts it). Expanded files
-are attributed to the rule that matched the **directory**, because restic pruned
-it and no pattern ever reached them.
+[[R-EXCL-60]] A matched directory is opened up into its contents, which costs
+nothing extra on the `--repo` path (the listing already holds every path) and one
+traversal on the walk path (`_subtree_totals` reports each file as it counts it).
+Expanded files are attributed to the rule that matched the **directory**, because
+restic pruned it and no pattern ever reached them.
 
 ### Output formats
 
-| Format | Columns | Units | Fitted |
-|--------|---------|-------|--------|
-| `text` (default) | fitted to the terminal, oldest dropped first | abbreviated to ≤4 chars | yes |
-| `markdown` | every column | abbreviated | no |
-| `csv` | union of every job's columns | raw integers | no |
-| `--json` | every column | raw integers | no |
+| ID | Format | Columns | Units | Fitted |
+|----|--------|---------|-------|--------|
+| [[R-EXCL-61]] | `text` (default) | fitted to the terminal, oldest dropped first | abbreviated to ≤4 chars | yes |
+| [[R-EXCL-62]] | `markdown` | every column | abbreviated | no |
+| [[R-EXCL-63]] | `csv` | union of every job's columns | raw integers | no |
+| [[R-EXCL-64]] | `--json` | every column | raw integers | no |
 
-Only the console is fitted. Whole source columns are dropped — never truncated
-mid-number — and what they held is stated underneath, so a fitted table never
-reads as a complete one. A terminal's row per source is `files / bytes`; the
-console puts the numeric columns before the rule or path, which are the columns
-of unbounded width and may be folded at the right without disturbing a number.
+[[R-EXCL-65]] Only the console is fitted. Whole source columns are dropped —
+never truncated mid-number — and what they held is stated underneath, so a
+fitted table never reads as a complete one. [[R-EXCL-66]] A terminal's row per
+source is `files / bytes`; the console puts the numeric columns before the rule
+or path, which are the columns of unbounded width and may be folded at the right
+without disturbing a number.
 
-`--format csv` emits one header for the whole invocation, built as the union of
-every job's source columns: two jobs rarely share a snapshot set, and a header
-per job is not a table any importer accepts. `--json` emits **one** document
-holding the lint results, every job and every source.
+[[R-EXCL-67]] `--format csv` emits one header for the whole invocation, built as
+the union of every job's source columns: two jobs rarely share a snapshot set,
+and a header per job is not a table any importer accepts. [[R-EXCL-68]] `--json`
+emits **one** document holding the lint results, every job and every source.
 
 ### `apply excludes`
 
-Dry-run by default: prints affected snapshot IDs, projected bytes, and the exact
-`restic rewrite` command that `--now` would run. Only `--now` and the scheduled
-run mutate.
+[[R-APPLY-01]] Dry-run by default: prints affected snapshot IDs, projected bytes,
+and the exact `restic rewrite` command that `--now` would run. Only `--now` and
+the scheduled run mutate.
 
-`--later` **queues** the rewrite as `rewrite-drop-excluded-files` on that job's
-state file, after checking there is genuinely something to do: a job whose repo
-has no snapshots holding excluded files is refused rather than queued. An empty
-repo means the store went empty or retention took everything, which is a
-problem to notice, not a rewrite to schedule. Queuing a task that is already
-queued is an error, not a silent no-op.
+[[R-APPLY-02]] `--later` **queues** the rewrite as `rewrite-drop-excluded-files`
+on that job's state file, after checking there is genuinely something to do: a
+job whose repo has no snapshots holding excluded files is refused rather than
+queued. [[R-APPLY-03]] An empty repo means the store went empty or retention
+took everything, which is a problem to notice, not a rewrite to schedule.
+[[R-APPLY-04]] Queuing a task that is already queued is an error, not a silent
+no-op.
 
 Execution order (each step is separately failure-isolated):
 
-1. **Plan** — `apply.plan()`, the same call `show excludes --repo` and the
+1. [[R-APPLY-05]] **Plan** — `apply.plan()`, the same call `show excludes --repo` and the
    dry-run use, so what the user approves is what runs.
-2. **Preflight** — repo reachable (`restic cat config`; rc 10/12 abort before any
+2. [[R-APPLY-06]] **Preflight** — repo reachable (`restic cat config`; rc 10/12 abort before any
    write) and unlocked (rc 11 abort). Nothing has been modified at this point.
-3. **Rewrite** — a single `restic rewrite <ids> --exclude-file … --exclude …
+3. [[R-APPLY-07]] **Rewrite** — a single `restic rewrite <ids> --exclude-file … --exclude …
    --forget`. Rewritten snapshots keep their original time, host and tag, so
    retention keeps working. restic adds a `rewrite` tag only when `--forget`
    is *not* used, so `--forget` keeps the tag set exactly as it was.
-4. **Prune** — one `restic prune` per repo to actually reclaim the space. The
+4. [[R-APPLY-08]] **Prune** — one `restic prune` per repo to actually reclaim the space. The
    measured duration is logged: prune is the expensive step, and seeing how long
    it took is how an operator judges whether the gate is set too generously.
 
-**Contention.** A scheduled apply runs inside the GlobalLock the run already
-holds, because that lock is what guards local btrfs snapshots as well. `--now`
-deliberately takes no lock and adds no `--retry-lock`: restic serializes on the
-repository's own lock, so a contended `--now` fails immediately with rc 11 and the
-answer is `--later`, which rides the next scheduled run. restic's own lock is
-what prevents repo corruption; a second lock would duplicate it, not strengthen
-it.
+[[R-APPLY-09]] **Contention.** A scheduled apply runs inside the GlobalLock the
+run already holds, because that lock is what guards local btrfs snapshots as
+well. [[R-APPLY-10]] `--now` deliberately takes no lock and adds no
+`--retry-lock`: restic serializes on the repository's own lock, so a contended
+`--now` fails immediately with rc 11 and the answer is `--later`, which rides the
+next scheduled run. restic's own lock is what prevents repo corruption; a second
+lock would duplicate it, not strengthen it.
 
-`--forget` is used in the same command deliberately: a standalone
+[[R-APPLY-11]] `--forget` is used in the same command deliberately: a standalone
 `restic forget <ids>` would **also apply retention policies** to the group and
 could delete snapshots beyond the intent. `--forget` removes exactly the
 rewritten originals.
 
-All affected snapshot IDs go into **one** `rewrite` invocation rather than a
-loop, so the repo is opened once and the work is all-or-nothing per snapshot:
-a snapshot restic could not rewrite keeps its original and its files. Only
-snapshots that actually hold a match are rewritten — the test is a per-snapshot
-membership check against the collected set, not "did this snapshot introduce a
-path we had not seen", which with restic's newest-first listing would rewrite one
-snapshot and leave every older copy in place.
+[[R-APPLY-12]] All affected snapshot IDs go into **one** `rewrite` invocation
+rather than a loop, so the repo is opened once and the work is all-or-nothing per
+snapshot: a snapshot restic could not rewrite keeps its original and its files.
+[[R-APPLY-13]] Only snapshots that actually hold a match are rewritten — the
+test is a per-snapshot membership check against the collected set, not "did this
+snapshot introduce a path we had not seen", which with restic's newest-first
+listing would rewrite one snapshot and leave every older copy in place.
 
-Failure behaviour: a failed rewrite leaves the originals in place; a failed
-prune leaves data merely unreclaimed. Both are safe to retry. A snapshot with
-zero matching files is skipped, so repeated runs converge and never re-upload
-identical trees.
+[[R-APPLY-14]] Failure behaviour: a failed rewrite leaves the originals in place;
+a failed prune leaves data merely unreclaimed. Both are safe to retry.
+[[R-APPLY-15]] A snapshot with zero matching files is skipped, so repeated runs
+converge and never re-upload identical trees.
 
-Outcomes are reported as `apply.Outcome`, deliberately a different type from
-`job.Result` (the one `exit_code()` consumes), so an apply can never move the
-run's exit code or be mistaken for a backup result.
+[[R-APPLY-16]] Outcomes are reported as `apply.Outcome`, deliberately a
+different type from `job.Result` (the one `exit_code()` consumes), so an apply
+can never move the run's exit code or be mistaken for a backup result.
 
 ### Arming a scheduled cleanup
 
-There is exactly one arming mechanism: the queue. `--later` adds a task to that
-job's state file; the next eligible run performs it and removes the entry. There
-is no config key that schedules this, so editing `excludes` alone can never
-rewrite history.
+[[R-APPLY-17]] There is exactly one arming mechanism: the queue. `--later` adds
+a task to that job's state file; the next eligible run performs it and removes
+the entry. There is no config key that schedules this, so editing `excludes`
+alone can never rewrite history.
 
 | Mechanism | Scope | Meaning |
 |-----------|-------|---------|
 | `--later` | one-shot | the next eligible run does this, then forgets it |
 
-`--now` performs it immediately and clears any matching queue entry.
+[[R-APPLY-18]] `--now` performs it immediately and clears any matching queue
+entry.
 
-A task that fails or is delayed **keeps** its entry, so it is retried at the next
-eligible window, with `attempts` and the last restic exit code recorded so a
-persistent failure escalates in the log rather than retrying nightly in silence.
-The attempt count deliberately does not gate the retry: the window gates already
-bound how often this runs — at most once per eligible window — and the operation
-is idempotent, so re-running is safe.
+[[R-APPLY-19]] A task that fails or is delayed **keeps** its entry, so it is
+retried at the next eligible window, with `attempts` and the last restic exit
+code recorded so a persistent failure escalates in the log rather than retrying
+nightly in silence. [[R-APPLY-20]] The attempt count deliberately does not gate
+the retry: the window gates already bound how often this runs — at most once per
+eligible window — and the operation is idempotent, so re-running is safe.
 
-A task name is declared once, by the handler that implements it
+[[R-APPLY-21]] A task name is declared once, by the handler that implements it
 (`@todo.task("rewrite-drop-excluded-files")`), and the registry is built from
-those declarations, so a name cannot drift from the function it names. Names are
-stored verbatim in the state file and read by a human wondering what a queued
-run will do, so they read as the restic operation plus its goal.
+those declarations, so a name cannot drift from the function it names.
+[[R-APPLY-22]] Names are stored verbatim in the state file and read by a human
+wondering what a queued run will do, so they read as the restic operation plus
+its goal.
 
 ### Run-time gate
 
-Queued work runs only when **all** hold, evaluated after backups complete,
-cheapest first:
+[[R-GATE-01]] Queued work runs only when **all** hold, evaluated after backups
+complete, cheapest first:
 
-1. The job has something queued.
-2. The job has excludes to apply.
-3. Inside the job's backup window.
-4. At least **half** the window length remains.
-5. Repo reachable and unlocked.
-6. At least one snapshot actually contains a matching file.
+1. [[R-GATE-02]] The job has something queued.
+2. [[R-GATE-03]] The job has excludes to apply.
+3. [[R-GATE-04]] Inside the job's backup window.
+4. [[R-GATE-05]] At least **half** the window length remains.
+5. [[R-GATE-06]] Repo reachable and unlocked.
+6. [[R-GATE-07]] At least one snapshot actually contains a matching file.
 
-`rewrite` is metadata-scale — it rebuilds and re-uploads *tree* blobs only; file
-data blobs stay shared with the original snapshot — which is what makes a cheap
-gate sufficient. No duration estimate is needed.
+[[R-GATE-08]] `rewrite` is metadata-scale — it rebuilds and re-uploads *tree*
+blobs only; file data blobs stay shared with the original snapshot — which is
+what makes a cheap gate sufficient. No duration estimate is needed.
 
-Phase order is **backups → queued work → retention(forget) → prune**, and the
-work phase registers its repos into the prune set alongside retention's, so a
-single prune per repo reclaims both. A repo whose job has no `backup_retention`
-is still pruned if a task made data there unreferenced.
+[[R-GATE-09]] Phase order is **backups → queued work → retention(forget) →
+prune**, and the work phase registers its repos into the prune set alongside
+retention's, so a single prune per repo reclaims both. [[R-GATE-10]] A repo
+whose job has no `backup_retention` is still pruned if a task made data there
+unreferenced.
 
-Queued work is the only thing this phase runs, and it is the only work a user
-asked for by name, so its outcome joins the run's own results and reaches the
-exit-code ladder. A task that fails or is delayed reports non-zero; a task that
-found nothing to do reports as an ordinary skip and changes nothing. The ladder
-accumulates with `any()` over all results, so a task can never mask a backup
-outcome.
+[[R-GATE-11]] Queued work is the only thing this phase runs, and it is the only
+work a user asked for by name, so its outcome joins the run's own results and
+reaches the exit-code ladder. A task that fails or is delayed reports non-zero; a
+task that found nothing to do reports as an ordinary skip and changes nothing.
+The ladder accumulates with `any()` over all results, so a task can never mask a
+backup outcome.
 
-A repo that is missing, locked or unreadable (restic 10/11/12) is a *temporary*
-problem and reports as `delayed` (exit 30) — it may well be fine on the next
-window. Any other restic failure reports as `failed` (exit 41), because it will
-not fix itself until the config changes.
+[[R-GATE-12]] A repo that is missing, locked or unreadable (restic 10/11/12) is a
+*temporary* problem and reports as `delayed` (exit 30) — it may well be fine on
+the next window. Any other restic failure reports as `failed` (exit 41), because
+it will not fix itself until the config changes.
 
-**A check, not a gate.** The backup that just ran used the job's current
-excludes, so its snapshot should hold nothing to remove. If the plan finds
-matches in the newest snapshot anyway, the run logs a warning: the backup path is
-not honouring the excludes. The rewrite still proceeds — the data ends up
+[[R-GATE-13]] **A check, not a gate.** The backup that just ran used the job's
+current excludes, so its snapshot should hold nothing to remove. If the plan
+finds matches in the newest snapshot anyway, the run logs a warning: the backup
+path is not honouring the excludes. The rewrite still proceeds — the data ends up
 correct — but the bug gets named instead of being quietly cleaned up after.
 
-A dry run reports and returns without touching the queue at all: simulating a run
-must not consume the request the real run is waiting for.
+[[R-GATE-14]] A dry run reports and returns without touching the queue at all:
+simulating a run must not consume the request the real run is waiting for.
 
-Failures are never retried by a counter. A transient repo problem (unreachable,
-locked) breaks every restic operation in the run equally, so the ordinary run
-logic already handles it and the next eligible window simply tries again; the
-operation is idempotent, so re-running is safe. What snap-bak must not do is
-retry silently forever — hence the loud log naming the failing phase and exit
-code, and the retained queue entry with its attempt count.
+[[R-GATE-15]] Failures are never retried by a counter. A transient repo problem
+(unreachable, locked) breaks every restic operation in the run equally, so the
+ordinary run logic already handles it and the next eligible window simply tries
+again; the operation is idempotent, so re-running is safe. What snap-bak must not
+do is retry silently forever — hence the loud log naming the failing phase and
+exit code, and the retained queue entry with its attempt count.
 
 ### IO & duration
 

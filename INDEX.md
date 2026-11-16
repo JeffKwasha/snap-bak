@@ -173,3 +173,40 @@ Conventions:
 | [[R-EXCL-45]] | SPEC.md | Excludes: Inspection & Application |
 | [[R-EXCL-46]] | SPEC.md | Excludes: Inspection & Application |
 | [[R-EXCL-47]] | SPEC.md | Excludes: Inspection & Application |
+| [[R-APPLY-01]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-02]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-03]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-04]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-05]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-06]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-07]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-08]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-09]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-10]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-11]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-12]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-13]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-14]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-15]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-16]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-17]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-18]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-19]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-20]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-21]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-APPLY-22]] | SPEC.md | `apply excludes`, Arming a scheduled cleanup |
+| [[R-GATE-01]] | SPEC.md | Run-time gate |
+| [[R-GATE-02]] | SPEC.md | Run-time gate |
+| [[R-GATE-03]] | SPEC.md | Run-time gate |
+| [[R-GATE-04]] | SPEC.md | Run-time gate |
+| [[R-GATE-05]] | SPEC.md | Run-time gate |
+| [[R-GATE-06]] | SPEC.md | Run-time gate |
+| [[R-GATE-07]] | SPEC.md | Run-time gate |
+| [[R-GATE-08]] | SPEC.md | Run-time gate |
+| [[R-GATE-09]] | SPEC.md | Run-time gate |
+| [[R-GATE-10]] | SPEC.md | Run-time gate |
+| [[R-GATE-11]] | SPEC.md | Run-time gate |
+| [[R-GATE-12]] | SPEC.md | Run-time gate |
+| [[R-GATE-13]] | SPEC.md | Run-time gate |
+| [[R-GATE-14]] | SPEC.md | Run-time gate |
+| [[R-GATE-15]] | SPEC.md | Run-time gate |
