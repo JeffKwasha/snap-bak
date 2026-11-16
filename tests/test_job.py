@@ -424,7 +424,7 @@ def test_a_missing_snapshot_dir_is_caught_before_anything_is_written(
 
 
 class TestGlobalLockLog:
-    def test_both_lines_name_the_version_and_the_build_time(
+    def test_both_lines_name_the_version_and_the_build_time(  # [[R-LOCK-02]]
         self, tmp_path, monkeypatch, caplog
     ):
         monkeypatch.setattr(config, "GLOBAL_LOCK_FILE", tmp_path / "snap-bak.lock")

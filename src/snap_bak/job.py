@@ -297,7 +297,7 @@ def _build_time() -> str:
     return stamped or _program_mtime()
 
 
-def _lock_transition(what: str) -> str:
+def _lock_transition(what: str) -> str:  # [[R-LOCK-02]]
     """The acquire/release line: which build took the lock, and when it was built."""
     return f"Global lock {what} (version {__version__}, build {_build_time()})."
 
