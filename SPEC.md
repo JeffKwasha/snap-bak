@@ -158,11 +158,15 @@ Algorithm (shared by both strategies):
 
 ### Config File Location
 
-Default: `config/config.json` (repo-relative)
-Override: `-c/--config` flag or `SNAPBAK_CONFIG_FILE` env var
-Production: `SNAPBAK_CONFIG_FILE=/opt/snap-bak/config.json` (set by the systemd service)
+[[R-CONFIG-01]] Default: `config/config.json` (repo-relative)
+
+[[R-CONFIG-02]] Override: `-c/--config` flag or `SNAPBAK_CONFIG_FILE` env var
+
+[[R-CONFIG-03]] Production: `SNAPBAK_CONFIG_FILE=/opt/snap-bak/config.json` (set by the systemd service)
 
 ### Config Schema
+
+[[R-CONFIG-04]]
 
 ```jsonc
 {
@@ -175,15 +179,15 @@ Production: `SNAPBAK_CONFIG_FILE=/opt/snap-bak/config.json` (set by the systemd 
 }
 ```
 
-`restic_update` (`after|never`, default `never`) controls when the privileged
-wrapper's `update-restic` op runs. `after` = update only after a run in which a
-backup actually completed (never on skipped/dry-run runs — updating restic
-rewrites a binary carrying `cap_dac_read_search`, so it must never run without
-reason). `never` = manual only. `before` is deliberately unsupported: it would
-update before knowing whether any backup will happen.
+[[R-CONFIG-05]] `restic_update` (`after|never`, default `never`) controls when
+the privileged wrapper's `update-restic` op runs. `after` = update only after a
+run in which a backup actually completed (never on skipped/dry-run runs —
+updating restic rewrites a binary carrying `cap_dac_read_search`, so it must
+never run without reason). `never` = manual only. `before` is deliberately
+unsupported: it would update before knowing whether any backup will happen.
 
-Duration and size fields (`stuck_threshold`, `stuck_wait`, `size_limit`,
-`snapshot_interval`, `backup_interval`) accept either a bare
+[[R-CONFIG-06]] Duration and size fields (`stuck_threshold`, `stuck_wait`,
+`size_limit`, `snapshot_interval`, `backup_interval`) accept either a bare
 integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 `"1w"`, `"200GB"`, `"1.5TiB"`. Units: durations `s m h d w`; sizes
 `b k/kb/kib m/mb/mib g/gb/gib t/tb/tib p/pb/pib` (binary multiples).
@@ -202,15 +206,15 @@ integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 }
 ```
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `name` | string | required | Unique repo identifier |
-| `path` | string | required | Restic repo path (e.g., `rclone:CONFIG_ENTRY:DIRECTORY`) |
-| `password_file` | string | "" | Path to restic password file (per-repo, under `/opt/snap-bak/passwords/`) |
-| `size_limit` | int/string | 0 | Max repo size (0 = unlimited). Int bytes or e.g. `"200GB"` |
-| `latency_ms` | int | 100 | Estimated latency for ETA calculation |
-| `throughput_mbps` | int | 1 | Estimated throughput for ETA calculation (seeding hint) |
-| `restic_options` | list | `[]` | Extra restic CLI flags against this repo; global options apply to every command, backup-only options to `backup` alone |
+| ID | Field | Type | Default | Description |
+|----|-------|------|---------|-------------|
+| [[R-REPO-01]] | `name` | string | required | Unique repo identifier |
+| [[R-REPO-02]] | `path` | string | required | Restic repo path (e.g., `rclone:CONFIG_ENTRY:DIRECTORY`) |
+| [[R-REPO-03]] | `password_file` | string | "" | Path to restic password file (per-repo, under `/opt/snap-bak/passwords/`) |
+| [[R-REPO-04]] | `size_limit` | int/string | 0 | Max repo size (0 = unlimited). Int bytes or e.g. `"200GB"` |
+| [[R-REPO-05]] | `latency_ms` | int | 100 | Estimated latency for ETA calculation |
+| [[R-REPO-06]] | `throughput_mbps` | int | 1 | Estimated throughput for ETA calculation (seeding hint) |
+| [[R-REPO-07]] | `restic_options` | list | `[]` | Extra restic CLI flags against this repo; global options apply to every command, backup-only options to `backup` alone |
 
 ### Job Schema
 
@@ -234,41 +238,44 @@ integer (seconds/bytes) or a human-readable string — e.g. `"90m"`, `"2h"`,
 }
 ```
 
-| Field | Type | Default | Constraint | Description |
-|-------|------|---------|------------|-------------|
-| `name` | string | required | `[A-Za-z0-9_-]` | Job id; must be filesystem-safe (`<state>/<name>.json`, restic tag). Does NOT set the mount point |
-| `snapshot_dir` | string | required | must exist | Path to btrfs snapshot directory |
-| `source_subvolume` | string | required | — | Btrfs subvolume to snapshot; mount point = `<mount_base>/<last component>` |
-| `repo` | string | required | must reference repo.name | Repo to backup to |
-| `priority` | int | `100` | `ge=1` | Job priority (higher = more important) |
-| `snapshot_interval` | int/string | `3600` | `ge=900` | Seconds between snapshots, or e.g. `"2h"` |
-| `skip_snapshot_if_idle` | bool | `true` | — | Power saving: skip snapshot creation when any disk in the source's btrfs pool is physically spun down (never wake it), and never snapshot an unchanged subvolume. See Power Saving. |
-| `backup_retention` | dict | `{}` | — | Restic retention policy (e.g., `{"daily": 6}`) |
-| `snapshot_retention` | dict | `{"fn":"exponential","config":{"n":5}}` | — | Local snapshot retention strategy |
-| `backup_interval` | int/string | `3600` | `ge=1` | Seconds between backups, or e.g. `"1w"` |
-| `backup_window_start` | string | `null` | `HH:MM` format | Backup window start (optional); interpreted in the server's LOCAL timezone |
-| `backup_window_end` | string | `null` | `HH:MM` format | Backup window end (optional) |
-| `ignore_file` | string | `""` | — | Restic exclude-from file |
-| `excludes` | list | `[]` | — | Restic exclude patterns |
-| `tag` | string | job name | `[A-Za-z0-9_-]` | Restic tag override |
-| `restic_options` | list | `[]` | — | Extra restic CLI flags for this job; global options apply to every command, backup-only options to `backup` alone |
+| ID | Field | Type | Default | Constraint | Description |
+|----|-------|------|---------|------------|-------------|
+| [[R-JOB-01]] | `name` | string | required | `[A-Za-z0-9_-]` | Job id; must be filesystem-safe (`<state>/<name>.json`, restic tag). Does NOT set the mount point |
+| [[R-JOB-02]] | `snapshot_dir` | string | required | must exist | Path to btrfs snapshot directory |
+| [[R-JOB-03]] | `source_subvolume` | string | required | — | Btrfs subvolume to snapshot; mount point = `<mount_base>/<last component>` |
+| [[R-JOB-04]] | `repo` | string | required | must reference repo.name | Repo to backup to |
+| [[R-JOB-05]] | `priority` | int | `100` | `ge=1` | Job priority (higher = more important) |
+| [[R-JOB-06]] | `snapshot_interval` | int/string | `3600` | `ge=900` | Seconds between snapshots, or e.g. `"2h"` |
+| [[R-JOB-07]] | `skip_snapshot_if_idle` | bool | `true` | — | Power saving: skip snapshot creation when any disk in the source's btrfs pool is physically spun down (never wake it), and never snapshot an unchanged subvolume. See Power Saving. |
+| [[R-JOB-08]] | `backup_retention` | dict | `{}` | — | Restic retention policy (e.g., `{"daily": 6}`) |
+| [[R-JOB-09]] | `snapshot_retention` | dict | `{"fn":"exponential","config":{"n":5}}` | — | Local snapshot retention strategy |
+| [[R-JOB-10]] | `backup_interval` | int/string | `3600` | `ge=1` | Seconds between backups, or e.g. `"1w"` |
+| [[R-JOB-11]] | `backup_window_start` | string | `null` | `HH:MM` format | Backup window start (optional); interpreted in the server's LOCAL timezone |
+| [[R-JOB-12]] | `backup_window_end` | string | `null` | `HH:MM` format | Backup window end (optional) |
+| [[R-JOB-13]] | `ignore_file` | string | `""` | — | Restic exclude-from file |
+| [[R-JOB-14]] | `excludes` | list | `[]` | — | Restic exclude patterns |
+| [[R-JOB-15]] | `tag` | string | job name | `[A-Za-z0-9_-]` | Restic tag override |
+| [[R-JOB-16]] | `restic_options` | list | `[]` | — | Extra restic CLI flags for this job; global options apply to every command, backup-only options to `backup` alone |
 
-The planning state fields that appear in the status file — `delayed`,
-`delayed_reason`, `protected_snapshot`, `missed_slots` — are part of the
-program's interface: they are persisted in the status file and never read from
-config.
+[[R-JOB-17]] The planning state fields that appear in the status file —
+`delayed`, `delayed_reason`, `protected_snapshot`, `missed_slots` — are part of
+the program's interface: they are persisted in the status file and never read
+from config.
 
-`restic_options` on both Repo and Job are appended verbatim to restic
-command lines (repo options first, then job options). Options in restic's
-global set (`RESTIC_GLOBAL_FLAGS` in `src/snap_bak/restic.py`, derived from
-`restic --help`) apply to every restic command; **all other options are
-backup-only** and apply to the `backup` subcommand alone. The `--exclude-file`
-and `--exclude` flags (from `ignore_file`/`excludes`) apply to `backup` **and**
-`rewrite` — the two subcommands that take a file set — and to no other
-subcommand (e.g. `forget` rejects them). Flags snap-bak
-manages itself are filtered out with a warning if a config author sets them:
-`-r/--repo`, `--password-file`, `--json`, `--dry-run`, `--tag`, `--keep-*`,
-`--prune`, `--exclude`, `--exclude-file`, `--forget`.
+- [[R-JOB-18]] `restic_options` on both Repo and Job are appended verbatim to
+  restic command lines (repo options first, then job options).
+- [[R-JOB-19]] Options in restic's global set (`RESTIC_GLOBAL_FLAGS` in
+  `src/snap_bak/restic.py`, derived from `restic --help`) apply to every restic
+  command; **all other options are backup-only** and apply to the `backup`
+  subcommand alone.
+- [[R-JOB-20]] The `--exclude-file` and `--exclude` flags (from
+  `ignore_file`/`excludes`) apply to `backup` **and** `rewrite` — the two
+  subcommands that take a file set — and to no other subcommand (e.g. `forget`
+  rejects them).
+- [[R-JOB-21]] Flags snap-bak manages itself are filtered out with a warning if a
+  config author sets them: `-r/--repo`, `--password-file`, `--json`,
+  `--dry-run`, `--tag`, `--keep-*`, `--prune`, `--exclude`, `--exclude-file`,
+  `--forget`.
 
 ---
 
