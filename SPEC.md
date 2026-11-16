@@ -286,6 +286,8 @@ plus that job's queued work.
 
 ### Schema
 
+[[R-STATUS-01]]
+
 ```json
 {
   "job": "data",
@@ -304,13 +306,13 @@ plus that job's queued work.
 }
 ```
 
-`restic_snapshot_id` is present on success; `failure_category` and `last_error`
-are present on failure. All fields except `job`, `status`, `timestamp`, and
-`message` are optional.
+[[R-STATUS-02]] `restic_snapshot_id` is present on success; `failure_category`
+and `last_error` are present on failure. All fields except `job`, `status`,
+`timestamp`, and `message` are optional.
 
-The `delayed` group carries the delayed-job state (see Delayed Job Handling):
-`delayed` is true while the job cannot proceed; `delayed_reason` is
-`"unreachable"` or `"size_limit"`; `protected_snapshot` names the exact
+[[R-STATUS-03]] The `delayed` group carries the delayed-job state (see Delayed
+Job Handling): `delayed` is true while the job cannot proceed; `delayed_reason`
+is `"unreachable"` or `"size_limit"`; `protected_snapshot` names the exact
 snapshot to retry (same `YYYY-MM-DD_HH:MMZ` format as the snapshot naming rule);
 `missed_slots` counts missed backup slots and feeds the priority system. On
 success the group resets to `delayed=false`, `delayed_reason=null`,
@@ -318,38 +320,38 @@ success the group resets to `delayed=false`, `delayed_reason=null`,
 
 ### Status Values
 
-| Status | Meaning | Exit Code |
-|--------|---------|-----------|
-| `started` | Backup initiated | — |
-| `success` | Backup completed | 0 |
-| `skipped` | Not time / outside window / snapshot too young | 0 |
-| `delayed` | Repo unreachable or over size_limit | 30-31 (temp) |
-| `failed` | Backup failed and slot expired | 41 (perm) |
-| `dry_run` | Preflight only | 0 |
+| ID | Status | Meaning | Exit Code |
+|----|--------|---------|-----------|
+| [[R-STATUS-04]] | `started` | Backup initiated | — |
+| [[R-STATUS-05]] | `success` | Backup completed | 0 |
+| [[R-STATUS-06]] | `skipped` | Not time / outside window / snapshot too young | 0 |
+| [[R-STATUS-07]] | `delayed` | Repo unreachable or over size_limit | 30-31 (temp) |
+| [[R-STATUS-08]] | `failed` | Backup failed and slot expired | 41 (perm) |
+| [[R-STATUS-09]] | `dry_run` | Preflight only | 0 |
 
 ---
 
 ## Error Codes
 
-| Code | Constant | Category | Meaning |
-|------|----------|----------|---------|
-| 0 | EXIT_SUCCESS | Success | All jobs succeeded or skipped |
-| 1 | EXIT_ERROR | General | Unexpected error |
-| 2 | EXIT_CONFIG_ERROR | Config | Config validation failed |
-| 3 | EXIT_MOUNT_ERROR | Mount | Mount base not found |
-| 4 | EXIT_PERMISSION_ERROR | Permission | Password file readable by a group other than snap-bak, or by other |
-| 30 | EXIT_TEMP_UNREACHABLE | Temporary | Repo unreachable (may self-rectify) |
-| 31 | EXIT_TEMP_SIZE_LIMIT | Temporary | Repo over size_limit (may self-rectify) |
-| 40 | EXIT_PERM_TIMEOUT | Permanent | Backup not completed in window |
-| 41 | EXIT_PERM_FAILED | Permanent | Backup failed and slot expired |
-| 50 | EXIT_SYSTEM | System | Lock acquisition failed (no stale instance to clean up) |
-| 51 | EXIT_STUCK_WAIT | System | Stuck wait exceeded |
+| ID | Code | Constant | Category | Meaning |
+|----|------|----------|----------|---------|
+| [[R-ERROR-01]] | 0 | EXIT_SUCCESS | Success | All jobs succeeded or skipped |
+| [[R-ERROR-02]] | 1 | EXIT_ERROR | General | Unexpected error |
+| [[R-ERROR-03]] | 2 | EXIT_CONFIG_ERROR | Config | Config validation failed |
+| [[R-ERROR-04]] | 3 | EXIT_MOUNT_ERROR | Mount | Mount base not found |
+| [[R-ERROR-05]] | 4 | EXIT_PERMISSION_ERROR | Permission | Password file readable by a group other than snap-bak, or by other |
+| [[R-ERROR-06]] | 30 | EXIT_TEMP_UNREACHABLE | Temporary | Repo unreachable (may self-rectify) |
+| [[R-ERROR-07]] | 31 | EXIT_TEMP_SIZE_LIMIT | Temporary | Repo over size_limit (may self-rectify) |
+| [[R-ERROR-08]] | 40 | EXIT_PERM_TIMEOUT | Permanent | Backup not completed in window |
+| [[R-ERROR-09]] | 41 | EXIT_PERM_FAILED | Permanent | Backup failed and slot expired |
+| [[R-ERROR-10]] | 50 | EXIT_SYSTEM | System | Lock acquisition failed (no stale instance to clean up) |
+| [[R-ERROR-11]] | 51 | EXIT_STUCK_WAIT | System | Stuck wait exceeded |
 
 ### Temporary vs Permanent
 
-- **Temporary (30-39)**: Can self-rectify on next run (e.g., network comes back, space frees up)
-- **Permanent (40-49)**: Won't retry until next scheduled backup window
-- **System (50-59)**: Infrastructure issues, not job-specific
+- [[R-ERROR-12]] **Temporary (30-39)**: Can self-rectify on next run (e.g., network comes back, space frees up)
+- [[R-ERROR-13]] **Permanent (40-49)**: Won't retry until next scheduled backup window
+- [[R-ERROR-14]] **System (50-59)**: Infrastructure issues, not job-specific
 
 ---
 
@@ -359,13 +361,14 @@ success the group resets to `delayed=false`, `delayed_reason=null`,
 
 A job is delayed when:
 
-1. **Repo unreachable**: `restic cat config` fails (network, drive offline)
-2. **Repo over size_limit**: After forget/prune, repo size exceeds `size_limit`
+1. [[R-DELAY-01]] **Repo unreachable**: `restic cat config` fails (network, drive offline)
+2. [[R-DELAY-02]] **Repo over size_limit**: After forget/prune, repo size exceeds `size_limit`
 
 ### Delay State
 
-Delaying a job: mark it delayed with a reason, protect the source snapshot,
-increment `missed_slots`, and record a `delayed` status naming the snapshot.
+[[R-DELAY-03]] Delaying a job: mark it delayed with a reason, protect the source
+snapshot, increment `missed_slots`, and record a `delayed` status naming the
+snapshot.
 
 ```
 delay(snapshot, reason):
@@ -377,7 +380,7 @@ delay(snapshot, reason):
 
 ### Delayed Recovery Flow
 
-On next run, during planning phase:
+[[R-DELAY-04]] On next run, during planning phase:
 
 ```
 was_delayed = job was delayed last run
@@ -398,23 +401,21 @@ else:
 
 ### Protected Snapshot Lifecycle
 
-- Protected snapshot = snapshot name referenced in `status_file["protected_snapshot"]`
-- During exponential cleanup: simply not deleted
-- Otherwise treated like any other snapshot (counted toward retention)
-- When delayed state clears (success): protection clears automatically
+- [[R-DELAY-05]] Protected snapshot = snapshot name referenced in `status_file["protected_snapshot"]`
+- [[R-DELAY-06]] During exponential cleanup: simply not deleted
+- [[R-DELAY-07]] Otherwise treated like any other snapshot (counted toward retention)
+- [[R-DELAY-08]] When delayed state clears (success): protection clears automatically
 - No special deletion logic needed
 
 ### Multi-Job Repo Handling
 
 If multiple jobs share a repo:
 
-1. Check repo reachability once per run (cached)
-2. If unreachable: all jobs for that repo are delayed
+1. [[R-DELAY-09]] Check repo reachability once per run (cached)
+2. [[R-DELAY-10]] If unreachable: all jobs for that repo are delayed
 3. If reachable but over size_limit:
-   - Sort jobs by effective priority
-   - Highest priority job runs
-   - Remaining jobs for that repo are skipped (not delayed)
-   - They accumulate missed_slots for next run
+   - [[R-DELAY-11]] Sort jobs by effective priority; the highest priority job runs
+   - [[R-DELAY-12]] Remaining jobs for that repo are skipped (not delayed); they accumulate missed_slots for next run
 
 ---
 

@@ -76,3 +76,38 @@ Conventions:
 | [[R-JOB-19]] | SPEC.md | Configuration, Job Schema |
 | [[R-JOB-20]] | SPEC.md | Configuration, Job Schema |
 | [[R-JOB-21]] | SPEC.md | Configuration, Job Schema |
+| [[R-STATUS-01]] | SPEC.md | Status File |
+| [[R-STATUS-02]] | SPEC.md | Status File |
+| [[R-STATUS-03]] | SPEC.md | Status File |
+| [[R-STATUS-04]] | SPEC.md | Status File |
+| [[R-STATUS-05]] | SPEC.md | Status File |
+| [[R-STATUS-06]] | SPEC.md | Status File |
+| [[R-STATUS-07]] | SPEC.md | Status File |
+| [[R-STATUS-08]] | SPEC.md | Status File |
+| [[R-STATUS-09]] | SPEC.md | Status File |
+| [[R-ERROR-01]] | SPEC.md | Error Codes |
+| [[R-ERROR-02]] | SPEC.md | Error Codes |
+| [[R-ERROR-03]] | SPEC.md | Error Codes |
+| [[R-ERROR-04]] | SPEC.md | Error Codes |
+| [[R-ERROR-05]] | SPEC.md | Error Codes |
+| [[R-ERROR-06]] | SPEC.md | Error Codes |
+| [[R-ERROR-07]] | SPEC.md | Error Codes |
+| [[R-ERROR-08]] | SPEC.md | Error Codes |
+| [[R-ERROR-09]] | SPEC.md | Error Codes |
+| [[R-ERROR-10]] | SPEC.md | Error Codes |
+| [[R-ERROR-11]] | SPEC.md | Error Codes |
+| [[R-ERROR-12]] | SPEC.md | Error Codes |
+| [[R-ERROR-13]] | SPEC.md | Error Codes |
+| [[R-ERROR-14]] | SPEC.md | Error Codes |
+| [[R-DELAY-01]] | SPEC.md | Delayed Job Handling |
+| [[R-DELAY-02]] | SPEC.md | Delayed Job Handling |
+| [[R-DELAY-03]] | SPEC.md | Delayed Job Handling |
+| [[R-DELAY-04]] | SPEC.md | Delayed Job Handling |
+| [[R-DELAY-05]] | SPEC.md | Delayed Job Handling |
+| [[R-DELAY-06]] | SPEC.md | Delayed Job Handling |
+| [[R-DELAY-07]] | SPEC.md | Delayed Job Handling |
+| [[R-DELAY-08]] | SPEC.md | Delayed Job Handling |
+| [[R-DELAY-09]] | SPEC.md | Delayed Job Handling |
+| [[R-DELAY-10]] | SPEC.md | Delayed Job Handling |
+| [[R-DELAY-11]] | SPEC.md | Delayed Job Handling |
+| [[R-DELAY-12]] | SPEC.md | Delayed Job Handling |
