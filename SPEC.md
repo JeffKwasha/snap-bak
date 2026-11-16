@@ -1006,9 +1006,8 @@ per-job lock would add complexity without additional protection.
 
 ```
 <install>                # root-owned: venv, wrapper, config
-  venv/                  # virtualenv: the base interpreter's binary, its own site-packages
+  venv/                  # created without pip; the base pip populates it
     bin/python           # what the unit, the wrapper and the launcher run
-    bin/snap-bak         # the console script pip generates (the launcher is the PATH one)
     lib/pythonX.Y/site-packages/
       snap_bak/          # the installed package (root:root)
       snap_bak-<ver>.dist-info/   # METADATA, entry points, RECORD
@@ -1289,11 +1288,10 @@ install, with nothing else done. A command that needs more is a bug in the docs
 or the install. The explicitly labelled development option in README is outside
 this contract.
 
-- **Baseline.** Linux with btrfs and systemd, Python 3.14 or newer with
-  virtualenv support (`python3-venv` on Debian/Ubuntu), PyPI access for the
-  first install, and restic at `/usr/local/bin/restic` as a real root-owned
-  file. rclone only for `rclone:` repositories. See *Supported Platform &
-  Dependencies*.
+- **Baseline.** Linux with btrfs and systemd, Python 3.14 or newer with pip,
+  PyPI access for the first install, and restic at `/usr/local/bin/restic` as a
+  real root-owned file. rclone only for `rclone:` repositories. See *Supported
+  Platform & Dependencies*.
 - **Only install.** A clone plus `snap-bak-setup.sh`, optionally with
   `PYTHON_BIN`. No pip install by the operator, no operator-managed virtualenv,
   no PATH edit.
@@ -1322,8 +1320,8 @@ this contract.
 
 snap-bak supports:
 
-- Python ≥ 3.14 with virtualenv support (`python3 -m venv`; on Debian/Ubuntu
-  the `python3-venv` package)
+- Python ≥ 3.14 with pip (the setup uses the base pip to populate the venv;
+  ensurepip is not needed)
 - pydantic >= 2.0 (config models)
 - python-dateutil (relativedelta for retention calculations)
 - json5 (JSONC config parsing)

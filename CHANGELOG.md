@@ -3,43 +3,34 @@
 All notable changes to snap-bak are documented here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [0.7.0] — 2026-11-16
-
-### Changed
-
-- The install is a standard Python one. The setup script creates
-  `/opt/snap-bak/venv` from the base interpreter, pip-installs the project and
-  its dependencies into it, and the unit, the wrapper and the launcher run that
-  interpreter. PEP 668 never applies and the system Python is never modified.
-- `snap-bak --version` reports the installed distribution's metadata. The
-  `VERSION` marker and the copy layout are gone; the first run after 0.6
-  removes both and backs them up so the migration can be rolled back.
-- `python3 -m venv` must work (Debian/Ubuntu: `python3-venv`), and the first
-  install needs PyPI access for the build backend and the dependencies.
-
-### Removed
-
-- The copied `snap_bak/` package directory and the `VERSION` file.
-
-## [0.6.0] — 2026-11-15
+## [0.6.0] — 2026-11-16
 
 ### Added
 
-- The install writes `/usr/local/bin/snap-bak`, bound to the configured
-  interpreter, `/opt/snap-bak` and the production config. A box that ran only
-  the setup script can now run the documented commands; before this the docs
-  used a command the install never created.
+- The install writes `/usr/local/bin/snap-bak`, bound to the venv interpreter
+  and the production config. A box that ran only the setup script can run the
+  documented commands; before this the docs used a command the install never
+  created.
+- The install is a standard virtualenv distribution. `/opt/snap-bak/venv` is
+  created without pip, and the base interpreter's pip installs the project and
+  its dependencies into it. PEP 668 never applies and the system Python is not
+  modified.
 - SPEC states the deployment contract: baseline, only-install, command,
-  operator, version and upgrade requirements. README and the agent skill now
-  name the service user and run tool commands with `sudo -u snap-bak`.
+  operator, version and upgrade requirements. README and the agent skill name
+  the service user and run tool commands with `sudo -u snap-bak`.
+- The rollback copy saves the installed distribution and its metadata, the
+  wrapper, the launcher and the unit files. On the first run after the copy
+  layout it also saves the old `snap_bak/` and `VERSION`, so the migration can
+  be undone.
 
-### Fixed
+### Changed
 
-- `--version` reports `/opt/snap-bak/VERSION` whenever it exists, so package
-  metadata from another tree cannot name a build that is not running. Metadata
-  is the fallback for a wheel or a source tree.
-- The rollback copy includes the launcher and restores it, or removes it when
-  the previous install had none.
+- `snap-bak --version` reports the installed distribution's metadata. The
+  `VERSION` marker and the copied `snap_bak/` layout are removed; the unit, the
+  wrapper and the launcher run the venv interpreter.
+- The first install needs pip on the base interpreter and PyPI access for the
+  build backend and the dependencies. ensurepip and `python3-venv` are not
+  needed.
 
 ## [0.5.2] — 2026-11-15
 

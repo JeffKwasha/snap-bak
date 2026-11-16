@@ -46,18 +46,18 @@ unmount, delete, restic update) goes through the root wrapper
 Prerequisites: restic at `/usr/local/bin/restic` (a distro package lands in
 `/usr/bin`, which the wrapper rejects; download the release binary and
 `sudo install -m755 restic /usr/local/bin/restic`), Python 3.14 or newer with
-virtualenv support (`python3-venv` on Debian/Ubuntu), and PyPI access for the
-first install. `python3` is the base interpreter by default; `PYTHON_BIN`
-overrides it for a non-system install.
+pip, and PyPI access for the first install. `python3` is the base interpreter by
+default; `PYTHON_BIN` overrides it for a non-system install.
 
 ```bash
 chmod +x snap-bak-setup.sh
 sudo ./snap-bak-setup.sh
 ```
 
-The clone is the install source. The script creates `/opt/snap-bak/venv` and
-pip-installs the project and its dependencies into it, so the system Python is
-never modified and PEP 668 never applies. It also installs the root wrapper
+The clone is the install source. The script creates `/opt/snap-bak/venv` without
+pip (ensurepip is not needed) and uses the base interpreter's pip to install the
+project and its dependencies into that venv, so the system Python is never
+modified and PEP 668 never applies. It also installs the root wrapper
 `sudo-exec.py`, which every privileged operation (mount, snapshot, unmount,
 delete, restic update) goes through; snap-bak cannot run without it, so a plain
 `pip install` of the project is not a supported deployment.

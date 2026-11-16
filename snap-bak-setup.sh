@@ -170,27 +170,32 @@ if ! "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 14) els
     echo "[!] snap-bak needs Python 3.14 or newer; $PYTHON_BIN is older." >&2
     exit 1
 fi
-PYVER="$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo 3.14)"
+if ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
+    echo "[!] $PYTHON_BIN has no pip. The install uses it to populate the venv." >&2
+    echo "    Debian/Ubuntu: sudo apt install python3-pip" >&2
+    exit 1
+fi
 echo "[*] Creating the virtualenv at $VENV_DIR..."
-if ! "$PYTHON_BIN" -m venv "$VENV_DIR" 2>/dev/null; then
-    echo "[!] $PYTHON_BIN cannot create a virtualenv (ensurepip is missing)." >&2
-    echo "    Debian/Ubuntu: sudo apt install python$PYVER-venv" >&2
-    echo "    Then re-run this script." >&2
+# --without-pip: ensurepip is not needed. The base pip installs into the venv's
+# site-packages, which is everything the venv's interpreter needs to run.
+if ! "$PYTHON_BIN" -m venv --without-pip "$VENV_DIR" 2>/dev/null; then
+    echo "[!] $PYTHON_BIN cannot create a virtualenv." >&2
     exit 1
 fi
-if ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
-    echo "[!] $VENV_DIR has no pip. Install the venv package for $PYTHON_BIN and re-run." >&2
-    exit 1
-fi
-# The distribution, its console script and its dependencies, all inside the
-# venv. --force-reinstall so a re-run picks up the current tree even when the
-# version was not bumped.
+SITE_PACKAGES="$("$VENV_PY" -c 'import site; print(site.getsitepackages()[0])')"
+# The distribution, its metadata and its dependencies, all inside the venv.
+# --upgrade makes a re-run replace the current tree even if the version did not
+# change.
 echo "[*] Installing snap-bak and its dependencies into $VENV_DIR..."
-if ! "$VENV_PY" -m pip install --quiet --upgrade --force-reinstall "$REPO_ROOT"; then
+if ! "$PYTHON_BIN" -m pip install --quiet --upgrade --target "$SITE_PACKAGES" "$REPO_ROOT"; then
     echo "[!] pip could not install $REPO_ROOT." >&2
     echo "    It needs PyPI access for the build backend and the dependencies." >&2
     exit 1
 fi
+# --target also writes console scripts under the target's bin/, with a shebang
+# that names the base interpreter, which cannot see the venv. The launcher is
+# the command, so drop them.
+rm -rf "${SITE_PACKAGES:?}/bin"
 
 # --- 1. CREATE USER, GROUP & DIRECTORIES ---
 if ! getent group "$SERVICE_GROUP" >/dev/null; then
