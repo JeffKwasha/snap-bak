@@ -17,12 +17,17 @@ because a command succeeded without confirming which of those two happened.
 
 ## Start here
 
+Tool commands run as the service user, because state, cache, the restic config
+and the sudo wrapper belong to it. Run `sudo -u snap-bak snap-bak ...`. Journal
+and state reads need root. Files passed with `-c` or `--excludes-file` are read
+as the service user, so put them somewhere it can read.
+
 Never guess a job name or a config path. Ask the tool:
 
 ```bash
-snap-bak --version                 # what is installed
-snap-bak --list-jobs               # the real job names
-snap-bak -c /opt/snap-bak/config.json --list-jobs
+sudo -u snap-bak snap-bak --version                 # what is installed
+sudo -u snap-bak snap-bak --list-jobs               # the real job names
+sudo -u snap-bak snap-bak -c /opt/snap-bak/config.json --list-jobs
 ```
 
 Config lives at `/opt/snap-bak/config.json` in production; `--list-jobs` prints
@@ -34,16 +39,16 @@ Do these in order, cheapest first. All are read-only.
 
 ```bash
 # 1. Is the config even valid? (exit 2 = bad config, fix that first)
-snap-bak -c /opt/snap-bak/config.json --list-jobs
+sudo -u snap-bak snap-bak -c /opt/snap-bak/config.json --list-jobs
 
 # 2. Are the exclude patterns sane, and what do they match on disk? (local)
-snap-bak show excludes
+sudo -u snap-bak snap-bak show excludes
 
 # 3. What would a backup skip, per local snapshot? (local)
-snap-bak show excludes --snaps
+sudo -u snap-bak snap-bak show excludes --snaps
 
 # 4. What is already stored in restic? (NETWORK - metadata only)
-snap-bak show excludes --repo --json
+sudo -u snap-bak snap-bak show excludes --repo --json
 ```
 
 Add `--job NAME` to scope to one job. `--all` puts every source in one table;
@@ -65,8 +70,8 @@ If it exits 30 or 41, you learned **nothing** — see exit codes below.
 For full per-run detail, read the state file and the journal:
 
 ```bash
-cat /opt/snap-bak/state/<job>.json     # last status + anything queued
-journalctl -u snap-bak --since "2 days ago" --no-pager
+sudo cat /opt/snap-bak/state/<job>.json     # last status + anything queued
+sudo journalctl -u snap-bak --since "2 days ago" --no-pager
 ```
 
 ## Working out an exclude change
@@ -80,17 +85,17 @@ comments, `!` negation — and adds it to the job's own rules:
 
 ```bash
 # 1. trial it locally, against the real config
-snap-bak show excludes --live --job data --excludes-file ~/work.ignore
+sudo -u snap-bak snap-bak show excludes --live --job data --excludes-file /tmp/work.ignore
 
 # 2. then against local snapshots (per-snapshot cost)
-snap-bak show excludes --snaps --job data --excludes-file ~/work.ignore
+sudo -u snap-bak snap-bak show excludes --snaps --job data --excludes-file /tmp/work.ignore
 
 # 3. then against what restic actually stores
-snap-bak show excludes --repo --job data --excludes-file ~/work.ignore
+sudo -u snap-bak snap-bak show excludes --repo --job data --excludes-file /tmp/work.ignore
 
 # 4. satisfied: put the rules in the config's ignore_file, then
-snap-bak apply excludes --job data          # dry-run
-snap-bak apply excludes --job data --later  # queue for the next run
+sudo -u snap-bak snap-bak apply excludes --job data          # dry-run
+sudo -u snap-bak snap-bak apply excludes --job data --later  # queue for the next run
 ```
 
 Ad-hoc rules work too: `-e '*.iso' -e 'build/cache/'`, repeatable.
@@ -233,9 +238,9 @@ history. Removing already-stored files is a separate, explicit operation —
 see "Working out an exclude change" above for the whole flow, and:
 
 ```bash
-snap-bak apply excludes --job data             # dry-run: plan only
-snap-bak apply excludes --job data --now       # rewrite now, then prune
-snap-bak apply excludes --job data --later     # queue for the next run
+sudo -u snap-bak snap-bak apply excludes --job data             # dry-run: plan only
+sudo -u snap-bak snap-bak apply excludes --job data --now       # rewrite now, then prune
+sudo -u snap-bak snap-bak apply excludes --job data --later     # queue for the next run
 ```
 
 Pick deliberately:
@@ -258,9 +263,9 @@ places it never removes files from. Do not work around that.
 ## Running a backup
 
 ```bash
-snap-bak -n                      # dry run: preflight, no upload or deletion
-snap-bak                          # run all jobs
-snap-bak -j data              # one job
+sudo -u snap-bak snap-bak -n                      # dry run: preflight, no upload or deletion
+sudo -u snap-bak snap-bak                          # run all jobs
+sudo -u snap-bak snap-bak -j data              # one job
 ```
 
 Run order is backups → queued work → retention → prune. A run that skips
@@ -275,8 +280,8 @@ must never carry a request — queued work lives in the state file, never in the
 config.
 
 ```bash
-snap-bak --list-jobs                        # the real job names
-snap-bak -c /path/to/other.json --list-jobs # a candidate config, before installing it
+sudo -u snap-bak snap-bak --list-jobs                        # the real job names
+sudo -u snap-bak snap-bak -c /path/to/other.json --list-jobs # a candidate config, before installing it
 ```
 
 - **A typo'd or unknown config key is exit 2, not a silent no-op.** That is
@@ -298,16 +303,16 @@ The systemd unit is the source of truth for what happened; the state file only
 holds the last status.
 
 ```bash
-journalctl -u snap-bak --since "2 days ago" --no-pager
-journalctl -u snap-bak -n 200 --no-pager            # the tail, for one run
-journalctl -u snap-bak -p err --since "7 days ago"  # only what failed
+sudo journalctl -u snap-bak --since "2 days ago" --no-pager
+sudo journalctl -u snap-bak -n 200 --no-pager            # the tail, for one run
+sudo journalctl -u snap-bak -p err --since "7 days ago"  # only what failed
 ```
 
 Read them in this order, because each answers a question the next one needs:
 
 | Question | Where |
 |---|---|
-| Did the run happen, and when? | `journalctl -u snap-bak -u snap-bak.timer` |
+| Did the run happen, and when? | `sudo journalctl -u snap-bak -u snap-bak.timer` |
 | What did this job end on? | `state/<job>.json` — `last_status`, `last_run` |
 | What is outstanding? | `state/<job>.json` — `queued` (an entry **is** the request) |
 | Why did it end that way? | the journal, around that timestamp |
@@ -354,7 +359,7 @@ After changing anything, confirm with a read-only command and read the exit
 code rather than trusting the absence of output:
 
 ```bash
-snap-bak -c /opt/snap-bak/config.json show excludes --all --job NAME --json
+sudo -u snap-bak snap-bak -c /opt/snap-bak/config.json show excludes --all --job NAME --json
 # expect: exit 0, and notes: [] on every job
 # a non-empty notes means the repo was never read — fix that first, because
 # zero sources then means "unknown", not "clean"

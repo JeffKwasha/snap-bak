@@ -86,6 +86,23 @@ What `snap-bak-setup.sh` does:
    name = any arguments, per sudoers(5)) — valid on both sudo-rs and
    sudo.ws.
 8. Writes `snap-bak.service` (oneshot) and `snap-bak.timer` (hourly).
+9. Writes the launcher `/usr/local/bin/snap-bak`, bound to the interpreter the
+   service uses and to `/opt/snap-bak`, so it reads the production config
+   without a `-c` and cannot be shadowed by a `snap_bak/` in the caller's cwd.
+
+Tool commands run as the service user. State, cache, the restic config and the
+sudo wrapper all belong to `snap-bak`, and only that user may call the wrapper
+through sudo:
+
+```bash
+sudo -u snap-bak snap-bak --version
+sudo -u snap-bak snap-bak --list-jobs
+sudo -u snap-bak snap-bak show excludes
+```
+
+`-c`, `--excludes-file` and `--reveal-file` are read as the service user, so a
+file under your own home must be readable by `snap-bak` (0644), or copied
+somewhere it can read.
 
 Then, before enabling the timer:
 
@@ -105,7 +122,7 @@ Then, before enabling the timer:
    sudo systemctl start snap-bak.service
    systemctl status snap-bak.service --no-pager
    sudo journalctl -u snap-bak --since "10 minutes ago" --no-pager
-   cat /opt/snap-bak/state/<job>.json
+   sudo cat /opt/snap-bak/state/<job>.json
    ```
 
 6. Enable the timer — by its full name, because `systemctl enable snap-bak`
@@ -124,7 +141,8 @@ program + unit files, re-validates sudoers and re-runs the restic update.
 
 Before it replaces the program, it saves the previous install under
 `/opt/snap-bak/rollback/<UTC timestamp>-XXXXXX/` with the package, the wrapper,
-the version marker, the unit files and a `restore.sh`. To undo an upgrade:
+the launcher, the version marker, the unit files and a `restore.sh`. To undo an
+upgrade:
 
 ```bash
 sudo /opt/snap-bak/rollback/<UTC timestamp>-XXXXXX/restore.sh
@@ -525,19 +543,19 @@ For full coverage, configure two jobs:
 
 ```bash
 # Run all jobs
-snap-bak
+sudo -u snap-bak snap-bak
 
 # Run a specific job
-snap-bak --job data
+sudo -u snap-bak snap-bak --job data
 
 # Dry run (preflight only, no upload or deletion)
-snap-bak --dry-run
+sudo -u snap-bak snap-bak --dry-run
 
 # List configured jobs
-snap-bak --list-jobs
+sudo -u snap-bak snap-bak --list-jobs
 
 # Use a custom config file
-snap-bak --config /path/to/config.json
+sudo -u snap-bak snap-bak --config /path/to/config.json
 ```
 
 ## Inspecting & Applying Excludes
@@ -551,24 +569,24 @@ files from existing backups.
 ```bash
 # One row per exclude rule, one column per source — local, no network, and
 # the default when you give no selector.
-snap-bak show excludes
+sudo -u snap-bak snap-bak show excludes
 
 # Exact sizes for matched directories (the slow walk: one stat per file
 # beneath every rule). The default prints `?` instead — see below.
-snap-bak show excludes --price
+sudo -u snap-bak snap-bak show excludes --price
 
 # Explicit selectors: each adds a column to the same table
-snap-bak show excludes --snaps      # a column per local btrfs snapshot (local)
-snap-bak show excludes --repo       # a column per snapshot stored in restic (network)
-snap-bak show excludes --all        # every source, in one table
+sudo -u snap-bak snap-bak show excludes --snaps      # a column per local btrfs snapshot (local)
+sudo -u snap-bak snap-bak show excludes --repo       # a column per snapshot stored in restic (network)
+sudo -u snap-bak snap-bak show excludes --all        # every source, in one table
 
 # Every file, not just the rule totals — a second table under the first
-snap-bak show excludes --all -v
+sudo -u snap-bak snap-bak show excludes --all -v
 
 # One job, machine-readable, every column, never fitted
-snap-bak show excludes --all --job data --json
-snap-bak show excludes --all --format markdown > excludes.md
-snap-bak show excludes --all --format csv > excludes.csv
+sudo -u snap-bak snap-bak show excludes --all --job data --json
+sudo -u snap-bak snap-bak show excludes --all --format markdown > excludes.md
+sudo -u snap-bak snap-bak show excludes --all --format csv > excludes.csv
 ```
 
 `show` is always read-only — it never creates, removes, or modifies a snapshot or
@@ -605,8 +623,8 @@ same distinction.
 
 ```bash
 # Would these rules be worth adding? Price and list everything they match.
-snap-bak show excludes --reveal 'build/cache/' --reveal '*.iso'
-snap-bak show excludes --reveal-file ~/candidate.ignore
+sudo -u snap-bak snap-bak show excludes --reveal 'build/cache/' --reveal '*.iso'
+sudo -u snap-bak snap-bak show excludes --reveal-file /tmp/candidate.ignore
 ```
 
 A reveal pattern is a what-if: it is treated as an extra rule, its matches are
@@ -625,12 +643,15 @@ deployed:
 
 ```bash
 # A working file, same syntax as the job's own ignore_file
-snap-bak show excludes --live --excludes-file ~/work.ignore
-snap-bak show excludes --repo --job data --excludes-file ~/work.ignore
+sudo -u snap-bak snap-bak show excludes --live --excludes-file /tmp/work.ignore
+sudo -u snap-bak snap-bak show excludes --repo --job data --excludes-file /tmp/work.ignore
 
 # Or ad-hoc rules, repeatable
-snap-bak show excludes --live -e '*.iso' -e 'build/cache/'
+sudo -u snap-bak snap-bak show excludes --live -e '*.iso' -e 'build/cache/'
 ```
+
+The working file is read as `snap-bak`, so it must be readable by that user.
+`/tmp` is used above because it usually is.
 
 Both take exactly the syntax an `ignore_file` uses — one restic exclude pattern
 per line, `#` comments, `!` negation — so a rule can be copied between them
@@ -746,7 +767,7 @@ They are not bound by a terminal, and a fit-to-width machine format is how a
 reader silently gets a subset.
 
 ```bash
-snap-bak show excludes --all --format csv > excludes.csv
+sudo -u snap-bak snap-bak show excludes --all --format csv > excludes.csv
 ```
 
 CSV columns: `job, root, scope, row, rule_or_path`, then `<source>_files` /
@@ -780,13 +801,13 @@ does — it is the same code, so the dry-run you approve is what runs:
 
 ```bash
 # Dry-run: which snapshots, which commands, how many bytes
-snap-bak apply excludes --job data
+sudo -u snap-bak snap-bak apply excludes --job data
 
 # Do it now (rewrite + forget, then prune to reclaim space)
-snap-bak apply excludes --job data --now
+sudo -u snap-bak snap-bak apply excludes --job data --now
 
 # Or defer to the next scheduled run instead
-snap-bak apply excludes --job data --later
+sudo -u snap-bak snap-bak apply excludes --job data --later
 ```
 
 `apply` refuses `--live`, `--snaps` and `--all` with an explanation: those name
@@ -977,11 +998,11 @@ ladder, and through the ordering that keeps it cheap and safe:
 Nothing here needs the skill. Every command above is plain CLI:
 
 ```bash
-snap-bak --version
-snap-bak -c /opt/snap-bak/config.json --list-jobs
-snap-bak -c /opt/snap-bak/config.json show excludes --all --json
-cat /opt/snap-bak/state/<job>.json
-journalctl -u snap-bak --since "2 days ago" --no-pager
+sudo -u snap-bak snap-bak --version
+sudo -u snap-bak snap-bak -c /opt/snap-bak/config.json --list-jobs
+sudo -u snap-bak snap-bak -c /opt/snap-bak/config.json show excludes --all --json
+sudo cat /opt/snap-bak/state/<job>.json
+sudo journalctl -u snap-bak --since "2 days ago" --no-pager
 ```
 
 ## Testing

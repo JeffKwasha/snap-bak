@@ -1,20 +1,27 @@
 """snap-bak: btrfs snapshots and restic backups.
 
-The version comes from installed package metadata, so `snap-bak --version`
-cannot drift from `pyproject.toml`. The setup script copies the package instead
-of installing a wheel, which leaves no metadata, so it also writes `VERSION`
-next to the package and that file is the fallback.
+A deploy writes `VERSION` next to the package, and that file is authoritative:
+the interpreter's package metadata can belong to another tree, such as a stale
+editable install, and would then name a build that is not running. Metadata is
+the fallback for a wheel or a source tree.
 """
 
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-try:
-    __version__ = version("snap-bak")
-except PackageNotFoundError:
+
+def _version() -> str:
+    marker = Path(__file__).resolve().parents[1] / "VERSION"
     try:
-        __version__ = (
-            Path(__file__).resolve().parents[1] / "VERSION"
-        ).read_text().strip() or "unknown"
-    except OSError:  # running from a source tree, not installed
-        __version__ = "unknown"
+        installed = marker.read_text().strip()
+    except OSError:
+        installed = ""
+    if installed:
+        return installed
+    try:
+        return version("snap-bak")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+__version__ = _version()

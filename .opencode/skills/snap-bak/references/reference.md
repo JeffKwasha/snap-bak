@@ -5,6 +5,10 @@ an exact config key, an exact flag, or the reasoning behind a decision.
 
 ## Command surface
 
+The installed command is `/usr/local/bin/snap-bak`, bound to the service
+interpreter and `/opt/snap-bak`. Run it as the service user:
+`sudo -u snap-bak snap-bak ...`.
+
 ### Main run
 
 ```
@@ -18,7 +22,7 @@ snap-bak [-c CONFIG] [-j JOB] [-n] [--log-file PATH] [-l] [--version] [show|appl
 | `-n, --dry-run` | Preflight and plan, but no upload and no deletion |
 | `--log-file PATH` | Also write logs to a file (default: stderr only) |
 | `-l, --list-jobs` | Print resolved job names and exit |
-| `--version` | Print the installed version (from package metadata) and exit |
+| `--version` | Print the installed version (the `VERSION` marker, else package metadata) and exit |
 
 With no subcommand, snap-bak performs a full scheduled run.
 
@@ -414,10 +418,10 @@ retention matches on.
 | Exit 2, `snapshot_dir does not exist` | Job points at a missing path | `snapshot_dir` in the config |
 | Exit 30 every run | Repo locked, missing, or bad password | `query_error.detail`; is another restic running? |
 | Exit 41 | Wrong password, or restic rejected something | The journal for that run |
-| Exit 51 | Previous run stuck | `journalctl -u snap-bak`; an orphaned restic? |
+| Exit 51 | Previous run stuck | `sudo journalctl -u snap-bak`; an orphaned restic? |
 | No new snapshots, no uploads | `skip_snapshot_if_idle` and nothing changed | Expected. Confirm the job is alive via the journal |
 | Space not reclaimed after a rewrite | Rewrite makes data unreferenced; `prune` reclaims it | Wait for the run's prune phase, or prune manually |
-| Backup ran but restic reports nothing new | Everything excluded | `snap-bak show excludes --live` |
+| Backup ran but restic reports nothing new | Everything excluded | `sudo -u snap-bak snap-bak show excludes --live` |
 
 ### Lock contention
 

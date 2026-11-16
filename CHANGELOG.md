@@ -3,6 +3,26 @@
 All notable changes to snap-bak are documented here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] — 2026-11-15
+
+### Added
+
+- The install writes `/usr/local/bin/snap-bak`, bound to the configured
+  interpreter, `/opt/snap-bak` and the production config. A box that ran only
+  the setup script can now run the documented commands; before this the docs
+  used a command the install never created.
+- SPEC states the deployment contract: baseline, only-install, command,
+  operator, version and upgrade requirements. README and the agent skill now
+  name the service user and run tool commands with `sudo -u snap-bak`.
+
+### Fixed
+
+- `--version` reports `/opt/snap-bak/VERSION` whenever it exists, so package
+  metadata from another tree cannot name a build that is not running. Metadata
+  is the fallback for a wheel or a source tree.
+- The rollback copy includes the launcher and restores it, or removes it when
+  the previous install had none.
+
 ## [0.5.2] — 2026-11-15
 
 ### Added

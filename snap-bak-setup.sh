@@ -38,6 +38,7 @@ SNAPBAK_DIR="/opt/snap-bak"
 MOUNT_BASE="/bak"
 CONFIG_FILE="$SNAPBAK_DIR/config.json"
 VERSION_FILE="$SNAPBAK_DIR/VERSION"
+CLI_PATH="/usr/local/bin/snap-bak"
 WRAPPER_PATH="$SNAPBAK_DIR/sudo-exec.py"
 PKG_PATH="$SNAPBAK_DIR/snap_bak"
 SERVICE_NAME="snap-bak"
@@ -67,6 +68,9 @@ save_previous_install() {
     if [ -f "$VERSION_FILE" ]; then
         cp -a "$VERSION_FILE" "$dest/VERSION"
     fi
+    if [ -f "$CLI_PATH" ]; then
+        cp -a "$CLI_PATH" "$dest/snap-bak"
+    fi
     for unit in "$SERVICE_NAME.service" "$SERVICE_NAME.timer"; do
         if [ -f "$UNIT_DIR/$unit" ]; then
             cp -a "$UNIT_DIR/$unit" "$dest/$unit"
@@ -87,6 +91,11 @@ if [ -f "$dest/sudo-exec.py" ]; then
 fi
 if [ -f "$dest/VERSION" ]; then
     install -o root -g root -m 0644 "$dest/VERSION" "$VERSION_FILE"
+fi
+if [ -f "$dest/snap-bak" ]; then
+    install -o root -g root -m 0755 "$dest/snap-bak" "$CLI_PATH"
+else
+    rm -f "$CLI_PATH"
 fi
 for unit in $SERVICE_NAME.service $SERVICE_NAME.timer; do
     if [ -f "$dest/\$unit" ]; then
@@ -185,7 +194,22 @@ INSTALLED_VERSION="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$REPO_ROOT/pyproje
 printf '%s\n' "${INSTALLED_VERSION:-unknown}" > "$VERSION_FILE"
 chown root:root "$VERSION_FILE"
 chmod 0644 "$VERSION_FILE"
+# The operator's command. It carries the interpreter, the package path and the
+# production config, so a fresh install needs no PATH edit, no virtualenv and no
+# `-c`. -P keeps the caller's cwd off sys.path, so a stray snap_bak/ cannot
+# shadow the installed package.
+cat > "$CLI_PATH" <<EOF
+#!/bin/sh
+# Installed by snap-bak-setup.sh. Run it as the service user.
+PYTHONPATH="$SNAPBAK_DIR"
+SNAPBAK_CONFIG_FILE="$CONFIG_FILE"
+export PYTHONPATH SNAPBAK_CONFIG_FILE
+exec "$PYTHON_BIN" -P -m snap_bak.cli "\$@"
+EOF
+chown root:root "$CLI_PATH"
+chmod 0755 "$CLI_PATH"
 echo "[*] Installed $PKG_PATH (root:root 0644) and $WRAPPER_PATH (root:root 0755)."
+echo "[*] Installed $CLI_PATH (run it as $SERVICE_USER: sudo -u $SERVICE_USER snap-bak ...)."
 
 # --- 1d. VERIFY/UPDATE RESTIC (setcap + self-update via the wrapper) ---
 # The wrapper is the single code path for restic trust + setcap (see its
@@ -469,4 +493,6 @@ echo "       sudo systemctl disable --now $SERVICE_NAME.service"
 echo "    Then enable the timer (do NOT enable the bare service name; systemd"
 echo "    treats an unsuffixed name as .service, not .timer):"
 echo "       sudo systemctl enable --now $SERVICE_NAME.timer"
+echo " 7. Run the tool as the service user (it owns state, cache and the wrapper):"
+echo "       sudo -u $SERVICE_USER snap-bak --list-jobs"
 echo "===================================================="

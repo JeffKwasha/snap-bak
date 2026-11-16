@@ -1024,6 +1024,7 @@ per-job lock would add complexity without additional protection.
     snap_bak/            # the package as it was
     sudo-exec.py         # the wrapper as it was (when it existed)
     VERSION              # the version marker as it was
+    snap-bak             # the /usr/local/bin launcher as it was (when it existed)
     snap-bak.service     # the unit files as they were (when they existed)
     snap-bak.timer
     restore.sh           # puts the above back; run as root
@@ -1056,10 +1057,10 @@ request from a human.
 
 `rollback` is written only by the setup script, and only when it replaces an
 existing package. Each directory is a complete copy of the program, the wrapper,
-the version marker and the unit files, plus the `restore.sh` that puts them
-back; config, state, cache, passwords and excludes are outside it because an
-upgrade never touches them. Nothing reaps these directories, so an operator
-deletes them by hand once the new install has proven itself.
+the launcher, the version marker and the unit files, plus the `restore.sh` that
+puts them back; config, state, cache, passwords and excludes are outside it
+because an upgrade never touches them. Nothing reaps these directories, so an
+operator deletes them by hand once the new install has proven itself.
 
 All paths are relative to the install directory (`<install>`, production
 `/opt/snap-bak`). The `restic` and `rclone` binaries are optional (rclone only
@@ -1088,7 +1089,9 @@ snap-bak apply excludes [OPTIONS]     # dry-run; --now applies, --later arms
 
 `show` / `apply` are subcommands. A bare `snap-bak` (no subcommand) is the
 normal run, so the systemd service (`ExecStart=python3 -m snap_bak.cli`) is
-unaffected.
+unaffected. The installed command is `/usr/local/bin/snap-bak`; tool commands
+run as the service user, `sudo -u snap-bak snap-bak ...` (see *Deployment
+Contract*).
 
 ### Options
 
@@ -1274,6 +1277,42 @@ come only from root-owned config.
 ```bash
 uv run pytest -q
 ```
+
+---
+
+## Deployment Contract
+
+These are requirements on the install, not a description of one host. Every
+command README presents for operating an installed box, and every command in the
+agent skill, must work after a fresh box meets the baseline and runs the official
+install, with nothing else done. A command that needs more is a bug in the docs
+or the install. The explicitly labelled development option in README is outside
+this contract.
+
+- **Baseline.** Linux with btrfs and systemd, one interpreter with Python 3.14
+  or newer that can import pydantic, python-dateutil, json5 and rich, and restic
+  at `/usr/local/bin/restic` as a real root-owned file. rclone only for
+  `rclone:` repositories. See *Supported Platform & Dependencies*.
+- **Only install.** A clone plus `snap-bak-setup.sh`, optionally with
+  `PYTHON_BIN`. No pip install of the project, no operator virtualenv, no PATH
+  edit.
+- **Command.** The install writes `/usr/local/bin/snap-bak`, bound to the
+  configured interpreter, `/opt/snap-bak` and `/opt/snap-bak/config.json`. It
+  runs the installed package whatever the caller's cwd contains, so a stray
+  `snap_bak/` cannot shadow it, and bare commands read the production config the
+  same way the service does.
+- **Operator.** The operator is an administrator with sudo. Tool commands run as
+  the service user, `sudo -u snap-bak snap-bak ...`, because state, cache, the
+  restic config and the sudo wrapper all belong to that identity. Journal and
+  state reads need root. Files passed to the tool (`-c`, `--excludes-file`)
+  must be readable by the service user.
+- **Version.** The install records the version it built in
+  `/opt/snap-bak/VERSION`, and `snap-bak --version` reports that file whenever it
+  exists. Installed package metadata is the fallback for a wheel or a source
+  tree, never a claim about a deploy.
+- **Upgrade.** Re-running the script is idempotent, keeps `config.json`, and
+  saves the install it replaces under `rollback/` with a `restore.sh` that puts
+  back the package, wrapper, launcher, version marker and unit files.
 
 ---
 
