@@ -11,16 +11,13 @@ Conventions:
 
 - IDs are `R-<AREA>-<NN>` and stable. Never renumber; retire an ID rather than
   reuse it.
-- The document marks the requirement with the ID at the statement:
+- The document marks each requirement with the ID at the statement:
   `[[R-LOCK-02]] Both transitions log...`.
-- A test or function cites one ID on its definition line:
-  `def f(...):  # [[R-LOCK-02]]`. A multi-line signature puts it on the
-  `def name(` line, so name, ID and line number share one grep line.
-- An ID names a testable behaviour, not a sentence or a bullet. Several
-  requirement statements may share one ID when one test covers them; statements
-  that need separate tests get separate IDs.
-- One ID per test and one per function. Pick the primary behaviour; the document
-  has the context needed to judge it.
+- A test or function cites every ID it covers on its definition line:
+  `def f(...):  # [[R-A-01]] [[R-B-02]]`. A multi-line signature puts them on the
+  `def name(` line, so name, IDs and line number share one grep line.
+- The mapping is many-to-many: a requirement may have several tests, and one
+  test may cite several requirements.
 - Tests point at the docs. This file does not track which tests exist, and a
   missing test is not detected here.
 
