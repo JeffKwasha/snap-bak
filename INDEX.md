@@ -16,8 +16,11 @@ Conventions:
 - A test or function cites one ID on its definition line:
   `def f(...):  # [[R-LOCK-02]]`. A multi-line signature puts it on the
   `def name(` line, so name, ID and line number share one grep line.
-- One ID per test and one per function. Pick the primary requirement; the
-  document has the context needed to judge it.
+- An ID names a testable behaviour, not a sentence or a bullet. Several
+  requirement statements may share one ID when one test covers them; statements
+  that need separate tests get separate IDs.
+- One ID per test and one per function. Pick the primary behaviour; the document
+  has the context needed to judge it.
 - Tests point at the docs. This file does not track which tests exist, and a
   missing test is not detected here.
 
