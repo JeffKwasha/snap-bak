@@ -661,48 +661,49 @@ every total cover the full set.
 
 ### Pattern matching
 
-`src/snap_bak/excludes.py` is a faithful port of restic's own exclusion engine
-(`internal/filter`, matching restic 0.19.1) so listings agree with what restic
-would do. restic's documentation of pattern syntax is the authority.
+[[R-EXCL-33]] `src/snap_bak/excludes.py` is a faithful port of restic's own
+exclusion engine (`internal/filter`, matching restic 0.19.1) so listings agree
+with what restic would do. restic's documentation of pattern syntax is the
+authority.
 
-CI installs the **newest** restic release rather than pinning 0.19.1: when
-restic's behaviour changes, the integration tests fail and the port gets fixed
-in the same change. A pinned old binary would hide the divergence until a user
-hit it against their own restic.
+[[R-EXCL-34]] CI installs the **newest** restic release rather than pinning
+0.19.1: when restic's behaviour changes, the integration tests fail and the port
+gets fixed in the same change. A pinned old binary would hide the divergence
+until a user hit it against their own restic.
 
-Negation and prune behaviour are **not** documented upstream — restic describes
-pattern syntax and says nothing about `!` or about what a matched directory does
-to later rules. Those rules below are therefore the volatile kind: a restic
-release may change them, and the port is expected to follow rather than to be
-argued with. See `docs/verification.md` for what was established and when.
+[[R-EXCL-35]] Negation and prune behaviour are **not** documented upstream —
+restic describes pattern syntax and says nothing about `!` or about what a
+matched directory does to later rules. Those rules below are therefore the
+volatile kind: a restic release may change them, and the port is expected to
+follow rather than to be argued with. See `docs/verification.md` for what was
+established and when.
 
 Ported semantics:
 
-- Per-segment Go `filepath.Match` — `*` never crosses `/`, plus `?`, `[a-z]`,
+- [[R-EXCL-36]] Per-segment Go `filepath.Match` — `*` never crosses `/`, plus `?`, `[a-z]`,
   `[^a]`, `\` escapes. Deliberately **not** Python `fnmatch`.
-- A pattern with no leading `/` matches at **any** path offset (`Trash` matches
+- [[R-EXCL-37]] A pattern with no leading `/` matches at **any** path offset (`Trash` matches
   `/bak/home/Trash/x`); a leading `/` anchors to the root.
-- A **trailing `/` is ignored**: `foo/` ≡ `foo`. It is not a directories-only
+- [[R-EXCL-38]] A **trailing `/` is ignored**: `foo/` ≡ `foo`. It is not a directories-only
   marker, so `foo/` also matches a *file* named `foo`.
-- `**` must be a complete path component (`foo/**/bar`, not `foo**`), and
+- [[R-EXCL-39]] `**` must be a complete path component (`foo/**/bar`, not `foo**`), and
   matches any number of intermediate directories.
-- `!` prefix negates. Negation is sequential and the **last match wins**:
+- [[R-EXCL-40]] `!` prefix negates. Negation is sequential and the **last match wins**:
   `--exclude '*' --exclude '!keep.txt'` keeps only `keep.txt`.
-- Patterns are `filepath.Clean`ed, so `/foo/../bar` ≡ `/bar`.
-- `ignore_file` lines are trimmed; blanks and `#` comments dropped; `$VAR` is
+- [[R-EXCL-41]] Patterns are `filepath.Clean`ed, so `/foo/../bar` ≡ `/bar`.
+- [[R-EXCL-42]] `ignore_file` lines are trimmed; blanks and `#` comments dropped; `$VAR` is
   expanded and `$$` yields a literal `$`. `~` is **not** expanded — use
   `$HOME`.
 
-Errors during inspection are reported but never fatal: an unreadable directory,
-a file that vanishes mid-walk, or a pattern restic itself would reject (caught
-and reported by the lint that runs on every `show`) all degrade to "skip this
-path" rather than aborting
-the run.
+[[R-EXCL-43]] Errors during inspection are reported but never fatal: an
+unreadable directory, a file that vanishes mid-walk, or a pattern restic itself
+would reject (caught and reported by the lint that runs on every `show`) all
+degrade to "skip this path" rather than aborting the run.
 
-Directory matching prunes the walk, mirroring restic's walker: it does not
-descend into an excluded directory, so a `!` pattern cannot re-include something
-inside one. Symlinks are never followed: restic stores a link as a link, so
-following one would name paths the repo does not contain.
+[[R-EXCL-44]] Directory matching prunes the walk, mirroring restic's walker: it
+does not descend into an excluded directory, so a `!` pattern cannot re-include
+something inside one. [[R-EXCL-45]] Symlinks are never followed: restic stores a
+link as a link, so following one would name paths the repo does not contain.
 
 Because pruning is what restic does, the rule order is load-bearing and cannot
 be worked around by reordering later patterns: the excluding pattern is
@@ -715,10 +716,11 @@ bounded — see *Trial pattern sets*.
 
 ### Path basis
 
-Backups run `restic backup <mount_base>/<source basename>`, so stored paths are
-`/bak/<name>/...`. **All matching uses that mount-point path.** `--live` and
-`--snaps` map live paths onto their mount-point equivalent before matching, so
-every mode answers the same question: *what would the next backup skip?*
+[[R-EXCL-46]] Backups run `restic backup <mount_base>/<source basename>`, so
+stored paths are `/bak/<name>/...`. [[R-EXCL-47]] **All matching uses that
+mount-point path.** `--live` and `--snaps` map live paths onto their mount-point
+equivalent before matching, so every mode answers the same question: *what would
+the next backup skip?*
 
 Consequence: a relative pattern (`*.tmp`, `Trash`) behaves identically
 everywhere, while an anchored pattern (`/bak/home/Trash`) is anchored to the
