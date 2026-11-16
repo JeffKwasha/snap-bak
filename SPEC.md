@@ -8,9 +8,9 @@ Frequent snapshots instantly protect against accidents while older (known good) 
 
 ### Constraints
 
-- snap-bak is the exclusive authority for snapshot and backup management.
-- Only snapshots matching snap-bak's expected format and directory are managed; all others are ignored.
-- All datetimes in snap-bak are GMT/UTC, except the `backup_window_start`/`backup_window_end` times, which are interpreted in the server's local timezone.
+- [[R-GLOBAL-01]] snap-bak is the exclusive authority for snapshot and backup management.
+- [[R-SNAP-02]] Only snapshots matching snap-bak's expected format and directory are managed; all others are ignored.
+- [[R-TIME-01]] All datetimes in snap-bak are GMT/UTC, except the `backup_window_start`/`backup_window_end` times, which are interpreted in the server's local timezone.
 
 ### Design Principles
 

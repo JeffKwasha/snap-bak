@@ -297,3 +297,5 @@ Conventions:
 | [[R-FLOW-09]] | SPEC.md | Execution Flow |
 | [[R-FLOW-10]] | SPEC.md | Execution Flow |
 | [[R-FLOW-11]] | SPEC.md | Execution Flow |
+| [[R-GLOBAL-01]] | SPEC.md | Overview, Constraints |
+| [[R-TIME-01]] | SPEC.md | Overview, Constraints |
