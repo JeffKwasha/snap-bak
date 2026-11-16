@@ -210,3 +210,24 @@ Conventions:
 | [[R-GATE-13]] | SPEC.md | Run-time gate |
 | [[R-GATE-14]] | SPEC.md | Run-time gate |
 | [[R-GATE-15]] | SPEC.md | Run-time gate |
+| [[R-EXCL-48]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-49]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-50]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-51]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-52]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-53]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-54]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-55]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-56]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-57]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-58]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-59]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-60]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-61]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-62]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-63]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-64]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-65]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-66]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-67]] | SPEC.md | The report, What counts as a file, -v, Output formats |
+| [[R-EXCL-68]] | SPEC.md | The report, What counts as a file, -v, Output formats |
