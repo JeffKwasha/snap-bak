@@ -31,7 +31,7 @@ Simplicity is a requirement: backups are critical infrastructure, and complex sy
 
 ### Phase 1: Validate
 
-Check global conditions once per run. If invalid, log error and exit.
+[[R-FLOW-01]] Check global conditions once per run. If invalid, log error and exit.
 
 ```
 - Config/status file(s) exist, valid syntax
@@ -46,7 +46,8 @@ Check global conditions once per run. If invalid, log error and exit.
 
 ### Phase 2: Plan & Prepare (implicit)
 
-Manipulate job state to determine what to do this run. No separate data structure — planning is implicit in job attributes.
+[[R-FLOW-02]] Manipulate job state to determine what to do this run. No separate
+data structure — planning is implicit in job attributes.
 
 ```
 For each job:
@@ -80,7 +81,7 @@ For each job:
 
 ### Phase 3: Execute Backups (restic)
 
-For each job with planned backup. Never uses today's new snapshot.
+[[R-FLOW-03]] For each job with planned backup. Never uses today's new snapshot.
 
 ```
 For each job that planned a backup:
@@ -95,26 +96,27 @@ For each job that planned a backup:
      - Do NOT retry this job in this run
 ```
 
-A `failed` status persists the failing snapshot name; the next run retries that
-exact snapshot before planning (same source data, same mount, same repo). This
-failed-backup retry is separate from the delayed-job machinery: the two are
-mutually exclusive statuses, so a delayed job never takes the failed-retry path
-and vice versa. If the snapshot is gone (deleted by retention), the job skips
-gracefully instead of failing.
+[[R-FLOW-04]] A `failed` status persists the failing snapshot name; the next run
+retries that exact snapshot before planning (same source data, same mount, same
+repo). This failed-backup retry is separate from the delayed-job machinery: the
+two are mutually exclusive statuses, so a delayed job never takes the
+failed-retry path and vice versa. If the snapshot is gone (deleted by
+retention), the job skips gracefully instead of failing.
 
-> **Execution ordering**: although planning is described as Phase 2, a scheduled
+> **Execution ordering**: [[R-FLOW-05]] although planning is described as Phase 2, a scheduled
 > snapshot is created at the very start of the run (Phase 4). This is safe
 > because the 12-hour minimum-age rule guarantees the new snapshot is never
 > backed up in the same run (see Snapshot Safety Rule).
 
 ### Phase 4: Create Snapshots (btrfs)
 
-Create new btrfs snapshot of `source_subvolume` at `{snapshot_dir}/{name}` for each job
-Only one snapshot per `snapshot_interval` seconds per job.
+[[R-FLOW-06]] Create new btrfs snapshot of `source_subvolume` at
+`{snapshot_dir}/{name}` for each job. Only one snapshot per `snapshot_interval`
+seconds per job.
 
 A scheduled snapshot is **suppressed** when the power-saving gate says so:
 
-1. **Disk spun down (power saving).** The wrapper's `status <job>` op resolves
+1. [[R-FLOW-07]] **Disk spun down (power saving).** The wrapper's `status <job>` op resolves
    the source's btrfs pool to its physical disks (from kernel state:
    `/proc/self/mountinfo`, `/sys/fs/btrfs/<uuid>/devices`, `/sys/class/block`)
    and reports `any_spun_down`. If **any** rotational disk in the pool is spun
@@ -123,28 +125,29 @@ A scheduled snapshot is **suppressed** when the power-saving gate says so:
    all (no btrfs calls, no snapshot-dir listing), so the drive stays asleep.
    Other states (`running`/`active`/`live`/`parked`) and unreadable states are
    never treated as spin-down; unknown pools fail open.
-2. **No changes.** When the pool is not spun down, the wrapper compares the
+2. [[R-FLOW-08]] **No changes.** When the pool is not spun down, the wrapper compares the
    source's btrfs `Generation` with the latest snapshot's. Equal generations
    mean the source is unchanged since that snapshot, so the new snapshot would
    capture nothing and is skipped.
 
-Both gates **fail open**: an error or indeterminate result falls back to the
-historic behavior (create when the interval has elapsed). A fresh install (no
-snapshot yet) always creates one. Config per job: `skip_snapshot_if_idle`
-(default `true`) disables the spun-down-disk gate only; the no-change gate is
-always on. Backups are independent of these gates and still run on schedule.
+[[R-FLOW-09]] Both gates **fail open**: an error or indeterminate result falls
+back to the historic behavior (create when the interval has elapsed). A fresh
+install (no snapshot yet) always creates one. Config per job:
+`skip_snapshot_if_idle` (default `true`) disables the spun-down-disk gate only;
+the no-change gate is always on. Backups are independent of these gates and
+still run on schedule.
 
 ### Phase 5: Cleanup Local Snapshots (btrfs)
 
-Retention is a choice of how timeslot boundaries are distributed — picking a
-function and its parameters. Two strategies are supported:
+[[R-FLOW-10]] Retention is a choice of how timeslot boundaries are distributed —
+picking a function and its parameters. Two strategies are supported:
 
 ```
 snapshot_retention = {"fn": "exponential", "config": {"n": 9}}        # boundaries at 2^(i-1) h: 1h, 2h, 4h, 8h, ...
 snapshot_retention = {"fn": "datetimes",  "config": {"hourly": 8, "daily": 7, "weekly": 4, "monthly": 3}}
 ```
 
-Algorithm (shared by both strategies):
+[[R-FLOW-11]] Algorithm (shared by both strategies):
 
 - Generate retention boundaries (oldest to newest) from the chosen function.
 - For each boundary, keep the **oldest snapshot still newer than that boundary**.
