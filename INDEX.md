@@ -233,3 +233,39 @@ Conventions:
 | [[R-EXCL-68]] | SPEC.md | The report, What counts as a file, -v, Output formats |
 | [[R-THROUGHPUT-01]] | SPEC.md | Throughput History |
 | [[R-THROUGHPUT-02]] | SPEC.md | Throughput History |
+| [[R-CLI-01]] | SPEC.md | CLI |
+| [[R-CLI-02]] | SPEC.md | CLI |
+| [[R-CLI-03]] | SPEC.md | CLI |
+| [[R-CLI-04]] | SPEC.md | CLI |
+| [[R-CLI-05]] | SPEC.md | CLI |
+| [[R-CLI-06]] | SPEC.md | CLI |
+| [[R-CLI-07]] | SPEC.md | CLI |
+| [[R-CLI-08]] | SPEC.md | CLI |
+| [[R-CLI-09]] | SPEC.md | CLI |
+| [[R-CLI-10]] | SPEC.md | CLI |
+| [[R-CLI-11]] | SPEC.md | CLI |
+| [[R-CLI-12]] | SPEC.md | CLI |
+| [[R-CLI-13]] | SPEC.md | CLI |
+| [[R-CLI-14]] | SPEC.md | CLI |
+| [[R-CLI-15]] | SPEC.md | CLI |
+| [[R-CLI-16]] | SPEC.md | CLI |
+| [[R-CLI-17]] | SPEC.md | CLI |
+| [[R-CLI-18]] | SPEC.md | CLI |
+| [[R-CLI-19]] | SPEC.md | CLI |
+| [[R-CLI-20]] | SPEC.md | CLI |
+| [[R-CLI-21]] | SPEC.md | CLI |
+| [[R-CLI-22]] | SPEC.md | CLI |
+| [[R-CLI-23]] | SPEC.md | CLI |
+| [[R-CLI-24]] | SPEC.md | CLI |
+| [[R-CLI-25]] | SPEC.md | CLI |
+| [[R-CLI-26]] | SPEC.md | CLI |
+| [[R-CLI-27]] | SPEC.md | CLI |
+| [[R-CLI-28]] | SPEC.md | CLI |
+| [[R-CLI-29]] | SPEC.md | CLI |
+| [[R-CLI-30]] | SPEC.md | CLI |
+| [[R-ENV-01]] | SPEC.md | CLI, Environment Variables |
+| [[R-ENV-02]] | SPEC.md | CLI, Environment Variables |
+| [[R-ENV-03]] | SPEC.md | CLI, Environment Variables |
+| [[R-ENV-04]] | SPEC.md | CLI, Environment Variables |
+| [[R-ENV-05]] | SPEC.md | CLI, Environment Variables |
+| [[R-ENV-06]] | SPEC.md | CLI, Environment Variables |

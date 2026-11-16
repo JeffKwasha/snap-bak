@@ -1111,49 +1111,51 @@ the rate is logged and the run continues.
 
 ### Usage
 
+[[R-CLI-01]]
+
 ```bash
 snap-bak [OPTIONS]                    # one run: validate, plan, backup, retain
 snap-bak show excludes [OPTIONS]      # read-only: what do the rules match?
 snap-bak apply excludes [OPTIONS]     # dry-run; --now applies, --later arms
 ```
 
-`show` / `apply` are subcommands. A bare `snap-bak` (no subcommand) is the
-normal run, so the systemd service (`ExecStart=<install>/venv/bin/python -P -m
-snap_bak.cli`) is unaffected. The installed command is `/usr/local/bin/snap-bak`; tool commands
-run as the service user, `sudo -u snap-bak snap-bak ...` (see *Deployment
-Contract*).
+[[R-CLI-02]] `show` / `apply` are subcommands. A bare `snap-bak` (no subcommand)
+is the normal run, so the systemd service
+(`ExecStart=<install>/venv/bin/python -P -m snap_bak.cli`) is unaffected. The
+installed command is `/usr/local/bin/snap-bak`; tool commands run as the service
+user, `sudo -u snap-bak snap-bak ...` (see *Deployment Contract*).
 
 ### Options
 
-| Flag | Description |
-|------|-------------|
-| `-c, --config` | Path to config JSON (default: `config/config.json`) |
-| `-j, --job` | Run specific job by name (default: all jobs) |
-| `-n, --dry-run` | Simulate backup (preflight only, no upload/delete) |
-| `-l, --list-jobs` | List configured jobs and exit |
-| `--log-file` | Also write logs to this file (default: stderr only; captured by systemd journal) |
+| ID | Flag | Description |
+|----|------|-------------|
+| [[R-CLI-03]] | `-c, --config` | Path to config JSON (default: `config/config.json`) |
+| [[R-CLI-04]] | `-j, --job` | Run specific job by name (default: all jobs) |
+| [[R-CLI-05]] | `-n, --dry-run` | Simulate backup (preflight only, no upload/delete) |
+| [[R-CLI-06]] | `-l, --list-jobs` | List configured jobs and exit |
+| [[R-CLI-07]] | `--log-file` | Also write logs to this file (default: stderr only; captured by systemd journal) |
 
 ### `show excludes` / `apply excludes` options
 
 `show` (read-only):
 
-| Flag | Description |
-|------|-------------|
-| *(always run)* | Static pattern diagnostics — silent when clean, so no flag |
-| `--live` | Add the live filesystem as a column (default) |
-| `--snaps` | Add a column per local btrfs snapshot |
-| `--repo` | Add a column per snapshot stored in restic (network) |
-| `--all` | Every selector above, in one table |
-| `--price` | Walk matched directories for exact totals; the default prunes them unread and prints `?` |
-| `--reveal PATTERN` | What-if: treat PATTERN as a rule, price its matches whole and list them (repeatable) |
-| `--reveal-file PATH` | A file of `--reveal` patterns, `ignore_file` syntax |
-| `--excludes-file PATH` | Add a working pattern file's rules, same syntax as `ignore_file` |
-| `-e, --exclude PATTERN` | Add one rule, repeatable |
-| `--format text\|csv\|markdown` | How to render the grid; only `text` is fitted to the terminal |
-| `-v, --verbose` | Add the per-file sheet under the rule table |
-| `--job NAME` | Restrict to one job |
-| `--json` | Machine-readable output; one document for the whole invocation |
-| `--limit N` | Bound the per-file rows under `-v`; rule rows and totals cover everything |
+| ID | Flag | Description |
+|----|------|-------------|
+| [[R-CLI-08]] | *(always run)* | Static pattern diagnostics — silent when clean, so no flag |
+| [[R-CLI-09]] | `--live` | Add the live filesystem as a column (default) |
+| [[R-CLI-10]] | `--snaps` | Add a column per local btrfs snapshot |
+| [[R-CLI-11]] | `--repo` | Add a column per snapshot stored in restic (network) |
+| [[R-CLI-12]] | `--all` | Every selector above, in one table |
+| [[R-CLI-13]] | `--price` | Walk matched directories for exact totals; the default prunes them unread and prints `?` |
+| [[R-CLI-14]] | `--reveal PATTERN` | What-if: treat PATTERN as a rule, price its matches whole and list them (repeatable) |
+| [[R-CLI-15]] | `--reveal-file PATH` | A file of `--reveal` patterns, `ignore_file` syntax |
+| [[R-CLI-16]] | `--excludes-file PATH` | Add a working pattern file's rules, same syntax as `ignore_file` |
+| [[R-CLI-17]] | `-e, --exclude PATTERN` | Add one rule, repeatable |
+| [[R-CLI-18]] | `--format text\|csv\|markdown` | How to render the grid; only `text` is fitted to the terminal |
+| [[R-CLI-19]] | `-v, --verbose` | Add the per-file sheet under the rule table |
+| [[R-CLI-20]] | `--job NAME` | Restrict to one job |
+| [[R-CLI-21]] | `--json` | Machine-readable output; one document for the whole invocation |
+| [[R-CLI-22]] | `--limit N` | Bound the per-file rows under `-v`; rule rows and totals cover everything |
 
 With no selector, `show` runs `--live`: a local, shallow walk that prunes matched
 directories unread exactly as restic does — local, but not "instant", because the
@@ -1161,13 +1163,13 @@ walk itself still costs the source's directory tree.
 
 `apply` (mutating; restic only):
 
-| Flag | Description |
-|------|-------------|
-| `--now` | Execute now instead of printing the plan |
-| `--later` | Arm the next normal run to apply |
-| `--job NAME` | Restrict to one job |
-| `--json` | Machine-readable output |
-| `--limit N` | Bound displayed rows/columns; totals still cover everything |
+| ID | Flag | Description |
+|----|------|-------------|
+| [[R-CLI-23]] | `--now` | Execute now instead of printing the plan |
+| [[R-CLI-24]] | `--later` | Arm the next normal run to apply |
+| [[R-CLI-25]] | `--job NAME` | Restrict to one job |
+| [[R-CLI-26]] | `--json` | Machine-readable output |
+| [[R-CLI-27]] | `--limit N` | Bound displayed rows/columns; totals still cover everything |
 
 `--live`, `--snaps` and `--all` are **refused** by `apply` with an explanation,
 since they name sources apply never removes files from. So are
@@ -1176,26 +1178,26 @@ or survey rule set must never drive a rewrite of real backups.
 
 ### Exit codes
 
-A verb's status reaches the process: `show` and `apply` exit with what they
-return, so a failure is visible to whatever monitors them rather than always
-looking successful.
+[[R-CLI-28]] A verb's status reaches the process: `show` and `apply` exit with
+what they return, so a failure is visible to whatever monitors them rather than
+always looking successful.
 
-Inspection uses the shared ladder in `cli.py`, unchanged: 0 on success (including
-"nothing matched"), 2 for a config error, 1 for anything else. `apply --now`
-additionally uses 11/12 (restic's own locked/bad-password codes) when the
-preflight aborts, so a caller can distinguish "refused before touching anything"
-from "failed mid-run".
+[[R-CLI-29]] Inspection uses the shared ladder in `cli.py`, unchanged: 0 on
+success (including "nothing matched"), 2 for a config error, 1 for anything else.
+[[R-CLI-30]] `apply --now` additionally uses 11/12 (restic's own
+locked/bad-password codes) when the preflight aborts, so a caller can distinguish
+"refused before touching anything" from "failed mid-run".
 
 ### Environment Variables
 
-| Variable | Description | Production value |
-|----------|-------------|------------------|
-| `SNAPBAK_CONFIG_FILE` | Config file path | `/opt/snap-bak/config.json` |
-| `SNAPBAK_JOB` | Job name to run | — |
-| `SNAPBAK_SUDO` | Sudo binary used to invoke the wrapper | `sudo` |
-| `SUDO_EXEC_PATH` | Path to the root-owned wrapper | `/opt/snap-bak/sudo-exec.py` |
-| `SNAPBAK_STATE_DIR` | State directory override (default: `/opt/snap-bak/state`) | `/opt/snap-bak/state` |
-| `RESTIC_CACHE_DIR` | Restic cache base (not set; restic uses `$HOME/.cache` → `/opt/snap-bak/.cache` → `/opt/snap-bak/cache`) | — |
+| ID | Variable | Description | Production value |
+|----|----------|-------------|------------------|
+| [[R-ENV-01]] | `SNAPBAK_CONFIG_FILE` | Config file path | `/opt/snap-bak/config.json` |
+| [[R-ENV-02]] | `SNAPBAK_JOB` | Job name to run | — |
+| [[R-ENV-03]] | `SNAPBAK_SUDO` | Sudo binary used to invoke the wrapper | `sudo` |
+| [[R-ENV-04]] | `SUDO_EXEC_PATH` | Path to the root-owned wrapper | `/opt/snap-bak/sudo-exec.py` |
+| [[R-ENV-05]] | `SNAPBAK_STATE_DIR` | State directory override (default: `/opt/snap-bak/state`) | `/opt/snap-bak/state` |
+| [[R-ENV-06]] | `RESTIC_CACHE_DIR` | Restic cache base (not set; restic uses `$HOME/.cache` → `/opt/snap-bak/.cache` → `/opt/snap-bak/cache`) | — |
 
 ---
 
