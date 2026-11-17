@@ -408,9 +408,10 @@ suffices, and code with no requirement behind it is orphaned.
 
 ## Release
 
-Bump `pyproject.toml` only when delivering. While a version is pending, fold
-further changes into its changelog entry; do not cut another version. The
-installed distribution is the only version source; there is no `VERSION` file.
+Bump `pyproject.toml` only when delivering. There is no changelog file: git
+history is the record, and the release notes live in the delivery commit and
+its pull request. The installed distribution is the only version source; there
+is no `VERSION` file.
 
 ## Development
 
