@@ -42,6 +42,7 @@ Conventions:
 | [[R-STATE-04]] | SPEC.md | State & Runtime Directories |
 | [[R-STATE-05]] | SPEC.md | State & Runtime Directories |
 | [[R-STATE-06]] | SPEC.md | State & Runtime Directories |
+| [[R-STATE-07]] | SPEC.md | State & Runtime Directories |
 | [[R-CONFIG-01]] | SPEC.md | Configuration |
 | [[R-CONFIG-02]] | SPEC.md | Configuration |
 | [[R-CONFIG-03]] | SPEC.md | Configuration |

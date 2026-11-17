@@ -1044,6 +1044,8 @@ lock; a per-job lock would add complexity without additional protection.
       snap_bak-<ver>.dist-info/   # METADATA, entry points, RECORD
   sudo-exec.py            # sudo wrapper (root:root 0755)
   config.json            # root-owned, validated by the wrapper
+  .config/rclone/        # rclone's config dir under the service user's HOME
+    rclone.conf          # operator-supplied credentials for `rclone:` repos
 
 <install>/rollback       # root-only copies of installs this script replaced
   <timestamp>-XXXXXX/    # one per setup run; never reaped
@@ -1088,17 +1090,22 @@ entry is a request from a human.
 [[R-STATE-05]] `rollback` is written only by the setup script, with `--backup`,
 when it replaces an existing install. Each directory is a complete copy of the
 installed distribution and its metadata, the wrapper, the launcher and the unit
-files, plus the `restore.sh` that puts them back; config, state, cache,
-passwords and excludes are outside it because an upgrade never touches them. The
-first run after the copy layout also saves the old `snap_bak/` and `VERSION`, so
-that migration can be undone. Nothing reaps these directories, so an operator
-deletes them by hand once the new install has proven itself.
+files, plus the `restore.sh` that puts them back; config (the rclone credentials
+included), state, cache, passwords and excludes are outside it because an
+upgrade never touches them. The first run after the copy layout also saves the
+old `snap_bak/` and `VERSION`, so that migration can be undone. Nothing reaps
+these directories, so an operator deletes them by hand once the new install has
+proven itself.
 
 [[R-STATE-06]] All paths are relative to the install directory (`<install>`,
 production
 `/opt/snap-bak`). The `restic` and `rclone` binaries are optional (rclone only
-if a repo uses an `rclone:` path). No `.local` or `.config` directories are
-used.
+if a repo uses an `rclone:` path). `.local` is never used.
+
+[[R-STATE-07]] The service user's home is `<install>`, so rclone reads
+`<install>/.config/rclone/rclone.conf`. The setup creates `.config/rclone` as
+`snap-bak:snap-bak 0750` and instructs the operator to place `rclone.conf` there
+at mode 600; snap-bak never writes it.
 
 ---
 
