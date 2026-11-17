@@ -46,16 +46,17 @@ unmount, delete, restic update) goes through the root wrapper
 Prerequisites: restic at `/usr/local/bin/restic` (a distro package lands in
 `/usr/bin`, which the wrapper rejects; download the release binary and
 `sudo install -m755 restic /usr/local/bin/restic`), Python 3.14 or newer with
-pip, and PyPI access for the first install. `python3` is the base interpreter by
-default; `PYTHON_BIN` overrides it for a non-system install.
+pip, git, and PyPI access for the first install. `python3` is the base
+interpreter by default; `PYTHON_BIN` overrides it for a non-system install.
 
 ```bash
 chmod +x snap-bak-setup.sh
-sudo ./snap-bak-setup.sh --backup
+sudo ./snap-bak-setup.sh
 ```
 
-`--backup` keeps a rollback copy of the install this run replaces. Without it,
-no copy is made and the script says so.
+The install runs from a committed tree: a checkout with uncommitted changes is
+refused, so what lands in production is a commit git can name. `--ref <sha|tag>`
+installs that commit instead of `HEAD`.
 
 The clone is the install source. The script creates `/opt/snap-bak/venv` without
 pip (ensurepip is not needed) and uses the base interpreter's pip to install the
@@ -70,8 +71,10 @@ What `snap-bak-setup.sh` does:
 1. Verifies you are `root`, and that the base interpreter is 3.14 or newer.
 2. Creates the `snap-bak` user/group and `/opt/snap-bak`.
 3. Creates `/opt/snap-bak/venv`, installs `snap-bak` and its dependencies there,
-   records the build timestamp in `/opt/snap-bak/venv/BUILD`, and installs the
-   wrapper to `/opt/snap-bak/sudo-exec.py` (root:root 0755).
+   records the build timestamp in `/opt/snap-bak/venv/BUILD`, the installed
+   commit in `/opt/snap-bak/venv/REF`, appends the change to
+   `/opt/snap-bak/updates.log`, and installs the wrapper to
+   `/opt/snap-bak/sudo-exec.py` (root:root 0755).
 4. Validates `/usr/local/bin/restic`, self-updates it to the newest release,
    and applies `cap_dac_read_search` (the wrapper's `update-restic` op).
 5. Writes an annotated example config to `/opt/snap-bak/config.json`.
@@ -135,17 +138,17 @@ The setup script is **idempotent** — re-running it is safe: it skips the user,
 group, and existing `config.json` (so your edits are preserved), refreshes the
 program + unit files, re-validates sudoers and re-runs the restic update.
 
-With `--backup`, before it replaces the program it saves the previous install
-under `/opt/snap-bak/rollback/<UTC timestamp>-XXXXXX/` with the installed package
-and its metadata, the build stamp, the wrapper, the launcher, the unit files and
-a `restore.sh`. Without the flag, no copy is made. To undo an upgrade:
+To put the code back on an earlier commit, install that ref:
 
 ```bash
-sudo /opt/snap-bak/rollback/<UTC timestamp>-XXXXXX/restore.sh
+sudo ./snap-bak-setup.sh --ref <sha|tag>
 ```
 
-The saved copy holds no config, state, cache or passwords, because an upgrade
-never modifies those.
+That runs today's installer against that ref's tree, so the venv, launcher,
+units and wrapper stay as this version defines them and only the code moves.
+The install keeps no copy of what it replaced. `/opt/snap-bak/updates.log` is
+the record of what the box has run: one line per code change, with the UTC
+timestamp, version and commit.
 
 ## How It Works
 

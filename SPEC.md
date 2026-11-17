@@ -1040,26 +1040,15 @@ lock; a per-job lock would add complexity without additional protection.
   venv/                  # created without pip; the base pip populates it
     bin/python           # what the unit, the wrapper and the launcher run
     BUILD                # UTC timestamp written at install; the lock line reports it
+    REF                  # the commit this install was made from
     lib/pythonX.Y/site-packages/
       snap_bak/          # the installed package (root:root)
       snap_bak-<ver>.dist-info/   # METADATA, entry points, RECORD
   sudo-exec.py            # sudo wrapper (root:root 0755)
   config.json            # root-owned, validated by the wrapper
+  updates.log            # append-only: UTC time, version, commit per install
   .config/rclone/        # rclone's config dir under the service user's HOME
     rclone.conf          # operator-supplied credentials for `rclone:` repos
-
-<install>/rollback       # root-only copies of installs this script replaced
-  <timestamp>-XXXXXX/    # one per setup run; never reaped
-    snap_bak/            # the venv-installed package as it was
-    snap_bak-*.dist-info # its metadata
-    BUILD                # the build stamp as it was (when it existed)
-    legacy-snap_bak/     # only on the first run after the copy layout
-    VERSION              # the legacy marker, only when it existed
-    sudo-exec.py         # the wrapper as it was (when it existed)
-    snap-bak             # the /usr/local/bin launcher as it was (when it existed)
-    snap-bak.service     # the unit files as they were (when they existed)
-    snap-bak.timer
-    restore.sh           # puts the above back; run as root
 
 <install>/state          # owned by snap-bak: runtime state
   snap-bak.lock          # Global lock file
@@ -1087,16 +1076,6 @@ been gone for `state_retention_days` (default 90). A job still in the config is
 never reaped — its file is rewritten every run, and reaping it would reset the
 missed-slot escalation that drives priority. Queued work is never reaped: an
 entry is a request from a human.
-
-[[R-STATE-05]] `rollback` is written only by the setup script, with `--backup`,
-when it replaces an existing install. Each directory is a complete copy of the
-installed distribution and its metadata, the wrapper, the launcher and the unit
-files, plus the `restore.sh` that puts them back; config (the rclone credentials
-included), state, cache, passwords and excludes are outside it because an
-upgrade never touches them. The first run after the copy layout also saves the
-old `snap_bak/` and `VERSION`, so that migration can be undone. Nothing reaps
-these directories, so an operator deletes them by hand once the new install has
-proven itself.
 
 [[R-STATE-06]] All paths are relative to the install directory (`<install>`,
 production
@@ -1335,7 +1314,7 @@ a bug in the docs or the install. The explicitly labelled development option in
 README is outside this contract.
 
 - [[R-DEPLOY-02]] **Baseline.** Linux with btrfs and systemd, Python 3.14 or newer
-  with pip, PyPI access for the first install, and restic at
+  with pip, git, PyPI access for the first install, and restic at
   `/usr/local/bin/restic` as a real root-owned file. rclone only for `rclone:`
   repositories. See *Supported Platform & Dependencies*.
 - [[R-DEPLOY-03]] **Only install.** A clone plus `snap-bak-setup.sh`, optionally
@@ -1354,12 +1333,18 @@ README is outside this contract.
 - [[R-DEPLOY-06]] **Version.** The package is installed as a distribution in
   `/opt/snap-bak/venv`, and `snap-bak --version` reports that distribution's
   metadata. There is no separate version file.
-- [[R-DEPLOY-07]] **Upgrade.** Re-running the script is idempotent, keeps
-  `config.json`, and, when run with `--backup`, saves the install it replaces
-  under `rollback/` with a `restore.sh` that puts back the installed distribution
-  and its metadata, the wrapper, the launcher, the build stamp and the unit
-  files. Without `--backup` no copy is made. The first run after the copy layout
-  also saves the old copy so the migration can be undone.
+- [[R-DEPLOY-07]] **Upgrade.** Re-running the script is idempotent and keeps
+  `config.json`. It installs a committed tree only: a checkout with uncommitted
+  changes is refused, because what runs in production must be a commit git can
+  name and install again. `--ref <sha|tag>` installs that commit instead of
+  `HEAD`, through the current installer, so the layout, launcher, units and
+  wrapper stay the ones this script defines. No copy of the previous install is
+  kept; undo is installing an older ref.
+- [[R-DEPLOY-08]] **Record.** The install writes the commit it installed to
+  `<install>/venv/REF` and appends one line per code change to
+  `<install>/updates.log`: UTC timestamp, installed version, commit. Together
+  they say what the box runs and what it ran before, without trusting the
+  checkout to still be there.
 
 ---
 
@@ -1375,6 +1360,7 @@ snap-bak supports:
 - rich (terminal rendering of the reports)
 - restic (backup tool), installed at /usr/local/bin/restic
 - btrfs-progs (snapshot management)
+- git, for the clone and for `--ref` installs
 - PyPI access for the first install, for the build backend and the dependencies
 
 The four Python libraries are installed into `/opt/snap-bak/venv` by the setup

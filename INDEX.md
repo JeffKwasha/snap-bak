@@ -30,6 +30,7 @@ Conventions:
 | [[R-DEPLOY-05]] | SPEC.md | Deployment Contract |
 | [[R-DEPLOY-06]] | SPEC.md | Deployment Contract |
 | [[R-DEPLOY-07]] | SPEC.md | Deployment Contract |
+| [[R-DEPLOY-08]] | SPEC.md | Deployment Contract |
 | [[R-LOCK-01]] | SPEC.md | Global Lock |
 | [[R-LOCK-02]] | SPEC.md | Global Lock |
 | [[R-LOCK-03]] | SPEC.md | Global Lock |
@@ -40,7 +41,6 @@ Conventions:
 | [[R-STATE-02]] | SPEC.md | State & Runtime Directories |
 | [[R-STATE-03]] | SPEC.md | State & Runtime Directories |
 | [[R-STATE-04]] | SPEC.md | State & Runtime Directories |
-| [[R-STATE-05]] | SPEC.md | State & Runtime Directories |
 | [[R-STATE-06]] | SPEC.md | State & Runtime Directories |
 | [[R-STATE-07]] | SPEC.md | State & Runtime Directories |
 | [[R-CONFIG-01]] | SPEC.md | Configuration |

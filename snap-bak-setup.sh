@@ -6,11 +6,12 @@
 #
 # USAGE INSTRUCTIONS:
 # 1. Make the script executable: chmod +x snap-bak-setup.sh
-# 2. Run with root privileges: sudo ./snap-bak-setup.sh [--backup]
-#    --backup keeps the install this run replaces under /opt/snap-bak/rollback.
+# 2. Commit any change, then run with root privileges:
+#      sudo ./snap-bak-setup.sh [--ref <sha|tag>]
+#    --ref installs that commit instead of HEAD.
 # 3. After completion, perform the 'NEXT STEPS' listed in the script output.
 #
-# Idempotent: re-running "fixes" the box to match the current repo state while
+# Idempotent: re-running "fixes" the box to match the current commit while
 # preserving your config.json edits.
 
 set -e
@@ -22,16 +23,30 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# A rollback copy is opt-in: it is a full copy of the previous install, and the
-# operator should know it exists and be able to delete it.
-BACKUP=0
-for arg in "$@"; do
-    case "$arg" in
-        --backup)
-            BACKUP=1
+# The install runs a committed tree only. --ref installs an older commit (or
+# tag) through this same script, which is what an undo is: git is the history,
+# and no copy of the replaced install is kept.
+REF=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --ref)
+            if [ $# -lt 2 ] || [ -z "$2" ]; then
+                echo "[!] --ref needs a commit or tag." >&2
+                exit 2
+            fi
+            REF="$2"
+            shift 2
+            ;;
+        --ref=*)
+            REF="${1#--ref=}"
+            if [ -z "$REF" ]; then
+                echo "[!] --ref needs a commit or tag." >&2
+                exit 2
+            fi
+            shift
             ;;
         *)
-            echo "[!] Unknown argument: $arg (only --backup is accepted)." >&2
+            echo "[!] Unknown argument: $1 (only --ref <sha|tag> is accepted)." >&2
             exit 2
             ;;
     esac
@@ -64,128 +79,52 @@ SERVICE_NAME="snap-bak"
 STATE_DIR="$SNAPBAK_DIR/state"
 CACHE_DIR="$SNAPBAK_DIR/cache"
 UNIT_DIR="/etc/systemd/system"
-ROLLBACK_ROOT="$SNAPBAK_DIR/rollback"
 
 # Source files co-located with this setup script (repo layout: src/snap_bak/).
 REPO_ROOT="$(dirname "$(readlink -f "$0")")"
 PKG_SRC="$REPO_ROOT/src/snap_bak"
 WRAPPER_SRC="$REPO_ROOT/src/sudo-exec.py"
 
-# Where the installed distribution lives today, for the rollback copy. Empty
-# until there is a venv.
-EXISTING_SITE=""
-if [ -x "$VENV_PY" ]; then
-    EXISTING_SITE="$("$VENV_PY" -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)"
+
+# --- 0. SOURCE: A CLEAN CHECKOUT, OPTIONALLY AT ANOTHER REF ---
+if [ ! -d "$PKG_SRC" ] || [ ! -f "$WRAPPER_SRC" ]; then
+    echo "[!] Cannot find $PKG_SRC and $WRAPPER_SRC. Run this script from the repo root." >&2
+    exit 1
+fi
+if ! command -v git >/dev/null 2>&1 || ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "[!] $REPO_ROOT is not a git checkout; the install needs one." >&2
+    exit 1
+fi
+DIRTY="$(git -C "$REPO_ROOT" status --porcelain)"
+if [ -n "$DIRTY" ]; then
+    echo "[!] Uncommitted changes in $REPO_ROOT. Commit them before installing:" >&2
+    printf '%s\n' "$DIRTY" | sed 's/^/    /' >&2
+    exit 1
 fi
 
-# Snapshot the install that is about to be replaced, with a script that puts it
-# back. Config, state, cache, passwords and excludes stay out of the copy: an
-# upgrade never modifies them, so a rollback never restores them. Both install
-# shapes are handled, because the first run after the venv migration must be
-# able to put the legacy copy layout back.
-save_previous_install() {
-    if [ ! -d "$PKG_PATH" ] && [ ! -d "${EXISTING_SITE:-}/snap_bak" ] && [ ! -f "$WRAPPER_PATH" ]; then
-        return 0
+# The tree that gets installed. With --ref it is an export of that commit, so
+# the code is exactly what git holds; everything around it (venv, launcher,
+# units, wrapper install) is always this script, so an undo never reverts the
+# installer.
+SOURCE_DIR="$REPO_ROOT"
+if [ -n "$REF" ]; then
+    if ! COMMIT="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "$REF^{commit}")"; then
+        echo "[!] Unknown ref: $REF" >&2
+        exit 1
     fi
-    local dest
-    local unit
-    local meta
-    mkdir -p "$ROLLBACK_ROOT"
-    dest="$(mktemp -d "$ROLLBACK_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
-    if [ -d "$PKG_PATH" ]; then
-        cp -a "$PKG_PATH" "$dest/legacy-snap_bak"
-    fi
-    if [ -f "$VERSION_FILE" ]; then
-        cp -a "$VERSION_FILE" "$dest/VERSION"
-    fi
-    if [ -n "${EXISTING_SITE:-}" ] && [ -d "$EXISTING_SITE/snap_bak" ]; then
-        cp -a "$EXISTING_SITE/snap_bak" "$dest/snap_bak"
-        for meta in "$EXISTING_SITE"/snap_bak-*.dist-info; do
-            if [ -e "$meta" ]; then
-                cp -a "$meta" "$dest/"
-            fi
-        done
-    fi
-    if [ -f "$VENV_DIR/BUILD" ]; then
-        cp -a "$VENV_DIR/BUILD" "$dest/BUILD"
-    fi
-    if [ -f "$WRAPPER_PATH" ]; then
-        cp -a "$WRAPPER_PATH" "$dest/sudo-exec.py"
-    fi
-    if [ -f "$CLI_PATH" ]; then
-        cp -a "$CLI_PATH" "$dest/snap-bak"
-    fi
-    for unit in "$SERVICE_NAME.service" "$SERVICE_NAME.timer"; do
-        if [ -f "$UNIT_DIR/$unit" ]; then
-            cp -a "$UNIT_DIR/$unit" "$dest/$unit"
-        fi
-    done
-    cat > "$dest/restore.sh" <<EOF
-#!/bin/bash
-set -e
-if [ "\$EUID" -ne 0 ]; then
-    echo "restore.sh must run as root." >&2
-    exit 1
-fi
-systemctl stop $SERVICE_NAME.timer || true
-if [ -d "$dest/legacy-snap_bak" ]; then
-    rm -rf "$PKG_PATH"
-    cp -a "$dest/legacy-snap_bak" "$PKG_PATH"
-    chown -R root:root "$PKG_PATH"
-    if [ -f "$dest/VERSION" ]; then
-        install -o root -g root -m 0644 "$dest/VERSION" "$VERSION_FILE"
-    fi
-    rm -rf "$VENV_DIR"
-fi
-if [ -d "$dest/snap_bak" ] && [ -d "$EXISTING_SITE" ]; then
-    rm -rf "$EXISTING_SITE/snap_bak" "$EXISTING_SITE"/snap_bak-*.dist-info
-    cp -a "$dest/snap_bak" "$EXISTING_SITE/snap_bak"
-    for meta in "$dest"/snap_bak-*.dist-info; do
-        if [ -e "\$meta" ]; then
-            cp -a "\$meta" "$EXISTING_SITE/"
-        fi
-    done
-    if [ -f "$dest/BUILD" ]; then
-        install -o root -g root -m 0644 "$dest/BUILD" "$VENV_DIR/BUILD"
-    fi
-    chown -R root:root "$EXISTING_SITE"
-fi
-if [ -f "$dest/sudo-exec.py" ]; then
-    install -o root -g root -m 0755 "$dest/sudo-exec.py" "$WRAPPER_PATH"
-fi
-if [ -f "$dest/snap-bak" ]; then
-    install -o root -g root -m 0755 "$dest/snap-bak" "$CLI_PATH"
+    EXPORT_DIR="$(mktemp -d)"
+    trap 'rm -rf "$EXPORT_DIR"' EXIT
+    git -C "$REPO_ROOT" archive --format=tar "$COMMIT" | tar -x -C "$EXPORT_DIR"
+    SOURCE_DIR="$EXPORT_DIR"
+    echo "[*] Installing $REF ($COMMIT) instead of HEAD."
 else
-    rm -f "$CLI_PATH"
+    COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 fi
-for unit in $SERVICE_NAME.service $SERVICE_NAME.timer; do
-    if [ -f "$dest/\$unit" ]; then
-        install -o root -g root -m 0644 "$dest/\$unit" "$UNIT_DIR/\$unit"
-    fi
-done
-systemctl daemon-reload
-if systemctl is-enabled --quiet $SERVICE_NAME.timer 2>/dev/null; then
-    systemctl start $SERVICE_NAME.timer
-fi
-EOF
-    chmod 0755 "$dest/restore.sh"
-    chown -R root:root "$dest"
-    echo "[*] Previous install saved to $dest (undo: sudo $dest/restore.sh)"
-}
-
-# --- 0. SOURCE CHECK AND ROLLBACK COPY ---
-if [ ! -d "$PKG_SRC" ]; then
-    echo "[!] Cannot find $PKG_SRC. Run this script from the repo root." >&2
+PKG_SRC="$SOURCE_DIR/src/snap_bak"
+WRAPPER_SRC="$SOURCE_DIR/src/sudo-exec.py"
+if [ ! -d "$PKG_SRC" ] || [ ! -f "$WRAPPER_SRC" ]; then
+    echo "[!] $SOURCE_DIR has no src/snap_bak and src/sudo-exec.py." >&2
     exit 1
-fi
-if [ ! -f "$WRAPPER_SRC" ]; then
-    echo "[!] Cannot find $WRAPPER_SRC. Run this script from the repo root." >&2
-    exit 1
-fi
-if [ "$BACKUP" -eq 1 ]; then
-    save_previous_install
-else
-    echo "[!] No rollback copy. Pass --backup to keep the install this run replaces."
 fi
 
 # --- 0b. VIRTUALENV & PACKAGE ---
@@ -211,8 +150,8 @@ SITE_PACKAGES="$("$VENV_PY" -c 'import site; print(site.getsitepackages()[0])')"
 # --upgrade makes a re-run replace the current tree even if the version did not
 # change.
 echo "[*] Installing snap-bak and its dependencies into $VENV_DIR..."
-if ! "$PYTHON_BIN" -m pip install --quiet --upgrade --target "$SITE_PACKAGES" "$REPO_ROOT"; then
-    echo "[!] pip could not install $REPO_ROOT." >&2
+if ! "$PYTHON_BIN" -m pip install --quiet --upgrade --target "$SITE_PACKAGES" "$SOURCE_DIR"; then
+    echo "[!] pip could not install $SOURCE_DIR." >&2
     echo "    It needs PyPI access for the build backend and the dependencies." >&2
     exit 1
 fi
@@ -225,7 +164,6 @@ rm -rf "${SITE_PACKAGES:?}/bin"
 date -u +%Y-%m-%dT%H:%M:%SZ > "$VENV_DIR/BUILD"
 chown root:root "$VENV_DIR/BUILD"
 chmod 0644 "$VENV_DIR/BUILD"
-
 # --- 1. CREATE USER, GROUP & DIRECTORIES ---
 if ! getent group "$SERVICE_GROUP" >/dev/null; then
     echo "[*] Creating system group: $SERVICE_GROUP"
@@ -532,6 +470,26 @@ rm -f "$VERSION_FILE"
 for stale in cli.py config.py job.py restic.py snapshot.py snap-bak-io; do
     rm -f "$SNAPBAK_DIR/$stale"
 done
+
+# What the box runs, and what it ran before. The commit is the only thing an
+# undo needs, because no copy of the replaced install is kept.
+INSTALLED_VERSION="$("$VENV_PY" -c 'import snap_bak; print(snap_bak.__version__)')" || {
+    echo "[!] $VENV_PY cannot import the installed snap_bak." >&2
+    exit 1
+}
+PREV_REF="$(cat "$VENV_DIR/REF" 2>/dev/null || true)"
+if [ "$COMMIT" != "$PREV_REF" ]; then
+    printf '%s %s %s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$INSTALLED_VERSION" "$COMMIT" \
+        >> "$SNAPBAK_DIR/updates.log"
+fi
+printf '%s\n' "$COMMIT" > "$VENV_DIR/REF"
+chown root:root "$VENV_DIR/REF"
+chmod 0644 "$VENV_DIR/REF"
+if [ -f "$SNAPBAK_DIR/updates.log" ]; then
+    chown root:root "$SNAPBAK_DIR/updates.log"
+    chmod 0644 "$SNAPBAK_DIR/updates.log"
+fi
 
 # --- 6. FINALIZE ---
 echo "[*] Reloading systemd daemon..."

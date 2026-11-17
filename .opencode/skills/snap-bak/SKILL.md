@@ -395,12 +395,12 @@ The official install is a clone plus `snap-bak-setup.sh`. It creates
 writes the wrapper, the launcher and the unit. Re-running is idempotent and
 keeps `config.json`.
 
-Pass `--backup` to keep a rollback copy of the install being replaced. Without
-it no copy is made. The copy holds the installed distribution and its metadata,
-the wrapper, the launcher, the build stamp and the unit files; it never holds
-config, state, cache or passwords. On a layout change, the old layout is removed
-only after the new unit is written, so a failure above leaves the previous unit
-working.
+It installs a committed tree only: uncommitted changes are refused. `--ref
+<sha|tag>` installs that commit instead of `HEAD` through the same script, so
+the layout, launcher, units and wrapper stay current and only the code moves.
+No copy of the replaced install is kept; `venv/REF` names the installed commit
+and `/opt/snap-bak/updates.log` records one line per code change. Undo is
+installing an older ref.
 
 **Baseline rule.** Every install requirement names what consumes it. A
 requirement nothing at runtime needs is dropped for the weaker primitive that
