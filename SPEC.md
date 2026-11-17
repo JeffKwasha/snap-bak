@@ -135,7 +135,8 @@ back to the historic behavior (create when the interval has elapsed). A fresh
 install (no snapshot yet) always creates one. Config per job:
 `skip_snapshot_if_idle` (default `true`) disables the spun-down-disk gate only;
 the no-change gate is always on. Backups are independent of these gates and
-still run on schedule.
+still run on schedule. A dry run evaluates neither gate, so it predicts no
+skip from them and reports that the gate was not checked.
 
 ### Phase 5: Cleanup Local Snapshots (btrfs)
 

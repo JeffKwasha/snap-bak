@@ -353,6 +353,15 @@ class TestDecide:
 # --- Runner.run orchestration ---
 
 
+class TestSnapshotGate:
+    def test_dry_run_reports_no_wrapper_failure(self, monkeypatch, tmp_path, caplog):
+        runner = _runner(monkeypatch, tmp_path)
+        with caplog.at_level(logging.INFO):
+            runner._should_create_snapshot()
+        assert "power-saving gate not evaluated" in caplog.text
+        assert "wrapper status unavailable" not in caplog.text
+
+
 class TestRun:
     def test_retries_failed_backup(self, monkeypatch, tmp_path):
         cfg = config.Config.model_validate({

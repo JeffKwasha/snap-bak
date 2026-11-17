@@ -676,6 +676,10 @@ class Runner:
     def _wrapper_status(self) -> dict:
         """Query the root wrapper for pool/generation status; {} fails open."""
         cmd = [config.SUDO, config.SUDO_EXEC, "status", self.job.name]
+        # A dry run never runs the query, so the empty stub stdout is not a failure.
+        if self.dry_run:
+            logger.info(f"DRY-RUN: power-saving gate not evaluated: {' '.join(cmd)}")
+            return {}
         try:
             result = self.run_command(cmd, timeout=config.REPO_CHECK_TIMEOUT)
             data = json.loads(result.stdout)
