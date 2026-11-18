@@ -163,6 +163,35 @@ class TestUpdateRestic:
             for c in calls
         )
 
+    def test_update_restricts_restic_before_setcap(self, tmp_path, monkeypatch):
+        fake = tmp_path / "restic"
+        fake.write_text("")
+        fake.chmod(0o755)
+        fake_stat = fake.stat()
+        monkeypatch.setattr(io, "RESTIC", str(fake))
+        monkeypatch.setattr(io, "CHGRP", "/usr/bin/chgrp")
+        monkeypatch.setattr(io, "CHMOD", "/usr/bin/chmod")
+        monkeypatch.setattr(io, "SETCAP", "/usr/bin/setcap")
+
+        def fake_stat_result(p):
+            return types.SimpleNamespace(st_uid=0, st_mode=fake_stat.st_mode, st_gid=0)
+
+        monkeypatch.setattr(io.os, "stat", fake_stat_result)
+        calls = []
+        monkeypatch.setattr(
+            io.subprocess,
+            "run",
+            lambda cmd, **kw: calls.append(cmd) or types.SimpleNamespace(returncode=0),
+        )
+        monkeypatch.setattr(io.os.path, "islink", lambda p: False)
+        io._update_restic()
+        commands = [c[0] for c in calls]
+        assert "/usr/bin/chmod" in commands
+        chmod = next(c for c in calls if c[0] == "/usr/bin/chmod")
+        assert chmod[1] == "0750"
+        # The capability is handed out only after execution is restricted.
+        assert commands.index("/usr/bin/setcap") > commands.index("/usr/bin/chmod")
+
 
 # --- status op: pool disk state + generation (power saving) ---
 

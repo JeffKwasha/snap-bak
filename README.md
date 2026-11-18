@@ -234,7 +234,9 @@ sudoers lets the service user run.
     `cap_dac_read_search` capability applied to the restic binary. This is
     managed entirely by the wrapper's `update-restic` op, which validates the
     binary is root-owned and un-writable by others, runs `restic self-update`
-    (dropping any stale caps), and re-applies the capability. A config
+    (dropping any stale caps), restricts the binary to `root:snap-bak 0750` and
+    then re-applies the capability. The mode matters as much as the capability:
+    a capable binary anyone can execute lets any user read any file. A config
     `restic_update` policy (`after|never`) controls when updates run — and it
     is deliberately restricted: updating restic rewrites a
     `cap_dac_read_search`-carrying binary, so snap-bak only does it after a

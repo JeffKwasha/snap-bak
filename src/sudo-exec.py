@@ -40,6 +40,7 @@ and orchestrator validate the same JSONC file identically and derive the same
 mount points; the JSONC handling lives in exactly one place.
 """
 
+import grp
 import json
 import os
 import stat
@@ -67,6 +68,9 @@ MOUNT = "/usr/bin/mount"
 UMOUNT = "/usr/bin/umount"
 RESTIC = "/usr/local/bin/restic"
 SETCAP = "/usr/sbin/setcap"
+CHGRP = "/usr/bin/chgrp"
+CHMOD = "/usr/bin/chmod"
+SERVICE_GROUP = "snap-bak"
 
 
 def _exit_err(msg: str, code: int = 1) -> NoReturn:
@@ -319,7 +323,27 @@ def _check_restic_trusted() -> None:
         )
 
 
+def _restrict_restic() -> None:
+    """Only root and the service group may run a capability-carrying restic.
+
+    cap_dac_read_search reads any file, so execution is the whole boundary:
+    left world-executable, every local user could read anything. Restrict
+    first, then hand out the capability, so a failure here never leaves a
+    capable binary that others can run.
+    """
+    try:
+        gid = grp.getgrnam(SERVICE_GROUP).gr_gid
+    except KeyError:
+        _exit_err(f"group {SERVICE_GROUP} does not exist", code=4)
+    try:
+        _run([CHGRP, str(gid), RESTIC])
+        _run([CHMOD, "0750", RESTIC])
+    except SystemExit:
+        _exit_err(f"could not restrict {RESTIC} to root:{SERVICE_GROUP} 0750", code=4)
+
+
 def _setcap() -> None:
+    _restrict_restic()
     _run([SETCAP, "cap_dac_read_search=+ep", RESTIC])
 
 
