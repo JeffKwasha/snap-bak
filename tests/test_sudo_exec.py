@@ -112,6 +112,7 @@ class TestUpdateRestic:
         fake.chmod(0o755)
         fake_stat = fake.stat()
         monkeypatch.setattr(io, "RESTIC", str(fake))
+        monkeypatch.setattr(io.grp, "getgrnam", lambda name: types.SimpleNamespace(gr_gid=0))
         monkeypatch.setattr(io, "SETCAP", "/bin/true")
         # Force uid != 0 by faking os.stat on the binary path
         import types
@@ -137,6 +138,7 @@ class TestUpdateRestic:
         fake.chmod(0o755)
         fake_stat = fake.stat()
         monkeypatch.setattr(io, "RESTIC", str(fake))
+        monkeypatch.setattr(io.grp, "getgrnam", lambda name: types.SimpleNamespace(gr_gid=0))
         monkeypatch.setattr(io, "SETCAP", "/usr/bin/setcap")
         import types
 
@@ -169,6 +171,7 @@ class TestUpdateRestic:
         fake.chmod(0o755)
         fake_stat = fake.stat()
         monkeypatch.setattr(io, "RESTIC", str(fake))
+        monkeypatch.setattr(io.grp, "getgrnam", lambda name: types.SimpleNamespace(gr_gid=0))
         monkeypatch.setattr(io, "CHGRP", "/usr/bin/chgrp")
         monkeypatch.setattr(io, "CHMOD", "/usr/bin/chmod")
         monkeypatch.setattr(io, "SETCAP", "/usr/bin/setcap")
