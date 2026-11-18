@@ -1081,7 +1081,17 @@ class Runner:
             for line in result.stderr.strip().splitlines():
                 logger.warning(f"restic: {line}")
         summary = restic.find_summary(result.stdout)
-        return summary.get("snapshot_id") if summary else None
+        if summary is None:
+            return None
+        # restic already produced these in the --json stream we parse for the
+        # snapshot id, so the counts cost nothing extra.
+        logger.info(
+            f"BACKUP: {summary.get('files_new', 0)} new, "
+            f"{summary.get('files_changed', 0)} changed, "
+            f"{summary.get('files_unmodified', 0)} unmodified, "
+            f"{summary.get('data_added', 0) / 1_000_000:.1f} MB added"
+        )
+        return summary.get("snapshot_id")
 
     @contextmanager
     def mount(self, snapshot_path: Path):

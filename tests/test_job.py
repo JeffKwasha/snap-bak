@@ -1,5 +1,6 @@
 """Tests for snap_bak.job: errors, lock helpers, status, Runner decisions."""
 
+import json
 import logging
 import subprocess
 import sys
@@ -351,6 +352,32 @@ class TestDecide:
 
 
 # --- Runner.run orchestration ---
+
+
+class TestBackupReport:
+    def test_reports_what_restic_counted(self, monkeypatch, tmp_path, caplog):
+        runner = _runner(monkeypatch, tmp_path)
+        summary = {
+            "message_type": "summary",
+            "files_new": 12,
+            "files_changed": 3,
+            "files_unmodified": 184203,
+            "data_added": 41_200_000,
+            "snapshot_id": "abc123",
+        }
+        monkeypatch.setattr(
+            runner,
+            "run_command",
+            lambda cmd, **kw: types.SimpleNamespace(
+                stdout=json.dumps(summary), stderr="", returncode=0
+            ),
+        )
+        with caplog.at_level(logging.INFO):
+            assert runner._backup(tmp_path / "mnt") == "abc123"
+        assert "12 new" in caplog.text
+        assert "3 changed" in caplog.text
+        assert "184203 unmodified" in caplog.text
+        assert "41.2 MB added" in caplog.text
 
 
 class TestSnapshotGate:
