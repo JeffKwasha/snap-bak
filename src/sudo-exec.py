@@ -71,6 +71,25 @@ SETCAP = "/usr/sbin/setcap"
 CHGRP = "/usr/bin/chgrp"
 CHMOD = "/usr/bin/chmod"
 SERVICE_GROUP = "snap-bak"
+_PROC_PATH = "/proc"
+
+
+def _restic_running() -> bool:
+    """True if any restic process is alive, whatever its arguments."""
+    try:
+        entries = Path(_PROC_PATH).iterdir()
+    except OSError:
+        return True
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv0 = (entry / "cmdline").read_bytes().decode("utf-8", "ignore").split("\0", 1)[0]
+        except OSError:
+            continue
+        if os.path.basename(argv0) == "restic":
+            return True
+    return False
 
 
 def _exit_err(msg: str, code: int = 1) -> NoReturn:
@@ -446,6 +465,10 @@ def main() -> None:
         _run([MOUNT, "-o", "bind,ro", snap_path, str(mount_point)])
 
     elif op == "umount":
+        # The orchestrator also checks, but this is the trust boundary: never
+        # pull a mounted snapshot out from under an in-flight restic process.
+        if _restic_running():
+            _exit_err("restic is still running; refusing to unmount")
         _run([UMOUNT, "-l", str(rj.mount_point)])
 
     else:

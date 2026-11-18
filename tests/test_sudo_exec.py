@@ -551,3 +551,38 @@ class TestStatusOp:
         assert parsed["source_generation"] == 300
         assert parsed["last_snapshot_generation"] is None
         assert parsed["changed"] is True  # fresh install -> creation warranted
+
+
+class TestUmount:
+    def _setup(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(io, "CONFIG_PATH", str(_write_config(tmp_path)))
+        monkeypatch.setattr(io, "UMOUNT", "/usr/bin/umount")
+        proc = tmp_path / "proc"
+        proc.mkdir()
+        monkeypatch.setattr(io, "_PROC_PATH", str(proc))
+        calls = []
+        monkeypatch.setattr(
+            io.subprocess,
+            "run",
+            lambda cmd, **kw: calls.append(cmd) or types.SimpleNamespace(returncode=0),
+        )
+        monkeypatch.setattr(io.sys, "argv", ["sudo-exec.py", "umount", "home"])
+        return proc, calls
+
+    def test_refuses_while_restic_runs(self, tmp_path, monkeypatch):
+        proc, calls = self._setup(tmp_path, monkeypatch)
+        (proc / "1").mkdir()
+        (proc / "1/cmdline").write_bytes(
+            b"/usr/local/bin/restic\0--password-file\0/opt/snap-bak/passwords/p\0"
+        )
+        with pytest.raises(SystemExit) as exc:
+            io.main()
+        assert exc.value.code == 1
+        assert calls == []
+
+    def test_unmounts_when_no_restic_runs(self, tmp_path, monkeypatch):
+        proc, calls = self._setup(tmp_path, monkeypatch)
+        (proc / "1").mkdir()
+        (proc / "1/cmdline").write_bytes(b"python3\0-m\0snap_bak.cli\0")
+        io.main()
+        assert calls == [["/usr/bin/umount", "-l", "/bak/home"]]
