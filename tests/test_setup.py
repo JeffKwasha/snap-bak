@@ -241,3 +241,9 @@ def test_a_destination_the_caller_cannot_read_is_left_alone(tmp_path):
     assert plan.unchanged == ["home.ignore"]
     assert plan.updated == []
     assert plan.added == []
+
+
+def test_the_wrapper_is_closed_to_other_users():
+    managed = setup.targets({})
+    assert managed["wrapper"].mode == "0750"
+    assert managed["wrapper"].owner == "root:snap-bak"

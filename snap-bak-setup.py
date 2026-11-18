@@ -392,7 +392,7 @@ class Managed:
 
 def targets(paths):
     managed = {
-        "wrapper": Managed("wrapper", WRAPPER_PATH, "0755"),
+        "wrapper": Managed("wrapper", WRAPPER_PATH, "0750", f"root:{SERVICE_GROUP}"),
         "launcher": Managed("launcher", CLI_PATH, "0755"),
         "service": Managed("service", UNIT_DIR / f"{SERVICE_NAME}.service", "0644"),
         "timer": Managed("timer", UNIT_DIR / f"{SERVICE_NAME}.timer", "0644"),

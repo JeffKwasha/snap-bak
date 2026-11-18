@@ -1044,7 +1044,7 @@ lock; a per-job lock would add complexity without additional protection.
     lib/pythonX.Y/site-packages/
       snap_bak/          # the installed package (root:root)
       snap_bak-<ver>.dist-info/   # METADATA, entry points, RECORD
-  sudo-exec.py            # sudo wrapper (root:root 0755)
+  sudo-exec.py            # sudo wrapper (root:snap-bak 0750)
   config.json            # root-owned, validated by the wrapper
   updates.log            # append-only: UTC time, version, commit per install
   .config/rclone/        # rclone's config dir under the service user's HOME
@@ -1195,7 +1195,7 @@ locked/bad-password codes) when the preflight aborts, so a caller can distinguis
 
 [[R-PRIV-01]] Btrfs snapshot create/delete and mount/umount require root.
 snap-bak runs as an unprivileged service user and delegates these to a
-**root-owned wrapper** (`sudo-exec.py`), reachable via a single static sudoers
+**root-owned wrapper** (`sudo-exec.py`, `root:snap-bak 0750`), reachable via a single static sudoers
 rule:
 
 ```

@@ -89,7 +89,7 @@ What `snap-bak-setup.py` does:
    records the build timestamp in `/opt/snap-bak/venv/BUILD`, the installed
    commit in `/opt/snap-bak/venv/REF`, appends the change to
    `/opt/snap-bak/updates.log`, and installs the wrapper to
-   `/opt/snap-bak/sudo-exec.py` (root:root 0755).
+   `/opt/snap-bak/sudo-exec.py` (root:snap-bak 0750).
 4. Validates `/usr/local/bin/restic`, self-updates it to the newest release,
    and applies `cap_dac_read_search` (the wrapper's `update-restic` op).
 5. Writes an annotated example config to `/opt/snap-bak/config.json`.
@@ -218,7 +218,7 @@ sudoers lets the service user run.
     sudo-rs mishandles it. Changing `mount_base` or `snapshot_dir` in config
     NEVER requires touching sudoers, because the wrapper derives every path
     from the root-owned config at runtime.
-2.  **The wrapper** (`sudo-exec.py`, root-owned 0755) accepts only
+2.  **The wrapper** (`sudo-exec.py`, root:snap-bak 0750) accepts only
     `snapshot|delete|mount|umount <job> [snapshot]`, `status <job>`, and
     `update-restic`,
     validates the job against `/opt/snap-bak/config.json` and the snapshot
