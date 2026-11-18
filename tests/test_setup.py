@@ -3,6 +3,7 @@
 import importlib.util
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -136,3 +137,85 @@ def test_an_unknown_ref_is_refused(tmp_path):
     stage.mkdir()
     with pytest.raises(setup.SetupError, match="Unknown ref"):
         setup.resolve_source(repo, "nope", stage)
+
+
+def test_plan_reports_what_changed(tmp_path):
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    (staged / "same").write_text("x")
+    (installed / "same").write_text("x")
+    (staged / "new").write_text("y")
+    (staged / "changed").write_text("new")
+    (installed / "changed").write_text("old")
+    managed = {
+        "same": setup.Managed("same", installed / "same", "0644"),
+        "new": setup.Managed("new", installed / "new", "0644"),
+        "changed": setup.Managed("changed", installed / "changed", "0644"),
+    }
+    plan = setup.plan_files(
+        {"same": staged / "same", "new": staged / "new", "changed": staged / "changed"}, managed
+    )
+    assert plan.unchanged == ["same"]
+    assert plan.added == ["new"]
+    assert plan.updated == ["changed"]
+    assert plan.changes
+    assert setup.summary_line(plan) == (
+        "Install report: 1 added, 1 updated, 1 unchanged, venv unchanged"
+    )
+
+
+def test_a_mode_drift_counts_as_a_change(tmp_path):
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / "launcher").write_text("x")
+    installed = tmp_path / "launcher"
+    installed.write_text("x")
+    installed.chmod(0o755)
+    plan = setup.plan_files(
+        {"launcher": staged / "launcher"},
+        {"launcher": setup.Managed("launcher", installed, "0644")},
+    )
+    assert plan.updated == ["launcher"]
+
+
+def test_build_is_never_compared(tmp_path):
+    (tmp_path / "BUILD").write_text("old")
+    plan = setup.plan_files(
+        {"BUILD": tmp_path / "staged-build"},
+        {"BUILD": setup.Managed("BUILD", tmp_path / "BUILD", "0644")},
+    )
+    assert plan.changes is False
+
+
+def test_tree_diff_ignores_pycache_and_finds_changes(tmp_path):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    for root in (left, right):
+        (root / "__pycache__").mkdir(parents=True)
+        (root / "pkg").mkdir()
+        (root / "pkg/mod.py").write_text("same")
+    (left / "__pycache__/x.cpython-314.pyc").write_text("a")
+    (right / "__pycache__/x.cpython-314.pyc").write_text("b")
+    assert setup.tree_diff(left, right) == []
+    (right / "pkg/mod.py").write_text("changed")
+    (right / "pkg/extra.py").write_text("x")
+    (left / "pkg/gone.py").write_text("x")
+    assert setup.tree_diff(left, right) == ["pkg/extra.py", "pkg/gone.py", "pkg/mod.py"]
+
+
+def test_env_fingerprint_follows_the_dependency_inputs(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nversion = '1'\n")
+    first = setup.env_fingerprint(tmp_path, sys.executable)
+    assert setup.env_fingerprint(tmp_path, sys.executable) == first
+    (tmp_path / "uv.lock").write_text("lock")
+    assert setup.env_fingerprint(tmp_path, sys.executable) != first
+
+
+def test_render_records_the_commit_and_the_fingerprint(tmp_path):
+    repo = Path(__file__).resolve().parents[1]
+    paths = setup.render(repo, tmp_path, "2026-11-18T00:00:00Z", "abc123", "feedface")
+    assert paths["REF"].read_text() == "abc123\n"
+    assert paths["ENV"].read_text() == "feedface\n"
+    assert paths["BUILD"].read_text() == "2026-11-18T00:00:00Z\n"

@@ -394,8 +394,13 @@ The official install is a clone plus `snap-bak-setup.py`. It runs as you,
 stages the venv, package, wrapper, launcher, units and sudoers rule in a temp
 directory with uv (or the interpreter's pip), then asks for sudo once to write
 them into `/opt/snap-bak`, `/etc/systemd/system` and `/usr/local/bin`. The
-package manager never runs as root. Re-running
-is idempotent and keeps `config.json`.
+package manager never runs as root. Re-running is idempotent and keeps
+`config.json`.
+
+It writes only what changed: managed files are compared by content and mode,
+the venv by its contents, and the report says what was added, updated and left
+alone (`-v` names each file). A box already on that commit with the same
+dependency inputs is left untouched and is not asked for a password.
 
 It installs a committed tree only: uncommitted changes are refused. `--ref
 <sha|tag>` installs that commit instead of `HEAD` through the same script, so

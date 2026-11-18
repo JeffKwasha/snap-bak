@@ -65,6 +65,12 @@ The install runs from a committed tree: a checkout with uncommitted changes is
 refused, so what lands in production is a commit git can name. `--ref <sha|tag>`
 installs that commit instead of `HEAD`.
 
+It writes nothing that did not change: each file is compared with the installed
+one by content and mode, and the venv by its contents, so unchanged files are
+skipped and the venv survives a run that changed nothing. The run reports what
+it found, and `-v` names every file. When the box already runs that commit with
+the same dependency inputs, nothing is built and no password is asked.
+
 The clone is the install source. The venv is built without pip (ensurepip is not
 needed), and the project and its dependencies go into it with uv when available,
 otherwise the base interpreter's pip, so the system Python is never modified and

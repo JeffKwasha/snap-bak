@@ -1345,6 +1345,12 @@ README is outside this contract.
   `<install>/updates.log`: UTC timestamp, installed version, commit. Together
   they say what the box runs and what it ran before, without trusting the
   checkout to still be there.
+- [[R-DEPLOY-10]] **Report.** A file is written only when its content or mode
+  differs from the installed one, and the venv is replaced only when its
+  contents differ. A run reports what it found — files added, updated and left
+  alone, and whether the venv moved — and `-v` names each file. When the
+  installed commit and dependency inputs already match, nothing is built and no
+  elevation is requested.
 - [[R-DEPLOY-09]] **Elevation.** The installer runs as the administrator, not as
   root. Everything it builds — the venv, the package, the wrapper, the launcher,
   the units, the sudoers rule and the example config — is staged under a temp

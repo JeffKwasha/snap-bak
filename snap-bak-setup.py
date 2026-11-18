@@ -8,6 +8,11 @@ writes them into the root-owned paths. Re-running is idempotent: it keeps
 config.json, refreshes the program and the units, and re-runs the restic
 update.
 
+Nothing is written that did not change. Every managed file is compared with the
+installed one by content and mode, and the venv by its contents; unchanged
+files are skipped and the run reports what it found. When the commit and the
+environment fingerprint match what is installed, the venv is not even built.
+
 The install runs a committed tree only. --ref installs an older commit through
 this same script, which is what an undo is: git is the history, and no copy of
 the replaced install is kept.
@@ -15,13 +20,14 @@ the replaced install is kept.
 
 import argparse
 import grp
+import hashlib
 import os
 import pwd
 import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -46,6 +52,7 @@ UNIT_DIR = Path("/etc/systemd/system")
 SERVICE_NAME = "snap-bak"
 SUDOERS_FILE = Path("/etc/sudoers.d/snap-bak")
 STALE_MODULES = ("cli.py", "config.py", "job.py", "restic.py", "snapshot.py", "snap-bak-io")
+IGNORED_PARTS = ("__pycache__",)
 
 EXAMPLE_CONFIG = """{
   // Top-level settings
@@ -195,6 +202,12 @@ def parse_args(argv):
         metavar="SHA|TAG",
         help="install that commit instead of HEAD",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="list every file and say whether it changed",
+    )
     return parser.parse_args(argv)
 
 
@@ -287,6 +300,26 @@ def now_utc():
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def env_fingerprint(source, python):
+    """What decides the venv's contents: the dependency inputs and the interpreter."""
+    digest = hashlib.sha256()
+    for name in ("pyproject.toml", "uv.lock"):
+        path = source / name
+        digest.update(name.encode())
+        digest.update(path.read_bytes() if path.exists() else b"<absent>")
+    version = run([python, "-c", "import sys; print(sys.version)"], capture=True).stdout
+    digest.update(version.encode())
+    return digest.hexdigest()
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 def render_launcher():
     return f"""#!/bin/sh
 # Installed by snap-bak-setup.py. Run it as the service user.
@@ -349,18 +382,182 @@ def update_line(commit, version, when):
     return f"{when} {version} {commit}"
 
 
+@dataclass(frozen=True)
+class Managed:
+    name: str
+    dest: Path
+    mode: str
+    owner: str = "root:root"
+
+
+def targets(paths):
+    managed = {
+        "wrapper": Managed("wrapper", WRAPPER_PATH, "0755"),
+        "launcher": Managed("launcher", CLI_PATH, "0755"),
+        "service": Managed("service", UNIT_DIR / f"{SERVICE_NAME}.service", "0644"),
+        "timer": Managed("timer", UNIT_DIR / f"{SERVICE_NAME}.timer", "0644"),
+        "sudoers": Managed("sudoers", SUDOERS_FILE, "0440"),
+        "REF": Managed("REF", VENV_DIR / "REF", "0644"),
+        "ENV": Managed("ENV", VENV_DIR / "ENV", "0644"),
+        "BUILD": Managed("BUILD", VENV_DIR / "BUILD", "0644"),
+    }
+    if "config" in paths:
+        managed["config"] = Managed("config", CONFIG_FILE, "0644")
+    if "home.ignore" in paths:
+        managed["home.ignore"] = Managed(
+            "home.ignore", EXCLUDES_DIR / "home.ignore", "0640", f"root:{SERVICE_GROUP}"
+        )
+    return managed
+
+
+def render(source_root, out, when, commit, fingerprint):
+    """Write every managed file, without building anything."""
+    out.mkdir(parents=True, exist_ok=True)
+    texts = {
+        "wrapper": render_wrapper(source_root),
+        "launcher": render_launcher(),
+        "service": render_service(),
+        "timer": render_timer(),
+        "sudoers": render_sudoers(),
+        "REF": commit + "\n",
+        "ENV": fingerprint + "\n",
+        "BUILD": when + "\n",
+    }
+    if not CONFIG_FILE.exists():
+        texts["config"] = EXAMPLE_CONFIG
+    if not (EXCLUDES_DIR / "home.ignore").exists():
+        texts["home.ignore"] = DEFAULT_EXCLUDES
+    paths = {}
+    for name, text in texts.items():
+        path = out / name
+        path.write_text(text)
+        paths[name] = path
+    return paths
+
+
+def matches(dest, staged, mode):
+    try:
+        stat = dest.stat()
+    except OSError:
+        return False
+    if f"{stat.st_mode & 0o777:04o}" != mode:
+        return False
+    if stat.st_size != staged.stat().st_size:
+        return False
+    return digest(dest) == digest(staged)
+
+
+@dataclass
+class Plan:
+    added: list[str] = field(default_factory=list)
+    updated: list[str] = field(default_factory=list)
+    unchanged: list[str] = field(default_factory=list)
+    venv_changed: bool = False
+    venv_detail: list[str] = field(default_factory=list)
+
+    @property
+    def changes(self):
+        return bool(self.added or self.updated or self.venv_changed)
+
+
+def plan_files(paths, managed):
+    plan = Plan()
+    for name, item in managed.items():
+        # BUILD records the last install that changed something; it is written
+        # with the rest, never compared on its own.
+        if name == "BUILD":
+            continue
+        dest = item.dest
+        if not dest.exists():
+            plan.added.append(name)
+        elif not os.access(dest, os.R_OK):
+            # Root-only file (the sudoers rule). The commit is unchanged here,
+            # so its content is the one this install would write.
+            plan.unchanged.append(name)
+        elif matches(dest, paths[name], item.mode):
+            plan.unchanged.append(name)
+        else:
+            plan.updated.append(name)
+    return plan
+
+
+def tree_diff(staged, installed):
+    """Relative paths whose content or link target differs, ignoring pycache."""
+
+    def files(root):
+        found = {}
+        if not root.exists():
+            return found
+        for path in root.rglob("*"):
+            if path.is_dir() or any(part in IGNORED_PARTS for part in path.parts):
+                continue
+            if path.suffix == ".pyc":
+                continue
+            found[str(path.relative_to(root))] = path
+        return found
+
+    left, right = files(staged), files(installed)
+    differing = set()
+    for rel, path in left.items():
+        other = right.get(rel)
+        if other is None:
+            differing.add(rel)
+        elif path.is_symlink() or other.is_symlink():
+            if not (path.is_symlink() and other.is_symlink() and os.readlink(path) == os.readlink(other)):
+                differing.add(rel)
+        elif path.stat().st_size != other.stat().st_size or digest(path) != digest(other):
+            differing.add(rel)
+    differing.update(right.keys() - left.keys())
+    return sorted(differing)
+
+
+def venv_diff(staged_venv, installed_venv):
+    if not (installed_venv / "bin/python").exists():
+        return True, ["no interpreter"]
+    if run([installed_venv / "bin/python", "-c", "import snap_bak"], check=False, capture=True).returncode != 0:
+        return True, ["the installed package cannot be imported"]
+    differing = tree_diff(staged_venv / "lib", installed_venv / "lib")
+    return bool(differing), differing
+
+
+def summary_line(plan):
+    parts = []
+    if plan.added:
+        parts.append(f"{len(plan.added)} added")
+    if plan.updated:
+        parts.append(f"{len(plan.updated)} updated")
+    parts.append(f"{len(plan.unchanged)} unchanged")
+    parts.append("venv replaced" if plan.venv_changed else "venv unchanged")
+    return "Install report: " + ", ".join(parts)
+
+
+def report(plan, verbose=False):
+    note(summary_line(plan))
+    if not verbose:
+        return
+    for name in plan.added:
+        print(f"    added      {name}")
+    for name in plan.updated:
+        print(f"    updated    {name}")
+    for name in plan.unchanged:
+        print(f"    unchanged  {name}")
+    for rel in plan.venv_detail:
+        print(f"    venv       {rel}")
+
+
 @dataclass
 class Stage:
     root: Path
     source: Path
     commit: str
     version: str
-    site: Path
-    files: dict
-    log_line: str | None
+    fingerprint: str
+    when: str
+    paths: dict
+    managed: dict
 
 
-def build_stage(stage_root, source, commit, python, tool, uv):
+def build_stage(stage_root, source, commit, python, tool, uv, fingerprint, when):
     venv = stage_root / "venv"
     note(f"Creating a virtualenv in {venv}...")
     if tool == "uv":
@@ -372,8 +569,6 @@ def build_stage(stage_root, source, commit, python, tool, uv):
     note(f"Installing snap-bak and its dependencies with {tool}...")
     if tool == "uv":
         run([uv, "pip", "install", "--quiet", "--python", venv / "bin/python", source])
-        # The launcher is the command; a second entry point in the venv's bin
-        # would be a path nobody documented.
         (venv / "bin" / "snap-bak").unlink(missing_ok=True)
     else:
         run(
@@ -382,44 +577,27 @@ def build_stage(stage_root, source, commit, python, tool, uv):
                 "--root-user-action=ignore", "--target", site, source,
             ]
         )
-        # --target writes console scripts under the target's bin/, with a shebang
-        # naming the base interpreter, which cannot see the venv. The launcher is
-        # the command, so drop them.
         shutil.rmtree(site / "bin", ignore_errors=True)
     version = run(
         [venv / "bin/python", "-c", "import snap_bak; print(snap_bak.__version__)"],
         capture=True,
     ).stdout.strip()
+    paths = render(source, stage_root / "files", when, commit, fingerprint)
+    return Stage(stage_root, source, commit, version, fingerprint, when, paths, targets(paths))
 
-    when = now_utc()
-    files = stage_root / "files"
-    files.mkdir()
-    rendered = {
-        "wrapper": (render_wrapper(source), "0755"),
-        "launcher": (render_launcher(), "0755"),
-        "service": (render_service(), "0644"),
-        "timer": (render_timer(), "0644"),
-        "sudoers": (render_sudoers(), "0440"),
-        "BUILD": (when + "\n", "0644"),
-        "REF": (commit + "\n", "0644"),
-    }
-    if not CONFIG_FILE.exists():
-        rendered["config"] = (EXAMPLE_CONFIG, "0644")
-    if not (EXCLUDES_DIR / "home.ignore").exists():
-        rendered["home.ignore"] = (DEFAULT_EXCLUDES, "0640")
-    paths = {}
-    for name, (text, _mode) in rendered.items():
-        path = files / name
-        path.write_text(text)
-        paths[name] = path
 
-    prev_ref = ""
+def installed_commit():
     try:
-        prev_ref = (VENV_DIR / "REF").read_text().strip()
+        return (VENV_DIR / "REF").read_text().strip()
     except OSError:
-        pass
-    log_line = None if commit == prev_ref else update_line(commit, version, when)
-    return Stage(stage_root, source, commit, version, site, paths, log_line)
+        return ""
+
+
+def installed_fingerprint():
+    try:
+        return (VENV_DIR / "ENV").read_text().strip()
+    except OSError:
+        return ""
 
 
 def privileged_prefix():
@@ -479,6 +657,28 @@ def ensure_identity(root):
         )
 
 
+def ensure_dirs(root):
+    root.install_dir(INSTALL_DIR, "0755", "root:root")
+    root.install_dir(STATE_DIR, "0750", f"{SERVICE_USER}:{SERVICE_GROUP}")
+    root.install_dir(CACHE_DIR, "0750", f"{SERVICE_USER}:{SERVICE_GROUP}")
+    root.install_dir(PASSWORDS_DIR, "0750", f"{SERVICE_USER}:{SERVICE_GROUP}")
+    root.install_dir(EXCLUDES_DIR, "0750", f"root:{SERVICE_GROUP}")
+    root.install_dir(INSTALL_DIR / ".config", "0750", f"{SERVICE_USER}:{SERVICE_GROUP}")
+    root.install_dir(RCLONE_DIR, "0750", f"{SERVICE_USER}:{SERVICE_GROUP}")
+    root.install_dir(MOUNT_BASE, "0755", f"{SERVICE_USER}:{SERVICE_GROUP}")
+
+
+def link_cache(root):
+    cache_link = INSTALL_DIR / ".cache"
+    if cache_link.is_symlink():
+        if os.readlink(cache_link) != "cache":
+            root.run("ln", "-sfn", "cache", cache_link)
+    elif not cache_link.exists():
+        root.run("ln", "-s", "cache", cache_link)
+    else:
+        warn(f"{cache_link} exists and is not a symlink; leaving it untouched.")
+
+
 def swap_in_venv(root, stage):
     if VENV_DIR.exists():
         root.run("rm", "-rf", VENV_DIR)
@@ -494,8 +694,6 @@ def update_restic(root):
         )
     note("Validating restic, self-updating and applying cap_dac_read_search...")
     result = root.run(WRAPPER_PATH, "update-restic", check=False)
-    # 0 = updated/current, 2 = self-update failed but the binary is retained,
-    # trusted and setcap applied. Anything else leaves restic unusable.
     if result.returncode not in (0, 2):
         raise SetupError(
             f"restic validation/update failed (rc={result.returncode}). Fix restic, "
@@ -505,65 +703,43 @@ def update_restic(root):
         warn("restic self-update failed (network?), but the existing restic is retained and setcap applied.")
 
 
-def apply(stage, root):
+def install_changed(paths, managed, plan, root, *, touch_build):
+    if "sudoers" in plan.added or "sudoers" in plan.updated:
+        validate_sudoers(paths["sudoers"])
+    for name in plan.added + plan.updated:
+        item = managed[name]
+        root.install(paths[name], item.dest, item.mode, item.owner)
+    if touch_build and plan.changes and "BUILD" in managed:
+        item = managed["BUILD"]
+        root.install(paths["BUILD"], item.dest, item.mode, item.owner)
+
+
+def apply(stage, plan, root, log_line):
     ensure_identity(root)
-
     note("Creating install directories...")
-    root.install_dir(INSTALL_DIR, "0755", "root:root")
-    root.install_dir(STATE_DIR, "0750", f"{SERVICE_USER}:{SERVICE_GROUP}")
-    root.install_dir(CACHE_DIR, "0750", f"{SERVICE_USER}:{SERVICE_GROUP}")
-    root.install_dir(PASSWORDS_DIR, "0750", f"{SERVICE_USER}:{SERVICE_GROUP}")
-    root.install_dir(EXCLUDES_DIR, "0750", f"root:{SERVICE_GROUP}")
-    root.install_dir(INSTALL_DIR / ".config", "0750", f"{SERVICE_USER}:{SERVICE_GROUP}")
-    root.install_dir(RCLONE_DIR, "0750", f"{SERVICE_USER}:{SERVICE_GROUP}")
-    root.install_dir(MOUNT_BASE, "0755", f"{SERVICE_USER}:{SERVICE_GROUP}")
-
-    swap_in_venv(root, stage)
-    files = stage.files
-    root.install(files["wrapper"], WRAPPER_PATH, "0755")
-    root.install(files["launcher"], CLI_PATH, "0755")
-    root.install(files["service"], UNIT_DIR / f"{SERVICE_NAME}.service", "0644")
-    root.install(files["timer"], UNIT_DIR / f"{SERVICE_NAME}.timer", "0644")
-    if "config" in files:
-        root.install(files["config"], CONFIG_FILE, "0644")
-    else:
-        warn(f"{CONFIG_FILE} already exists. Skipping generation (keeps your edits).")
-    if "home.ignore" in files:
-        root.install(files["home.ignore"], EXCLUDES_DIR / "home.ignore", "0640", f"root:{SERVICE_GROUP}")
-    root.install(files["BUILD"], VENV_DIR / "BUILD", "0644")
-    root.install(files["REF"], VENV_DIR / "REF", "0644")
-
-    cache_link = INSTALL_DIR / ".cache"
-    if cache_link.is_symlink():
-        if os.readlink(cache_link) != "cache":
-            root.run("ln", "-sfn", "cache", cache_link)
-    elif not cache_link.exists():
-        root.run("ln", "-s", "cache", cache_link)
-    else:
-        warn(f"{cache_link} exists and is not a symlink; leaving it untouched.")
-
-    validate_sudoers(files["sudoers"])
-    root.install(files["sudoers"], SUDOERS_FILE, "0440")
-
-    update_restic(root)
-
-    # The unit, the wrapper and the launcher all run the venv now. Remove the
-    # copy layout and its marker last, so a failure above left it working.
-    root.run("rm", "-rf", PKG_PATH)
-    root.run("rm", "-f", VERSION_FILE, *[INSTALL_DIR / name for name in STALE_MODULES])
-
-    if stage.log_line:
-        root.run("tee", "-a", UPDATE_LOG, input_text=stage.log_line + "\n", capture=True)
+    ensure_dirs(root)
+    if plan.venv_changed:
+        note("Replacing the virtualenv...")
+        swap_in_venv(root, stage)
+    install_changed(stage.paths, stage.managed, plan, root, touch_build=True)
+    link_cache(root)
+    if plan.changes:
+        update_restic(root)
+        # The unit, the wrapper and the launcher all run the venv now. Remove the
+        # copy layout and its marker last, so a failure above left it working.
+        root.run("rm", "-rf", PKG_PATH)
+        root.run("rm", "-f", VERSION_FILE, *[INSTALL_DIR / name for name in STALE_MODULES])
+        note("Reloading systemd daemon...")
+        root.run("systemctl", "daemon-reload")
+        check = root.run("systemctl", "is-enabled", f"{SERVICE_NAME}.service", check=False)
+        if check.returncode == 0:
+            warn(f"{SERVICE_NAME}.service is currently enabled. Migrate to the timer:")
+            warn(f"    sudo systemctl disable --now {SERVICE_NAME}.service")
+            warn(f"    sudo systemctl enable --now {SERVICE_NAME}.timer")
+    if log_line:
+        root.run("tee", "-a", UPDATE_LOG, input_text=log_line + "\n", capture=True)
         root.run("chown", "root:root", UPDATE_LOG)
         root.run("chmod", "0644", UPDATE_LOG)
-
-    note("Reloading systemd daemon...")
-    root.run("systemctl", "daemon-reload")
-    check = root.run("systemctl", "is-enabled", f"{SERVICE_NAME}.service", check=False)
-    if check.returncode == 0:
-        warn(f"{SERVICE_NAME}.service is currently enabled. Migrate to the timer:")
-        warn(f"    sudo systemctl disable --now {SERVICE_NAME}.service")
-        warn(f"    sudo systemctl enable --now {SERVICE_NAME}.timer")
 
 
 def summary(stage):
@@ -598,14 +774,47 @@ def main(argv=None):
     work = Path(tempfile.mkdtemp(prefix="snap-bak-setup-"))
     try:
         source, commit = resolve_source(repo, args.ref, work)
-        stage = build_stage(work, source, commit, python, tool, uv)
+        when = now_utc()
+        fingerprint = env_fingerprint(source, python)
+        previous = installed_commit()
+        venv_usable = VENV_PY.exists() and run(
+            [VENV_PY, "-c", "import snap_bak"], check=False, capture=True
+        ).returncode == 0
+
+        if previous == commit and installed_fingerprint() == fingerprint and venv_usable:
+            # Nothing to build: the installed commit and its dependency inputs
+            # are the ones this run would install, so the files can be compared
+            # as they are.
+            paths = render(source, work / "files", when, commit, fingerprint)
+            managed = targets(paths)
+            plan = plan_files(paths, managed)
+            if not plan.changes:
+                report(plan, args.verbose)
+                note(f"Nothing to do: the box is at {commit[:12]}.")
+                return 0
+            root = Privileged()
+            root.prepare()
+            install_changed(paths, managed, plan, root, touch_build=True)
+            link_cache(root)
+            if {"service", "timer"} & set(plan.added + plan.updated):
+                root.run("systemctl", "daemon-reload")
+            report(plan, args.verbose)
+            note(f"Nothing to rebuild: the box stays at {commit[:12]}.")
+            return 0
+
+        stage = build_stage(work, source, commit, python, tool, uv, fingerprint, when)
+        plan = plan_files(stage.paths, stage.managed)
+        plan.venv_changed, plan.venv_detail = venv_diff(stage.root / "venv", VENV_DIR)
+        log_line = update_line(commit, stage.version, when) if commit != previous else None
         root = Privileged()
         root.prepare()
-        apply(stage, root)
-        summary(stage)
+        apply(stage, plan, root, log_line)
+        report(plan, args.verbose)
+        if plan.changes:
+            summary(stage)
+        return 0
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    return 0
 
 
 if __name__ == "__main__":
