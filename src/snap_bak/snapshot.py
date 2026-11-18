@@ -2,7 +2,7 @@
 
 Shared by the unprivileged orchestrator (config.py/job.py) and the root-owned
 wrapper (sudo-exec.py, formerly snap-bak-io). Installed as part of the
-snap_bak package (see snap-bak-setup.sh); both callers import it simply:
+snap_bak package (see snap-bak-setup.py); both callers import it simply:
 
     from snap_bak import snapshot
 

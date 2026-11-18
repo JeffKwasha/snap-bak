@@ -23,7 +23,7 @@ never pass arbitrary paths to btrfs/mount. Accepted operations:
 This wrapper is intentionally standalone: it must NOT import the orchestrator
 modules (`job`, `cli`) — the security boundary is the wrapper itself; coupling
 to the orchestrator would let a bug there widen this path. It is installed
-root:root 0755 by snap-bak-setup.sh.
+root:root 0755 by snap-bak-setup.py.
 
 The snapshot DOMAIN — name format, strict parse, btrfs create/delete, and the
 generation read — is shared with the orchestrator through the dependency-free

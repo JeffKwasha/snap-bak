@@ -31,6 +31,7 @@ Conventions:
 | [[R-DEPLOY-06]] | SPEC.md | Deployment Contract |
 | [[R-DEPLOY-07]] | SPEC.md | Deployment Contract |
 | [[R-DEPLOY-08]] | SPEC.md | Deployment Contract |
+| [[R-DEPLOY-09]] | SPEC.md | Deployment Contract |
 | [[R-LOCK-01]] | SPEC.md | Global Lock |
 | [[R-LOCK-02]] | SPEC.md | Global Lock |
 | [[R-LOCK-03]] | SPEC.md | Global Lock |

@@ -33,7 +33,7 @@ DEFAULT_STUCK_WAIT = 300
 STUCK_POLL_INTERVAL = 60
 REPO_CHECK_TIMEOUT = 30
 REPO_STATS_TIMEOUT = 300
-# Sudo runs a root-owned wrapper (installed by snap-bak-setup.sh) rather than
+# Sudo runs a root-owned wrapper (installed by snap-bak-setup.py) rather than
 # btrfs/mount directly; a bare sudoers command name matches any args.
 SUDO = os.environ.get("SNAPBAK_SUDO", "/usr/bin/sudo")
 SUDO_EXEC = os.environ.get("SUDO_EXEC_PATH", "/opt/snap-bak/sudo-exec.py")

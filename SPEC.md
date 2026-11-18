@@ -1317,7 +1317,7 @@ README is outside this contract.
   with pip, git, PyPI access for the first install, and restic at
   `/usr/local/bin/restic` as a real root-owned file. rclone only for `rclone:`
   repositories. See *Supported Platform & Dependencies*.
-- [[R-DEPLOY-03]] **Only install.** A clone plus `snap-bak-setup.sh`, optionally
+- [[R-DEPLOY-03]] **Only install.** A clone plus `snap-bak-setup.py`, optionally
   with `PYTHON_BIN`. No pip install by the operator, no operator-managed
   virtualenv, no PATH edit.
 - [[R-DEPLOY-04]] **Command.** The install writes `/usr/local/bin/snap-bak`,
@@ -1345,6 +1345,12 @@ README is outside this contract.
   `<install>/updates.log`: UTC timestamp, installed version, commit. Together
   they say what the box runs and what it ran before, without trusting the
   checkout to still be there.
+- [[R-DEPLOY-09]] **Elevation.** The installer runs as the administrator, not as
+  root. Everything it builds — the venv, the package, the wrapper, the launcher,
+  the units, the sudoers rule and the example config — is staged under a temp
+  directory owned by that user, and one sudo elevation writes the staged files
+  into the root-owned paths. pip never runs as root, and an existing user,
+  group or directory is left alone.
 
 ---
 

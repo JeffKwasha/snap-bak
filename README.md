@@ -50,9 +50,15 @@ pip, git, and PyPI access for the first install. `python3` is the base
 interpreter by default; `PYTHON_BIN` overrides it for a non-system install.
 
 ```bash
-chmod +x snap-bak-setup.sh
-sudo ./snap-bak-setup.sh
+chmod +x snap-bak-setup.py
+./snap-bak-setup.py
 ```
+
+It runs as you, not as root. The venv, the package, the wrapper, the launcher,
+the unit files, the sudoers rule and the example config are staged in a temp
+directory you own; sudo is requested once, when those files are written into
+`/opt/snap-bak`, `/etc/systemd/system` and `/usr/local/bin`. Nothing pip does
+runs as root.
 
 The install runs from a committed tree: a checkout with uncommitted changes is
 refused, so what lands in production is a commit git can name. `--ref <sha|tag>`
@@ -66,9 +72,10 @@ modified and PEP 668 never applies. It also installs the root wrapper
 delete, restic update) goes through; snap-bak cannot run without it, so a plain
 `pip install` of the project is not a supported deployment.
 
-What `snap-bak-setup.sh` does:
+What `snap-bak-setup.py` does:
 
-1. Verifies you are `root`, and that the base interpreter is 3.14 or newer.
+1. Verifies the base interpreter is 3.14 or newer and has pip, then builds the
+   venv and installs the package in a temp directory as you.
 2. Creates the `snap-bak` user/group and `/opt/snap-bak`.
 3. Creates `/opt/snap-bak/venv`, installs `snap-bak` and its dependencies there,
    records the build timestamp in `/opt/snap-bak/venv/BUILD`, the installed
@@ -136,12 +143,13 @@ The timer runs hourly; restic uploads happen per-job only when
 
 The setup script is **idempotent** — re-running it is safe: it skips the user,
 group, and existing `config.json` (so your edits are preserved), refreshes the
-program + unit files, re-validates sudoers and re-runs the restic update.
+program + unit files, re-validates sudoers and re-runs the restic update. It
+asks for sudo once per run, when the staged files are copied into place.
 
 To put the code back on an earlier commit, install that ref:
 
 ```bash
-sudo ./snap-bak-setup.sh --ref <sha|tag>
+./snap-bak-setup.py --ref <sha|tag>
 ```
 
 That runs today's installer against that ref's tree, so the venv, launcher,
@@ -244,7 +252,7 @@ sudoers lets the service user run.
 The config file is JSONC: standard JSON plus `//` and `/* */` comments and
 trailing commas. It is parsed with json5 by both `config.py` and the root
 wrapper `sudo-exec.py` (a single code path for JSONC handling). The default
-config written by `snap-bak-setup.sh` includes inline comments describing
+config written by `snap-bak-setup.py` includes inline comments describing
 every field.
 
 Duration and size fields (`stuck_threshold`, `size_limit`,
