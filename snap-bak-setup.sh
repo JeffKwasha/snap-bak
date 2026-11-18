@@ -148,9 +148,12 @@ fi
 SITE_PACKAGES="$("$VENV_PY" -c 'import site; print(site.getsitepackages()[0])')"
 # The distribution, its metadata and its dependencies, all inside the venv.
 # --upgrade makes a re-run replace the current tree even if the version did not
-# change.
+# change. --root-user-action=ignore silences pip's "running as root" warning:
+# it installs into the venv's site-packages, never into the system Python, so
+# the warning's premise (a root-owned system install) does not apply.
 echo "[*] Installing snap-bak and its dependencies into $VENV_DIR..."
-if ! "$PYTHON_BIN" -m pip install --quiet --upgrade --target "$SITE_PACKAGES" "$SOURCE_DIR"; then
+if ! "$PYTHON_BIN" -m pip install --quiet --upgrade --root-user-action=ignore \
+        --target "$SITE_PACKAGES" "$SOURCE_DIR"; then
     echo "[!] pip could not install $SOURCE_DIR." >&2
     echo "    It needs PyPI access for the build backend and the dependencies." >&2
     exit 1
