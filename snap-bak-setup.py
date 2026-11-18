@@ -523,12 +523,22 @@ def tree_diff(staged, installed):
     return sorted(differing)
 
 
-def venv_diff(staged_venv, installed_venv):
+def venv_diff(staged_venv, installed_venv, deps_changed):
+    """Whether the installed venv already holds what the staged one would.
+
+    Dependencies are decided by the fingerprint, not by walking them: dist-info
+    records a hash of the console script, whose shebang names the staging path,
+    so a byte comparison would report a change on every run.
+    """
+    if deps_changed:
+        return True, ["dependency inputs changed"]
     if not (installed_venv / "bin/python").exists():
         return True, ["no interpreter"]
     if run([installed_venv / "bin/python", "-c", "import snap_bak"], check=False, capture=True).returncode != 0:
         return True, ["the installed package cannot be imported"]
-    differing = tree_diff(staged_venv / "lib", installed_venv / "lib")
+    staged = site_packages_of(staged_venv / "bin/python") / "snap_bak"
+    installed = site_packages_of(installed_venv / "bin/python") / "snap_bak"
+    differing = tree_diff(staged, installed)
     return bool(differing), differing
 
 
@@ -696,6 +706,8 @@ def swap_in_venv(root, stage):
         root.run("rm", "-rf", VENV_DIR)
     root.run("cp", "-a", stage.root / "venv", VENV_DIR)
     root.run("chown", "-R", "root:root", VENV_DIR)
+    # uv creates the venv with the caller's umask; the installed one is root's.
+    root.run("chmod", "-R", "go-w", VENV_DIR)
 
 
 def update_restic(root):
@@ -715,25 +727,36 @@ def update_restic(root):
         warn("restic self-update failed (network?), but the existing restic is retained and setcap applied.")
 
 
-def install_changed(paths, managed, plan, root, *, touch_build):
-    if "sudoers" in plan.added or "sudoers" in plan.updated:
+def install_changed(paths, managed, plan, root, *, touch_build, force=()):
+    names = [*plan.added, *plan.updated, *force]
+    if touch_build and plan.changes and "BUILD" in managed:
+        names.append("BUILD")
+    names = list(dict.fromkeys(names))
+    if "sudoers" in names:
         validate_sudoers(paths["sudoers"])
-    for name in plan.added + plan.updated:
+    for name in names:
         item = managed[name]
         root.install(paths[name], item.dest, item.mode, item.owner)
-    if touch_build and plan.changes and "BUILD" in managed:
-        item = managed["BUILD"]
-        root.install(paths["BUILD"], item.dest, item.mode, item.owner)
 
 
 def apply(stage, plan, root, log_line):
     ensure_identity(root)
     note("Creating install directories...")
     ensure_dirs(root)
-    if plan.venv_changed:
+    swapped = plan.venv_changed
+    if swapped:
         note("Replacing the virtualenv...")
         swap_in_venv(root, stage)
-    install_changed(stage.paths, stage.managed, plan, root, touch_build=True)
+    # The venv holds REF, ENV and BUILD; replacing it removes them, so they are
+    # installed again even when their content did not change.
+    install_changed(
+        stage.paths,
+        stage.managed,
+        plan,
+        root,
+        touch_build=True,
+        force=("REF", "ENV", "BUILD") if swapped else (),
+    )
     link_cache(root)
     if plan.changes:
         update_restic(root)
@@ -816,7 +839,9 @@ def main(argv=None):
 
         stage = build_stage(work, source, commit, python, tool, uv, fingerprint, when)
         plan = plan_files(stage.paths, stage.managed)
-        plan.venv_changed, plan.venv_detail = venv_diff(stage.root / "venv", VENV_DIR)
+        plan.venv_changed, plan.venv_detail = venv_diff(
+            stage.root / "venv", VENV_DIR, deps_changed=installed_fingerprint() != fingerprint
+        )
         log_line = update_line(commit, stage.version, when) if commit != previous else None
         root = Privileged()
         root.prepare()
