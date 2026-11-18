@@ -1,6 +1,7 @@
 """The installer's decisions: rendered files, argument handling, git gates."""
 
 import importlib.util
+import os
 import shutil
 import subprocess
 import sys
@@ -219,3 +220,24 @@ def test_render_records_the_commit_and_the_fingerprint(tmp_path):
     assert paths["REF"].read_text() == "abc123\n"
     assert paths["ENV"].read_text() == "feedface\n"
     assert paths["BUILD"].read_text() == "2026-11-18T00:00:00Z\n"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read anything")
+def test_a_destination_the_caller_cannot_read_is_left_alone(tmp_path):
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / "home.ignore").write_text("default\n")
+    hidden = tmp_path / "excludes"
+    hidden.mkdir()
+    (hidden / "home.ignore").write_text("*important*\n")
+    hidden.chmod(0o000)
+    try:
+        plan = setup.plan_files(
+            {"home.ignore": staged / "home.ignore"},
+            {"home.ignore": setup.Managed("home.ignore", hidden / "home.ignore", "0640")},
+        )
+    finally:
+        hidden.chmod(0o755)
+    assert plan.unchanged == ["home.ignore"]
+    assert plan.updated == []
+    assert plan.added == []

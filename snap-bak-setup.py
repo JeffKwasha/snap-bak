@@ -435,10 +435,19 @@ def render(source_root, out, when, commit, fingerprint):
     return paths
 
 
-def matches(dest, staged, mode):
+def probe(path):
+    """stat, or None when absent. False means the caller may not look."""
     try:
-        stat = dest.stat()
-    except OSError:
+        return os.stat(path)
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        return False
+
+
+def matches(dest, staged, mode):
+    stat = probe(dest)
+    if not stat:
         return False
     if f"{stat.st_mode & 0o777:04o}" != mode:
         return False
@@ -468,11 +477,14 @@ def plan_files(paths, managed):
         if name == "BUILD":
             continue
         dest = item.dest
-        if not dest.exists():
+        state = probe(dest)
+        if state is None:
             plan.added.append(name)
-        elif not os.access(dest, os.R_OK):
-            # Root-only file (the sudoers rule). The commit is unchanged here,
-            # so its content is the one this install would write.
+        elif state is False or not os.access(dest, os.R_OK):
+            # Root-only content (the sudoers rule, or a file inside a service
+            # directory). The commit is unchanged here, so what this install
+            # would write is what is already there — and it must not be
+            # overwritten on a guess.
             plan.unchanged.append(name)
         elif matches(dest, paths[name], item.mode):
             plan.unchanged.append(name)
