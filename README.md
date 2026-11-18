@@ -45,8 +45,9 @@ unmount, delete, restic update) goes through the root wrapper
 
 Prerequisites: restic at `/usr/local/bin/restic` (a distro package lands in
 `/usr/bin`, which the wrapper rejects; download the release binary and
-`sudo install -m755 restic /usr/local/bin/restic`), Python 3.14 or newer with
-pip, git, and PyPI access for the first install. `python3` is the base
+`sudo install -m755 restic /usr/local/bin/restic`), Python 3.14 or newer, uv
+or pip to populate the venv, git, and PyPI access for the first install. uv is
+used when it is on PATH; otherwise the interpreter's pip is. `python3` is the base
 interpreter by default; `PYTHON_BIN` overrides it for a non-system install.
 
 ```bash
@@ -57,25 +58,26 @@ chmod +x snap-bak-setup.py
 It runs as you, not as root. The venv, the package, the wrapper, the launcher,
 the unit files, the sudoers rule and the example config are staged in a temp
 directory you own; sudo is requested once, when those files are written into
-`/opt/snap-bak`, `/etc/systemd/system` and `/usr/local/bin`. Nothing pip does
-runs as root.
+`/opt/snap-bak`, `/etc/systemd/system` and `/usr/local/bin`. The package
+manager never runs as root.
 
 The install runs from a committed tree: a checkout with uncommitted changes is
 refused, so what lands in production is a commit git can name. `--ref <sha|tag>`
 installs that commit instead of `HEAD`.
 
-The clone is the install source. The script creates `/opt/snap-bak/venv` without
-pip (ensurepip is not needed) and uses the base interpreter's pip to install the
-project and its dependencies into that venv, so the system Python is never
-modified and PEP 668 never applies. It also installs the root wrapper
+The clone is the install source. The venv is built without pip (ensurepip is not
+needed), and the project and its dependencies go into it with uv when available,
+otherwise the base interpreter's pip, so the system Python is never modified and
+PEP 668 never applies. It also installs the root wrapper
 `sudo-exec.py`, which every privileged operation (mount, snapshot, unmount,
 delete, restic update) goes through; snap-bak cannot run without it, so a plain
 `pip install` of the project is not a supported deployment.
 
 What `snap-bak-setup.py` does:
 
-1. Verifies the base interpreter is 3.14 or newer and has pip, then builds the
-   venv and installs the package in a temp directory as you.
+1. Verifies the base interpreter is 3.14 or newer, then builds the venv with uv
+   (or pip when uv is absent) and installs the package in a temp directory as
+   you.
 2. Creates the `snap-bak` user/group and `/opt/snap-bak`.
 3. Creates `/opt/snap-bak/venv`, installs `snap-bak` and its dependencies there,
    records the build timestamp in `/opt/snap-bak/venv/BUILD`, the installed

@@ -70,6 +70,13 @@ def test_the_old_backup_flag_is_gone():
         setup.parse_args(["--ref"])
 
 
+def test_uv_is_preferred_and_pip_is_the_fallback():
+    assert setup.choose_tool("/usr/bin/uv", True) == "uv"
+    assert setup.choose_tool(None, True) == "pip"
+    with pytest.raises(setup.SetupError, match="Neither uv nor pip"):
+        setup.choose_tool(None, False)
+
+
 def test_update_line_is_time_version_commit():
     assert setup.update_line("c0ffee", "0.6.0", "2026-11-18T00:00:00Z") == (
         "2026-11-18T00:00:00Z 0.6.0 c0ffee"

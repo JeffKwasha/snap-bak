@@ -211,12 +211,25 @@ def find_python():
     )
     if proc.returncode != 0:
         raise SetupError(f"snap-bak needs Python 3.14 or newer; {candidate} is older.")
-    if run([candidate, "-m", "pip", "--version"], check=False, capture=True).returncode != 0:
-        raise SetupError(
-            f"{candidate} has no pip. The install uses it to populate the venv "
-            "(Debian/Ubuntu: apt install python3-pip)."
-        )
     return Path(candidate)
+
+
+def choose_tool(uv, pip_present):
+    """What populates the venv: uv when present, else the interpreter's pip."""
+    if uv:
+        return "uv"
+    if pip_present:
+        return "pip"
+    raise SetupError(
+        "Neither uv nor pip is available. Install uv (https://docs.astral.sh/uv/) "
+        "or the interpreter's pip (Debian/Ubuntu: apt install python3-pip)."
+    )
+
+
+def find_tool(python):
+    uv = shutil.which("uv")
+    pip_present = run([python, "-m", "pip", "--version"], check=False, capture=True).returncode == 0
+    return choose_tool(uv, pip_present), uv
 
 
 def check_clean(repo):
@@ -347,23 +360,32 @@ class Stage:
     log_line: str | None
 
 
-def build_stage(stage_root, source, commit, python):
+def build_stage(stage_root, source, commit, python, tool, uv):
     venv = stage_root / "venv"
     note(f"Creating a virtualenv in {venv}...")
-    run([python, "-m", "venv", "--without-pip", venv])
+    if tool == "uv":
+        run([uv, "venv", "--python", python, venv])
+    else:
+        run([python, "-m", "venv", "--without-pip", venv])
     site = site_packages_of(venv / "bin/python")
     site.mkdir(parents=True, exist_ok=True)
-    note("Installing snap-bak and its dependencies...")
-    run(
-        [
-            python, "-m", "pip", "install", "--quiet", "--upgrade",
-            "--root-user-action=ignore", "--target", site, source,
-        ]
-    )
-    # --target writes console scripts under the target's bin/, with a shebang
-    # naming the base interpreter, which cannot see the venv. The launcher is
-    # the command, so drop them.
-    shutil.rmtree(site / "bin", ignore_errors=True)
+    note(f"Installing snap-bak and its dependencies with {tool}...")
+    if tool == "uv":
+        run([uv, "pip", "install", "--quiet", "--python", venv / "bin/python", source])
+        # The launcher is the command; a second entry point in the venv's bin
+        # would be a path nobody documented.
+        (venv / "bin" / "snap-bak").unlink(missing_ok=True)
+    else:
+        run(
+            [
+                python, "-m", "pip", "install", "--quiet", "--upgrade",
+                "--root-user-action=ignore", "--target", site, source,
+            ]
+        )
+        # --target writes console scripts under the target's bin/, with a shebang
+        # naming the base interpreter, which cannot see the venv. The launcher is
+        # the command, so drop them.
+        shutil.rmtree(site / "bin", ignore_errors=True)
     version = run(
         [venv / "bin/python", "-c", "import snap_bak; print(snap_bak.__version__)"],
         capture=True,
@@ -572,10 +594,11 @@ def main(argv=None):
     args = parse_args(argv)
     repo = Path(__file__).resolve().parent
     python = find_python()
+    tool, uv = find_tool(python)
     work = Path(tempfile.mkdtemp(prefix="snap-bak-setup-"))
     try:
         source, commit = resolve_source(repo, args.ref, work)
-        stage = build_stage(work, source, commit, python)
+        stage = build_stage(work, source, commit, python, tool, uv)
         root = Privileged()
         root.prepare()
         apply(stage, root)

@@ -1314,7 +1314,7 @@ a bug in the docs or the install. The explicitly labelled development option in
 README is outside this contract.
 
 - [[R-DEPLOY-02]] **Baseline.** Linux with btrfs and systemd, Python 3.14 or newer
-  with pip, git, PyPI access for the first install, and restic at
+  with uv or pip, git, PyPI access for the first install, and restic at
   `/usr/local/bin/restic` as a real root-owned file. rclone only for `rclone:`
   repositories. See *Supported Platform & Dependencies*.
 - [[R-DEPLOY-03]] **Only install.** A clone plus `snap-bak-setup.py`, optionally
@@ -1349,8 +1349,9 @@ README is outside this contract.
   root. Everything it builds — the venv, the package, the wrapper, the launcher,
   the units, the sudoers rule and the example config — is staged under a temp
   directory owned by that user, and one sudo elevation writes the staged files
-  into the root-owned paths. pip never runs as root, and an existing user,
-  group or directory is left alone.
+  into the root-owned paths. The package manager — uv when installed,
+  otherwise pip — runs as that user, never as root, and an existing user, group
+  or directory is left alone.
 
 ---
 
@@ -1358,8 +1359,8 @@ README is outside this contract.
 
 snap-bak supports:
 
-- Python ≥ 3.14 with pip (the setup uses the base pip to populate the venv;
-  ensurepip is not needed)
+- Python ≥ 3.14 with uv or pip (the setup populates the venv with whichever
+  is available; ensurepip is not needed)
 - pydantic >= 2.0 (config models)
 - python-dateutil (relativedelta for retention calculations)
 - json5 (JSONC config parsing)

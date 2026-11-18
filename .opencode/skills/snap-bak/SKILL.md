@@ -392,8 +392,9 @@ reasoning behind the exit-code ladder — load
 
 The official install is a clone plus `snap-bak-setup.py`. It runs as you,
 stages the venv, package, wrapper, launcher, units and sudoers rule in a temp
-directory, then asks for sudo once to write them into `/opt/snap-bak`,
-`/etc/systemd/system` and `/usr/local/bin`. pip never runs as root. Re-running
+directory with uv (or the interpreter's pip), then asks for sudo once to write
+them into `/opt/snap-bak`, `/etc/systemd/system` and `/usr/local/bin`. The
+package manager never runs as root. Re-running
 is idempotent and keeps `config.json`.
 
 It installs a committed tree only: uncommitted changes are refused. `--ref
