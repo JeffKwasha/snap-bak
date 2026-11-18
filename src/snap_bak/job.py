@@ -132,14 +132,13 @@ def restic_running() -> bool:
         if not entry.name.isdigit():
             continue
         try:
-            cmdline = (entry / "cmdline").read_bytes().decode("utf-8", "ignore")
+            argv0 = (entry / "cmdline").read_bytes().decode("utf-8", "ignore").split("\0", 1)[0]
         except OSError:
             continue
-        if (
-            "restic" in cmdline
-            and "snap_bak" not in cmdline
-            and "snap-bak" not in cmdline
-        ):
+        # Match the executable, not the whole command line: every restic call
+        # carries --password-file /opt/snap-bak/passwords/..., so excluding
+        # lines that mention snap-bak hid exactly the processes this looks for.
+        if Path(argv0).name == "restic":
             return True
     return False
 

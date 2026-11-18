@@ -250,6 +250,17 @@ class TestResticRunning:
         monkeypatch.setattr(job_mod, "_proc_dir", lambda: proc)
         assert restic_running() is False
 
+    def test_detects_restic_reading_a_snap_bak_password_file(self, tmp_path, monkeypatch):
+        proc = _fake_proc(
+            tmp_path,
+            {
+                "1": b"restic\0-r\0rclone:filen:restic\0--password-file\0"
+                b"/opt/snap-bak/passwords/restic_rclone_filen\0backup\0/bak/home\0"
+            },
+        )
+        monkeypatch.setattr(job_mod, "_proc_dir", lambda: proc)
+        assert restic_running() is True
+
     def test_no_restic(self, tmp_path, monkeypatch):
         proc = _fake_proc(tmp_path, {"1": b"python3\0x\0"})
         monkeypatch.setattr(job_mod, "_proc_dir", lambda: proc)
