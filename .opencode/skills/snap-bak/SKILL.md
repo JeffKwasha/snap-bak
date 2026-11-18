@@ -430,3 +430,13 @@ uv run pytest -q -n 0   # one test, serially
 The suite skips every restic-backed test when the `restic` binary is absent, so
 a green run without restic proves nothing about restic paths. CI installs the
 newest restic so they cannot skip.
+
+Every run ends with the taxonomy counts, and every commit message repeats them
+with the previous value:
+
+```
+taxonomy: 1/426 tests cite a requirement; 1/279 requirements cited (was 1/425; 1/279)
+```
+
+The next change is expected to beat that line. There is no pass mark: adoption
+is incremental, and the numbers are the pressure.

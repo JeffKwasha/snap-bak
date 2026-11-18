@@ -141,3 +141,17 @@ def resolved_job(tmp_path, monkeypatch, *, excludes_list):
     monkeypatch.setattr(config, "STATE_DIR", tmp_path / "state")
     rj = config.Config.load(config_file).resolve(str(config_file))[0]
     return rj, src, repo
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Print the taxonomy counts; commit messages carry them forward."""
+    from taxonomy import counts
+
+    c = counts()
+    terminalreporter.write_sep("-", "taxonomy")
+    terminalreporter.write_line(
+        f"{c['tests_cited']}/{c['tests']} tests cite a requirement; "
+        f"{c['requirements_cited']}/{c['requirements']} requirements are cited by code or tests"
+    )
+    if not c["spec_index_agree"]:
+        terminalreporter.write_line("SPEC.md and INDEX.md disagree on the requirement IDs")
