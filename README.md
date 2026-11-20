@@ -1039,9 +1039,9 @@ the journal, how to configure and edit a job safely — ships as a **skill**, so
 agent loads it only when it is working with backups rather than carrying it in
 every session.
 
-The skill is [`SKILL.md`](.opencode/skills/snap-bak/SKILL.md), with the full
+The skill is [`SKILL.md`](skills/snap-bak/SKILL.md), with the full
 config and flag tables in
-[`references/reference.md`](.opencode/skills/snap-bak/references/reference.md).
+[`references/reference.md`](skills/snap-bak/references/reference.md).
 It is plain markdown with no dependency on this repository, so it can be
 installed from a clone, from a mirror, or by pasting it into an agent's context.
 
@@ -1052,7 +1052,7 @@ your global skills directory to use it from anywhere:
 
 ```bash
 mkdir -p ~/.config/opencode/skills
-cp -r .opencode/skills/snap-bak ~/.config/opencode/skills/
+cp -r skills/snap-bak ~/.config/opencode/skills/
 ```
 
 **From a URL** — the better route once the repo is public:
@@ -1060,12 +1060,12 @@ cp -r .opencode/skills/snap-bak ~/.config/opencode/skills/
 ```bash
 # opencode
 hermes skills install \
-  https://raw.githubusercontent.com/JeffKwasha/snap-bak/main/.opencode/skills/snap-bak/SKILL.md
+  https://raw.githubusercontent.com/JeffKwasha/snap-bak/main/skills/snap-bak/SKILL.md
 
 # Hermes, into the category you want (Hermes loads from ~/.hermes/skills/)
 mkdir -p ~/.hermes/skills/devops
 curl -fsSL -o ~/.hermes/skills/devops/snap-bak-SKILL.md \
-  https://raw.githubusercontent.com/JeffKwasha/snap-bak/main/.opencode/skills/snap-bak/SKILL.md
+  https://raw.githubusercontent.com/JeffKwasha/snap-bak/main/skills/snap-bak/SKILL.md
 ```
 
 The raw URL 404s while the repo is private — use the clone route until it is
@@ -1078,10 +1078,10 @@ Confirm with `/skills list`, load it with `/snap-bak`. Installed skills apply to
 new sessions; `/reset` picks one up in the current one.
 
 A second skill,
-[`snap-bak-watch`](.opencode/skills/snap-bak-watch/SKILL.md), is for a periodic
+[`snap-bak-watch`](skills/snap-bak-watch/SKILL.md), is for a periodic
 watcher. It reads the capability, the log and the state files, separates hard
 failures from soft drift, and states when to notify an operator. Install it the
-same way by copying `.opencode/skills/snap-bak-watch` into the global skills
+same way by copying `skills/snap-bak-watch` into the global skills
 directory. It is short enough to load on every tick.
 
 ### What the agent is told to do
