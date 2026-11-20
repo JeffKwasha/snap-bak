@@ -969,7 +969,15 @@ State for a job removed from the config is deleted once it has been gone for
 `state_retention_days` (default 90). A job still in the config is never touched,
 and queued work is never discarded for being old.
 
-(Logs go to stderr — captured by the systemd journal. A file log is opt-in via `--log-file`.)
+(Logs go to stderr, captured by the systemd journal. A normal run opens with
+`Starting snap-bak <version> (build <time>)` and closes with `RUN end`, and each
+job logs a `JOB plan` and `JOB end` line. Lock transitions and per-job status
+writes are at debug. A file log is opt-in via `--log-file`.
+
+The unit sets `SyslogIdentifier=snap-bak`, so `journalctl -u snap-bak -t snap-bak`
+shows snap-bak's lines and `-t sudo` shows sudo's audit lines. The sudo and PAM
+session lines cannot be suppressed per command by sudo-rs, so filter them in the
+query.)
 
 ### Lock file crash recovery
 

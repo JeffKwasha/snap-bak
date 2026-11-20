@@ -21,8 +21,11 @@ import os
 import subprocess
 import sys
 import time
+import uuid
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from snap_bak import __version__, apply, config, excludes, job, report, todo
@@ -1301,6 +1304,13 @@ def _run_orchestrator(args) -> None:
             logger.error(f"Job '{args.job}' not found in config.")
             sys.exit(config.EXIT_ERROR)
 
+    run_id = uuid.uuid4().hex[:8]
+    started = time.monotonic()
+    logger.info(
+        f"Starting snap-bak {__version__} (build {job._build_time()}) "
+        f"run={run_id} jobs={len(jobs)}"
+    )
+
     # Check mount base exists before acquiring the lock.
     mount_base = Path(cfg.mount_base)
     if not mount_base.exists():
@@ -1311,6 +1321,25 @@ def _run_orchestrator(args) -> None:
     for j in jobs:
         job.check_password_file(j.repo)
 
+    results: list[job.Result] = []
+    code = config.EXIT_ERROR
+    try:
+        results, code = _run_locked(cfg, jobs, args)
+    finally:
+        counts = Counter(str(r.status) for r in results)
+        logger.info(
+            f"RUN end run={run_id} exit={code} jobs={len(jobs)} "
+            f"success={counts['success']} skipped={counts['skipped']} "
+            f"delayed={counts['delayed']} failed={counts['failed']} "
+            f"retention_failed={counts['retention_failed']} "
+            f"duration={int(time.monotonic() - started)}s "
+            f"at={datetime.now(UTC).isoformat(timespec='seconds')}"
+        )
+    sys.exit(code)
+
+
+def _run_locked(cfg, jobs, args) -> tuple[list[job.Result], int]:
+    results = []
     # Acquire the global lock to prevent multiple snap-bak instances.
     with job.GlobalLock(cfg.stuck_threshold, cfg.stuck_wait):
         # One Runner per resolved job sharing one per-run repo-state cache;
@@ -1372,7 +1401,7 @@ def _run_orchestrator(args) -> None:
                 )
             if _restic_update_due(results, cfg.restic_update):
                 _run_restic_update()
-        sys.exit(code)
+        return results, code
 
 
 if __name__ == "__main__":

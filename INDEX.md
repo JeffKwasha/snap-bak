@@ -270,6 +270,10 @@ Conventions:
 | [[R-CLI-32]] | SPEC.md | CLI, Help |
 | [[R-CLI-33]] | SPEC.md | CLI, Help |
 | [[R-CLI-34]] | SPEC.md | CLI, Help |
+| [[R-CLI-35]] | SPEC.md | CLI, Logging |
+| [[R-CLI-36]] | SPEC.md | CLI, Logging |
+| [[R-CLI-37]] | SPEC.md | CLI, Logging |
+| [[R-CLI-38]] | SPEC.md | CLI, Logging |
 | [[R-ENV-01]] | SPEC.md | CLI, Environment Variables |
 | [[R-ENV-02]] | SPEC.md | CLI, Environment Variables |
 | [[R-ENV-03]] | SPEC.md | CLI, Environment Variables |
