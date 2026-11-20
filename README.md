@@ -971,8 +971,11 @@ and queued work is never discarded for being old.
 
 (Logs go to stderr, captured by the systemd journal. A normal run opens with
 `Starting snap-bak <version> (build <time>)` and closes with `RUN end`, and each
-job logs a `JOB plan` and `JOB end` line. Lock transitions and per-job status
-writes are at debug. A file log is opt-in via `--log-file`.
+job logs a `JOB plan` and `JOB end` line. The job name is already in the `[job]`
+prefix, so the line does not repeat it. On `JOB end`, `snapshot=-` means no
+snapshot is attached to the outcome, as on a skip; a backup or a failed retry
+names the snapshot. Lock transitions and per-job status writes are at debug. A
+file log is opt-in via `--log-file`.
 
 The unit sets `SyslogIdentifier=snap-bak`, so `journalctl -u snap-bak -t snap-bak`
 shows snap-bak's lines and `-t sudo` shows sudo's audit lines. The sudo and PAM
@@ -1073,6 +1076,13 @@ self-contained and deliberately short.
 
 Confirm with `/skills list`, load it with `/snap-bak`. Installed skills apply to
 new sessions; `/reset` picks one up in the current one.
+
+A second skill,
+[`snap-bak-watch`](.opencode/skills/snap-bak-watch/SKILL.md), is for a periodic
+watcher. It reads the capability, the log and the state files, separates hard
+failures from soft drift, and states when to notify an operator. Install it the
+same way by copying `.opencode/skills/snap-bak-watch` into the global skills
+directory. It is short enough to load on every tick.
 
 ### What the agent is told to do
 

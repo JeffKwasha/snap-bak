@@ -646,7 +646,7 @@ class Runner:
             or "-"
         )
         logger.info(
-            f"JOB end job={self.job.name} "
+            f"JOB end "
             f"status={result.status if result else 'failed'} "
             f"rc={_job_exit_code(result)} "
             f"reason={reason!r} "
@@ -1133,7 +1133,7 @@ class Runner:
             if was_delayed:
                 self.delay.missed_slots += 1
                 logger.info(
-                    f"DELAY cleared job={self.job.name}; "
+                    f"DELAY cleared; "
                     f"missed_slots={self.delay.missed_slots}"
                 )
             self.delay.delayed = False
@@ -1284,7 +1284,7 @@ class Runner:
             )
         if retry:
             logger.info(
-                f"RETRY cleared job={self.job.name} snapshot={snapshot_name}; "
+                f"RETRY cleared snapshot={snapshot_name}; "
                 f"failed status replaced"
             )
         self._bump_repo_size(repo, total_size)
@@ -1355,7 +1355,7 @@ class Runner:
                 )
                 return Result(self.job.name, ResultStatus.SKIPPED)
             logger.info(
-                f"JOB plan job={self.job.name} action=retry snapshot={failed_name}"
+                f"JOB plan action=retry snapshot={failed_name}"
             )
             return self._backup_snapshot(failed_path, retry=True)
 
@@ -1363,14 +1363,14 @@ class Runner:
 
         if decision.action == "delayed":
             logger.info(
-                f"JOB plan job={self.job.name} action=delay reason={decision.reason}"
+                f"JOB plan action=delay reason={decision.reason}"
             )
             self._delay(decision.reason)
             return Result(self.job.name, ResultStatus.DELAYED, reason=decision.reason)
 
         if decision.action == "skip":
             logger.info(
-                f"JOB plan job={self.job.name} action=skip "
+                f"JOB plan action=skip "
                 f"reason={decision.reason or 'not time for backup'}"
             )
             self._write_status(
@@ -1381,7 +1381,7 @@ class Runner:
         snapshot_path = decision.snapshot or self._candidate_snapshot()
         if snapshot_path is None:
             logger.info(
-                f"JOB plan job={self.job.name} action=skip reason='no snapshot found'"
+                "JOB plan action=skip reason='no snapshot found'"
             )
             self._write_status("skipped", "No snapshot found")
             return Result(self.job.name, ResultStatus.SKIPPED)
@@ -1389,7 +1389,7 @@ class Runner:
         # Never back up a snapshot younger than the safety floor; a graceful skip.
         if self._snapshot_too_young(snapshot_path):
             logger.info(
-                f"JOB plan job={self.job.name} action=defer "
+                f"JOB plan action=defer "
                 f"snapshot={snapshot_path.name} "
                 f"reason='younger than {config.DEFAULT_SNAPSHOT_AGE_MIN}s'"
             )
@@ -1401,17 +1401,14 @@ class Runner:
 
         # If the window closed between planning and execution, the slot is missed.
         if not self.within_backup_window():
-            logger.info(
-                f"JOB plan job={self.job.name} action=skip "
-                f"reason='backup window closed'"
-            )
+            logger.info("JOB plan action=skip reason='backup window closed'")
             self._write_status(
                 "skipped", "Backup window closed before backup could run"
             )
             return Result(self.job.name, ResultStatus.SKIPPED, timeout=True)
 
         logger.info(
-            f"JOB plan job={self.job.name} action=backup "
+            f"JOB plan action=backup "
             f"snapshot={snapshot_path.name} source={self.mount_point}"
         )
         return self._backup_snapshot(snapshot_path)
