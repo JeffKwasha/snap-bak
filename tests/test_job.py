@@ -78,6 +78,19 @@ class TestCategorize:
     def _err(self, rc):
         return subprocess.CalledProcessError(rc, "restic", output="", stderr="boom")
 
+    def test_permission_errors_are_summarized(self):  # [[R-CLI-37]]
+        stderr = "\n".join(
+            [
+                "error: open /mnt/bak/home/jk/a: permission denied",
+                "error: open /mnt/bak/home/jk/b: permission denied",
+            ]
+        )
+        err = categorize_restic_error(
+            subprocess.CalledProcessError(3, "restic", stderr=stderr),
+            Path("/mnt/bak/home"),
+        )
+        assert "lack permission to read home/jk (2 paths)" in str(err)
+
     def test_locked(self):
         e = categorize_restic_error(self._err(11))
         assert isinstance(e, RepoLockedError)
@@ -394,7 +407,7 @@ class TestBackupReport:
 class TestSnapshotGate:
     def test_dry_run_reports_no_wrapper_failure(self, monkeypatch, tmp_path, caplog):
         runner = _runner(monkeypatch, tmp_path)
-        with caplog.at_level(logging.INFO):
+        with caplog.at_level(logging.DEBUG):
             runner._should_create_snapshot()
         assert "power-saving gate not evaluated" in caplog.text
         assert "wrapper status unavailable" not in caplog.text
@@ -471,14 +484,14 @@ def test_a_missing_snapshot_dir_is_caught_before_anything_is_written(
 
 
 class TestGlobalLockLog:
-    def test_both_lines_name_the_version_and_the_build_time(  # [[R-LOCK-02]]
+    def test_both_lines_name_the_version_and_the_build_time(  # [[R-LOCK-02]] [[R-CLI-38]]
         self, tmp_path, monkeypatch, caplog
     ):
         monkeypatch.setattr(config, "GLOBAL_LOCK_FILE", tmp_path / "snap-bak.lock")
         (tmp_path / "BUILD").write_text("2026-11-16T12:00:00Z\n")
         monkeypatch.setattr(sys, "prefix", str(tmp_path))
         job_mod._build_time.cache_clear()
-        with caplog.at_level(logging.INFO):
+        with caplog.at_level(logging.DEBUG):
             lock = job_mod.GlobalLock()
             lock.__enter__()
             lock.__exit__(None, None, None)
@@ -544,3 +557,57 @@ class TestWrapperResticOps:
         commands = self._record(runner)
         runner.prune()
         assert commands == [[config.SUDO, config.SUDO_EXEC, "restic-prune", "j"]]
+
+
+class TestLogSummary:
+    def test_summarizes_permission_denials_by_top_directory(self, tmp_path):  # [[R-CLI-37]]
+        stderr = "\n".join(
+            [
+                "error: open /mnt/bak/home/jk/a: permission denied",
+                "error: open /mnt/bak/home/jk/b: permission denied",
+                "error: open /mnt/bak/home/claude/snap: permission denied",
+                "error: something else",
+            ]
+        )
+        summary = job_mod._summarize_restic_stderr(stderr, Path("/mnt/bak/home"))
+        assert summary == (
+            "lack permission to read home/claude (1 path), home/jk (2 paths)"
+        )
+
+    def test_job_end_reports_the_verdict_and_the_snapshot(  # [[R-CLI-36]]
+        self, monkeypatch, tmp_path, caplog
+    ):
+        runner = _runner(monkeypatch, tmp_path)
+        runner.state_file.unlink(missing_ok=True)
+        runner._run_backup_phase = lambda: Result(
+            "j", ResultStatus.SKIPPED, reason="outside backup window"
+        )
+        with caplog.at_level(logging.INFO):
+            runner.run()
+        assert "JOB end job=j status=skipped rc=0" in caplog.text
+        assert "reason='outside backup window'" in caplog.text
+        assert "snapshot=-" in caplog.text
+
+    def test_job_end_reports_a_failed_code(  # [[R-CLI-36]]
+        self, monkeypatch, tmp_path, caplog
+    ):
+        runner = _runner(monkeypatch, tmp_path)
+        runner._run_backup_phase = lambda: Result(
+            "j", ResultStatus.FAILED, reason="permission denied (rc=3)"
+        )
+        with caplog.at_level(logging.INFO):
+            runner.run()
+        assert "JOB end job=j status=failed rc=41" in caplog.text
+
+    def test_status_probe_logs_at_debug(self, monkeypatch, tmp_path):  # [[R-CLI-38]]
+        runner = _runner(monkeypatch, tmp_path)
+        runner.dry_run = False
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen.update(kw)
+            return types.SimpleNamespace(stdout="{}", stderr="", returncode=0)
+
+        monkeypatch.setattr(runner, "run_command", fake_run)
+        runner._wrapper_status()
+        assert seen["log_level"] == logging.DEBUG

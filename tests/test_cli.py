@@ -1,4 +1,7 @@
-"""Tests for snap_bak.cli: exit-code ladder, restic-update gating and help."""
+"""Tests for snap_bak.cli: exit-code ladder, restic-update gating, help and logs."""
+
+import logging
+import types
 
 import pytest
 
@@ -111,3 +114,39 @@ class TestHelp:
             assert "The noun to act on" in out
             assert "Path to config JSON" in out
             assert "Restrict to one job" in out
+
+
+class TestRunSummary:
+    def test_run_start_and_end_lines(self, monkeypatch, tmp_path, caplog):  # [[R-CLI-35]]
+        cfg = config.Config.model_validate(
+            {
+                "mount_base": str(tmp_path),
+                "repos": [{"name": "r", "path": str(tmp_path / "repo")}],
+                "jobs": [
+                    {
+                        "name": "j",
+                        "snapshot_dir": str(tmp_path / "snaps"),
+                        "source_subvolume": str(tmp_path),
+                        "repo": "r",
+                    }
+                ],
+            }
+        )
+        (tmp_path / "snaps").mkdir()
+        monkeypatch.setattr(
+            config.Config, "load", classmethod(lambda cls, path: cfg)
+        )
+        monkeypatch.setattr(
+            cli, "_run_locked", lambda cfg, jobs, args: ([], config.EXIT_SUCCESS)
+        )
+        args = types.SimpleNamespace(
+            config=str(tmp_path / "config.json"),
+            list_jobs=False,
+            job=None,
+            dry_run=True,
+        )
+        with caplog.at_level(logging.INFO), pytest.raises(SystemExit) as exc:
+            cli._run_orchestrator(args)
+        assert exc.value.code == config.EXIT_SUCCESS
+        assert "Starting snap-bak" in caplog.text
+        assert "RUN end" in caplog.text

@@ -1184,6 +1184,25 @@ help too.
 flags `--reveal`, `-e/--exclude`, `--excludes-file`, `--price`, `--format`,
 `--json` and `--limit`, and points at the README section with worked examples.
 
+### Logging
+
+[[R-CLI-35]] A normal run logs, at INFO, a start line with the version, build
+timestamp, run id and job count, and an end line with the exit code, per-status
+counts, duration and UTC timestamp.
+
+[[R-CLI-36]] Each job logs, at INFO, a plan line naming the action (`backup`,
+`retry`, `skip`, `delay`, `defer`) and its snapshot or reason, and an end line
+with the status, the snap-bak exit code, the reason, the snapshot and a UTC
+timestamp.
+
+[[R-CLI-37]] A restic failure logs one high-level error line grouped by the
+top-level directory under the backup root, for example
+`lack permission to read home/jk (12 paths)`. The full stderr is logged at
+DEBUG.
+
+[[R-CLI-38]] Lock transitions and per-job status writes log at DEBUG. The
+version and build timestamp remain visible at INFO in the run start line.
+
 ### Exit codes
 
 [[R-CLI-28]] A verb's status reaches the process: `show` and `apply` exit with

@@ -339,6 +339,7 @@ Wants=network-online.target
 Type=oneshot
 User={SERVICE_USER}
 Group={SERVICE_GROUP}
+SyslogIdentifier=snap-bak
 WorkingDirectory={INSTALL_DIR}
 Environment=SNAPBAK_CONFIG_FILE={CONFIG_FILE}
 ExecStart={VENV_PY} -P -m snap_bak.cli
