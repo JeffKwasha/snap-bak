@@ -27,7 +27,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 
-from snap_bak import excludes, job, report, restic, todo
+from snap_bak import config, excludes, job, report, todo
 
 logger = logging.getLogger(__name__)
 
@@ -351,20 +351,13 @@ def _rewrite_cmd(runner, snapshot_ids) -> list[str]:
     `forget` would also apply the retention policies and could delete snapshots
     beyond this intent.
     """
-    return restic.build(
-        "rewrite",
-        repo_path=runner.repo.path,
-        password_file=runner.repo.password_file,
-        options=list(runner.repo.restic_options) + list(runner.job.restic_options),
-        exclude_file=runner.job.ignore_file or None,
-        excludes=runner.job.excludes,
-        forget=True,
-        extra_args=list(snapshot_ids),
-        warn=lambda opt: logger.warning(
-            f"restic_options contains reserved flag '{opt}' which snap-bak "
-            "manages; ignoring it."
-        ),
-    )
+    return [
+        config.SUDO,
+        config.SUDO_EXEC,
+        "restic-rewrite",
+        runner.job.name,
+        *snapshot_ids,
+    ]
 
 
 def warns_on_newest(runner, p: Plan) -> bool:
