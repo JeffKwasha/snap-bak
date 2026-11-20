@@ -1166,6 +1166,24 @@ since they name sources apply never removes files from. So are
 `--excludes-file`, `-e`, `--reveal`, `--reveal-file` and `--price`, since a trial
 or survey rule set must never drive a rewrite of real backups.
 
+### Help
+
+[[R-CLI-31]] The top-level `--help` names `show excludes` and `apply excludes`
+with one line each in the words a request would use: inspect what the rules
+match, and remove matching files from snapshots already in the repo.
+
+[[R-CLI-32]] Each excludes subcommand's `--help` opens with the task, not the
+mechanism: what the rules match for `show`, and removing matching files from
+stored snapshots for `apply`.
+
+[[R-CLI-33]] Every excludes option's help says what question it answers, not
+only how it works. The positional object, `-c/--config` and `-j/--job` carry
+help too.
+
+[[R-CLI-34]] The top-level help names the verbs and the mechanism-changing
+flags `--reveal`, `-e/--exclude`, `--excludes-file`, `--price`, `--format`,
+`--json` and `--limit`, and points at the README section with worked examples.
+
 ### Exit codes
 
 [[R-CLI-28]] A verb's status reaches the process: `show` and `apply` exit with
