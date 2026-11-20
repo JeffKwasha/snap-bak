@@ -577,6 +577,73 @@ sudo -u snap-bak snap-bak --config /path/to/config.json
 
 ## Inspecting & Applying Excludes
 
+### Common requests
+
+#### Remove a directory from the backups already in the repo
+
+```bash
+# Preview the snapshots and the exact rewrite command. Changes nothing.
+sudo -u snap-bak snap-bak apply excludes --job data
+
+# Do it in the next eligible window. Preferred on a remote or busy repo.
+sudo -u snap-bak snap-bak apply excludes --job data --later
+
+# Do it now. Fails fast if the repo is locked or unreachable.
+sudo -u snap-bak snap-bak apply excludes --job data --now
+```
+
+`apply excludes` rewrites the job's restic snapshots with its configured
+`ignore_file` and `excludes`, then prunes to reclaim the space. It never touches
+live files, the source subvolume, or local btrfs snapshots. A completed rewrite
+has no undo, so run the dry run first and prefer `--later`. The rewritten
+snapshots keep their original time, host and tag.
+
+#### Try a pattern before you deploy it
+
+```bash
+# Add rules for this run only. The config is not edited.
+sudo -u snap-bak snap-bak show excludes --live -e '*.iso' -e 'build/cache/'
+
+# Or use a working file with the same syntax as the job's ignore_file.
+sudo -u snap-bak snap-bak show excludes --live \
+  --excludes-file /tmp/work.ignore
+```
+
+Trial rules add to the configured rules. They never modify the config or any
+snapshot. Read the `+` rows to see what the trial adds. Drop the flag or file to
+return to the deployed rules.
+
+#### See what a candidate rule would newly exclude
+
+```bash
+sudo -u snap-bak snap-bak show excludes --reveal 'build/cache/'
+sudo -u snap-bak snap-bak show excludes --reveal-file /tmp/candidate.ignore
+```
+
+A reveal pattern is a what-if. Its matches are walked, priced and listed file by
+file. It is never handed to restic and never applied. When it looks right, copy
+it into the job's `ignore_file` to make it real.
+
+#### Survey what the current rules match
+
+```bash
+# Local only, no network. The default selector is --live.
+sudo -u snap-bak snap-bak show excludes
+
+# Every source in one table. --repo reads the repository over the network.
+sudo -u snap-bak snap-bak show excludes --all
+
+# Exact sizes for matched directories, plus the file sheet.
+sudo -u snap-bak snap-bak show excludes --all --price -v
+```
+
+`show` is read only. It never creates, removes, or modifies a snapshot or a
+local file. With no selector it walks the live filesystem, prunes matched
+directories unread, and prints `?` where the size is unknown. Add `--price` for
+exact totals.
+
+### Reference
+
 Your `ignore_file` / `excludes` patterns decide what a **future** backup skips.
 Anything uploaded *before* you added a rule stays in the repo forever — restic's
 retention prunes whole snapshots, never a subset of files. These commands show
