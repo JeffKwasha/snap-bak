@@ -143,6 +143,26 @@ def resolved_job(tmp_path, monkeypatch, *, excludes_list):
     return rj, src, repo
 
 
+def direct_rewrite_cmd(runner, snapshot_ids):
+    """The pre-wrapper rewrite, for integration tests with no root.
+
+    The wrapper routing is unit-tested in tests/test_sudo_exec.py; tests that
+    run a real restic rewrite use this so they stay unprivileged.
+    """
+    from snap_bak import restic as restic_module
+
+    return restic_module.build(
+        "rewrite",
+        repo_path=runner.repo.path,
+        password_file=runner.repo.password_file,
+        options=list(runner.repo.restic_options) + list(runner.job.restic_options),
+        exclude_file=runner.job.ignore_file or None,
+        excludes=runner.job.excludes,
+        forget=True,
+        extra_args=list(snapshot_ids),
+    )
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     """Print the taxonomy counts; commit messages carry them forward."""
     from taxonomy import counts

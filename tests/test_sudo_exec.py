@@ -586,3 +586,149 @@ class TestUmount:
         (proc / "1/cmdline").write_bytes(b"python3\0-m\0snap_bak.cli\0")
         io.main()
         assert calls == [["/usr/bin/umount", "-l", "/bak/home"]]
+
+
+class TestResticOps:
+    def _resolved(self, tmp_path, jobs=None):
+        cfg = config.Config.load(_write_config(tmp_path, jobs=jobs))
+        rj = cfg.get("home")
+        assert rj is not None
+        return rj
+
+    def _capture(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            io, "_run_restic", lambda cmd, **kw: calls.append((cmd, kw))
+        )
+        return calls
+
+    def test_backup_derives_repo_mount_tag_and_json(self, tmp_path, monkeypatch):
+        rj = self._resolved(tmp_path)
+        calls = self._capture(monkeypatch)
+        io._op_restic_backup(rj, dry_run=False)
+        cmd = calls[0][0]
+        assert cmd[0] == io.RESTIC
+        assert cmd[1:3] == ["-r", "rclone:test"]
+        assert cmd[3] == "backup"
+        assert str(rj.mount_point) in cmd
+        assert "--tag" in cmd and rj.tag in cmd
+        assert "--json" in cmd
+        assert "--dry-run" not in cmd
+
+    def test_backup_dry_run_adds_dry_run(self, tmp_path, monkeypatch):
+        rj = self._resolved(tmp_path)
+        calls = self._capture(monkeypatch)
+        io._op_restic_backup(rj, dry_run=True)
+        assert "--dry-run" in calls[0][0]
+
+    def test_forget_uses_tag_and_retention(self, tmp_path, monkeypatch):
+        jobs = [
+            {
+                "name": "home",
+                "snapshot_dir": str(tmp_path / "snaps"),
+                "source_subvolume": "home",
+                "repo": "primary",
+                "backup_retention": {"daily": 3, "monthly": 2},
+            }
+        ]
+        rj = self._resolved(tmp_path, jobs=jobs)
+        calls = self._capture(monkeypatch)
+        io._op_restic_forget(rj)
+        cmd = calls[0][0]
+        assert cmd[3] == "forget"
+        assert "--tag" in cmd and rj.tag in cmd
+        assert "--keep-daily" in cmd and "3" in cmd
+        assert "--keep-monthly" in cmd and "2" in cmd
+
+    def test_forget_refuses_missing_retention(self, tmp_path, monkeypatch):
+        rj = self._resolved(tmp_path)
+        with pytest.raises(SystemExit):
+            io._op_restic_forget(rj)
+
+    def test_prune_is_allowlisted(self, tmp_path, monkeypatch):
+        rj = self._resolved(tmp_path)
+        calls = self._capture(monkeypatch)
+        io._op_restic_prune(rj)
+        assert calls[0][0][3] == "prune"
+
+    def test_rewrite_uses_only_tagged_ids(self, tmp_path, monkeypatch):
+        rj = self._resolved(tmp_path)
+        monkeypatch.setattr(
+            io, "_tagged_snapshot_ids", lambda _rj: {"abc12345", "def45678"}
+        )
+        calls = self._capture(monkeypatch)
+        io._op_restic_rewrite(rj, ["abc12345"])
+        cmd = calls[0][0]
+        assert cmd[3] == "rewrite"
+        assert "abc12345" in cmd
+        assert "--forget" in cmd
+
+    def test_rewrite_refuses_an_untagged_id(self, tmp_path, monkeypatch):
+        rj = self._resolved(tmp_path)
+        monkeypatch.setattr(io, "_tagged_snapshot_ids", lambda _rj: {"abc123"})
+        with pytest.raises(SystemExit):
+            io._op_restic_rewrite(rj, ["deadbeef"])
+
+    def test_rewrite_refuses_a_malformed_id(self, tmp_path, monkeypatch):
+        rj = self._resolved(tmp_path)
+        with pytest.raises(SystemExit):
+            io._op_restic_rewrite(rj, ["../../etc/passwd"])
+
+    def test_extra_arguments_are_refused(self, tmp_path):
+        rj = self._resolved(tmp_path)
+        with pytest.raises(SystemExit):
+            io._op_restic("restic-prune", rj, ["extra"])
+
+    def test_environment_is_explicit(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(io, "CONFIG_PATH", str(tmp_path / "config.json"))
+        env = io._restic_env()
+        assert env["HOME"] == str(tmp_path)
+        assert env["RCLONE_CONFIG"] == str(tmp_path / ".config/rclone/rclone.conf")
+        assert env["RESTIC_CACHE_DIR"] == str(tmp_path / "cache")
+        assert env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+
+    def test_restic_runs_as_the_service_user_in_its_own_session(self, monkeypatch):
+        seen = {}
+
+        class FakeProc:
+            pid = 1
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(cmd, **kwargs):
+            seen.update(kwargs)
+            return FakeProc()
+
+        monkeypatch.setattr(io.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(io, "_service_ids", lambda: (1000, 1001))
+        monkeypatch.setattr(io, "_restic_env", lambda: {"HOME": "/x"})
+        monkeypatch.setattr(io, "_restic_timeout", lambda: None)
+        io._run_restic(["restic"])
+        assert seen["user"] == 1000
+        assert seen["group"] == 1001
+        assert seen["start_new_session"] is True
+        assert seen["env"] == {"HOME": "/x"}
+
+    def test_timeout_signals_the_process_group(self, monkeypatch):
+        calls = []
+        waits = []
+
+        class FakeProc:
+            pid = 4242
+
+            def wait(self, timeout=None):
+                waits.append(timeout)
+                if len(waits) == 1:
+                    raise subprocess.TimeoutExpired("restic", timeout)
+                return 0
+
+        monkeypatch.setattr(io.subprocess, "Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr(io, "_service_ids", lambda: (1000, 1000))
+        monkeypatch.setattr(io, "_restic_env", lambda: {})
+        monkeypatch.setattr(io, "_restic_timeout", lambda: 5)
+        monkeypatch.setattr(
+            io.os, "killpg", lambda pid, sig: calls.append((pid, sig))
+        )
+        io._run_restic(["restic", "cat", "config"])
+        assert calls == [(4242, io.signal.SIGTERM)]

@@ -38,7 +38,7 @@ The example config names files that do not exist in a clone (its
 
 That is enough to develop, run the suite, and inspect a configuration. It is
 **not** enough to run a backup: every privileged step (mount, snapshot,
-unmount, delete, restic update) goes through the root wrapper
+unmount, delete, restic update, and mutating restic calls) goes through the root wrapper
 `/opt/snap-bak/sudo-exec.py` and its sudoers rule, which Option B installs.
 
 ### Option B — Systemd service (recommended for production)
@@ -219,8 +219,10 @@ sudoers lets the service user run.
     NEVER requires touching sudoers, because the wrapper derives every path
     from the root-owned config at runtime.
 2.  **The wrapper** (`sudo-exec.py`, root:snap-bak 0750) accepts only
-    `snapshot|delete|mount|umount <job> [snapshot]`, `status <job>`, and
-    `update-restic`,
+    `snapshot|delete|mount|umount <job> [snapshot]`, `status <job>`,
+    `update-restic`, and the mutating restic ops `restic-backup`,
+    `restic-backup-dry-run`, `restic-forget`, `restic-prune` and
+    `restic-rewrite <job> <id>...`,
     validates the job against `/opt/snap-bak/config.json` and the snapshot
     name against `YYYY-MM-DD_HH:MMZ`, and confines all paths under the
     configured `snapshot_dir` / `mount_base` (realpath traversal guard).
@@ -231,7 +233,10 @@ sudoers lets the service user run.
     (a changing source path would force full-copy backups).
 4.  **`cap_dac_read_search` on restic** — snapshots are root-owned, so restic
     (running as the unprivileged `snap-bak` user) reads them via the
-    `cap_dac_read_search` capability applied to the restic binary. This is
+    `cap_dac_read_search` capability applied to the restic binary. The wrapper
+    builds every mutating restic invocation from the root-owned config and then
+    drops to the service user before exec, so restic never runs as root.
+    Read-only repository queries stay in the service process. The capability is
     managed entirely by the wrapper's `update-restic` op, which validates the
     binary is root-owned and un-writable by others, runs `restic self-update`
     (dropping any stale caps), restricts the binary to `root:snap-bak 0750` and

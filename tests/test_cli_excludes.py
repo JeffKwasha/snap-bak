@@ -14,10 +14,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from conftest import backup, init_repo, resolved_job, restic
+from conftest import backup, direct_rewrite_cmd, init_repo, resolved_job, restic
 
 import snap_bak
-from snap_bak import cli, config, excludes, job
+from snap_bak import apply, cli, config, excludes, job
 
 # A wide terminal by default, so a test's assertions do not depend on whatever
 # terminal happened to run it. The fitting itself has its own tests.
@@ -317,6 +317,7 @@ class TestApplyDryRun:
 
 class TestApplyNow:
     def test_apply_now_rewrites_and_prunes(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(apply, "_rewrite_cmd", direct_rewrite_cmd)
         rj, src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=["*.tmp", "cache"])
         init_repo(str(tmp_path / "repo"))
         backup(str(tmp_path / "repo"), src, "--exclude", "*.tmp")
