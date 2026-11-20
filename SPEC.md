@@ -1193,7 +1193,10 @@ counts, duration and UTC timestamp.
 [[R-CLI-36]] Each job logs, at INFO, a plan line naming the action (`backup`,
 `retry`, `skip`, `delay`, `defer`) and its snapshot or reason, and an end line
 with the status, the snap-bak exit code, the reason, the snapshot and a UTC
-timestamp.
+timestamp. The job name comes from the `[job]` log context and is not repeated
+in the line. `snapshot=-` means no snapshot is attached to the outcome, as on a
+skip or a delay before selection; a backup, a failed retry and a defer name the
+snapshot.
 
 [[R-CLI-37]] A restic failure logs one high-level error line grouped by the
 top-level directory under the backup root, for example

@@ -584,7 +584,7 @@ class TestLogSummary:
         )
         with caplog.at_level(logging.INFO):
             runner.run()
-        assert "JOB end job=j status=skipped rc=0" in caplog.text
+        assert "JOB end status=skipped rc=0" in caplog.text
         assert "reason='outside backup window'" in caplog.text
         assert "snapshot=-" in caplog.text
 
@@ -597,7 +597,7 @@ class TestLogSummary:
         )
         with caplog.at_level(logging.INFO):
             runner.run()
-        assert "JOB end job=j status=failed rc=41" in caplog.text
+        assert "JOB end status=failed rc=41" in caplog.text
 
     def test_status_probe_logs_at_debug(self, monkeypatch, tmp_path):  # [[R-CLI-38]]
         runner = _runner(monkeypatch, tmp_path)
