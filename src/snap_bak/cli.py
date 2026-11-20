@@ -912,49 +912,85 @@ def excludes_parser(verb: str) -> argparse.ArgumentParser:
     while `apply` mutates restic and refuses the selectors that would imply
     otherwise.
     """
+    if verb == "show":
+        description = (
+            "Inspect what the exclude rules match. Read-only: nothing is "
+            "created, removed, or modified."
+        )
+        epilog = (
+            "Start with the question. What do the current rules match? Use "
+            "--live (default), --snaps, --repo, or --all for every source. "
+            "What would a candidate rule newly exclude? Use --reveal or "
+            "--reveal-file. What would a working rule set do? Use -e/--exclude "
+            "or --excludes-file. Add --price for exact directory sizes, -v for "
+            "every excluded file, and --format or --json for machine output. "
+            "Patterns are linted on every run and print nothing when clean. "
+            "See README.md, section 'Common requests', for worked examples."
+        )
+    else:
+        description = (
+            "Remove files that the configured exclude rules match from "
+            "snapshots already in the repo. Live files and local snapshots "
+            "are never touched."
+        )
+        epilog = (
+            "Start with the request. Which snapshots hold matches, and what "
+            "would run? The default prints the plan. --now rewrites and prunes "
+            "immediately; --later queues the rewrite for the next eligible "
+            "scheduled run. Prefer --later on a remote or busy repo. A "
+            "completed rewrite has no undo, and rewrite is metadata-scale "
+            "while prune is the expensive step. See README.md, section "
+            "'Common requests', for worked examples."
+        )
     parser = argparse.ArgumentParser(
         prog=f"snap-bak {verb} excludes",
-        description=(
-            "Inspect restic exclude patterns (show), or remove excluded files "
-            "from existing restic snapshots (apply)."
-        ),
-        epilog=(
-            "Cost: patterns are linted on every `show`, silently when clean. "
-            "--live and --snaps walk locally, pruning matched directories "
-            "unread the way restic's backup does — '?' marks a rule whose "
-            "directory totals are therefore unknown; --price walks them out, "
-            "--reveal lists candidate patterns beneath their matches. "
-            "--repo reaches the network for metadata only. `apply --now` "
-            "prunes after rewriting, which repacks and re-uploads (minutes to "
-            "hours); prefer --later."
-        ),
+        description=description,
+        epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("object", choices=("excludes",))
-    parser.add_argument("-c", "--config", default=None)
-    parser.add_argument("-j", "--job", default=None)
-    parser.add_argument("--json", action="store_true", help="Machine-readable output.")
+    parser.add_argument(
+        "object",
+        choices=("excludes",),
+        help="The noun to act on. Both verbs take `excludes`.",
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        default=None,
+        help="Path to config JSON (default: SNAPBACK_CONFIG_FILE or the production config).",
+    )
+    parser.add_argument(
+        "-j",
+        "--job",
+        default=None,
+        help="Restrict to one job by name (default: all jobs).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print one JSON document for the whole invocation.",
+    )
     parser.add_argument(
         "--format",
         choices=report.FORMATS,
         default="text",
         help=(
-            "How to render the rule-by-source table (default: text). "
-            "text fits itself to the terminal and abbreviates bytes; "
-            "markdown and csv carry every column and every job in one table."
+            "How to render the report. text fits the terminal and abbreviates "
+            "bytes; markdown and csv keep every column and every job in one "
+            "table."
         ),
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Bound the per-file rows under -v (rule rows and totals cover all).",
+        help="Cap the per-file rows under -v. Rule rows and totals still cover everything.",
     )
     parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
-        help="Add the per-file sheet: every excluded path, one per line.",
+        help="Also list every excluded file, one per line.",
     )
 
     if verb == "show":
@@ -962,29 +998,38 @@ def excludes_parser(verb: str) -> argparse.ArgumentParser:
             "--price",
             action="store_true",
             help=(
-                "Walk matched directories for exact sizes (the slow way: one "
-                "stat per file beneath every rule). The default marks "
-                "directories restic would prune with '?' instead of reading "
-                "them; --live and --snaps only."
+                "Walk matched directories for exact sizes. The default prunes "
+                "them unread, as restic does, and prints '?'."
             ),
         )
-        parser.add_argument("--live", action="store_true", help="Match the live filesystem.")
         parser.add_argument(
-            "--snaps", action="store_true", help="Match local btrfs snapshots (table)."
+            "--live",
+            action="store_true",
+            help="Match the live filesystem. This is the default when no selector is given.",
         )
         parser.add_argument(
-            "--repo", action="store_true", help="Match files already in restic (network)."
+            "--snaps",
+            action="store_true",
+            help="Match each local btrfs snapshot.",
         )
-        parser.add_argument("--all", action="store_true", help="Every selector.")
+        parser.add_argument(
+            "--repo",
+            action="store_true",
+            help="Match files already stored in restic. This reads the repo over the network.",
+        )
+        parser.add_argument(
+            "--all",
+            action="store_true",
+            help="Match every source above in one table.",
+        )
         parser.add_argument(
             "--excludes-file",
             metavar="PATH",
             default=None,
             help=(
-                "Evaluate this pattern file's rules in addition to the job's. "
-                "Same syntax as a job's ignore_file: one restic exclude pattern "
-                "per line, '#' comments, '!' negation. The config is not "
-                "modified, and this cannot remove the job's own rules."
+                "Try this pattern file's rules without editing the config. "
+                "Same syntax as the job's ignore_file: one restic exclude "
+                "pattern per line, '#' comments, '!' negation."
             ),
         )
         parser.add_argument(
@@ -994,8 +1039,8 @@ def excludes_parser(verb: str) -> argparse.ArgumentParser:
             default=[],
             metavar="PATTERN",
             help=(
-                "Add one restic exclude pattern, in the same syntax the "
-                "excludes file uses. Repeatable; added after --excludes-file."
+                "Try one extra exclude pattern, repeatable. Rules are added "
+                "after --excludes-file and never modify the config."
             ),
         )
         parser.add_argument(
@@ -1004,11 +1049,9 @@ def excludes_parser(verb: str) -> argparse.ArgumentParser:
             default=[],
             metavar="PATTERN",
             help=(
-                "What-if: exclude with PATTERN and list everything beneath "
-                "each match (exact sizes). What the configuration already "
-                "excludes is shown on its own row. Restic never sees reveal "
-                "patterns; run them through `show --excludes-file` and then "
-                "edit the config to make them real."
+                "See what a candidate rule would newly exclude, priced and "
+                "listed file by file. Restic never sees it; copy it to the "
+                "config to make it real."
             ),
         )
         parser.add_argument(
@@ -1016,16 +1059,20 @@ def excludes_parser(verb: str) -> argparse.ArgumentParser:
             metavar="PATH",
             default=None,
             help=(
-                "A file of --reveal patterns, ignore_file syntax. Repeat "
-                "--reveal as well; they combine."
+                "Read candidate rules from a file, using ignore_file syntax. "
+                "Combines with --reveal."
             ),
         )
     else:
         parser.add_argument(
-            "--now", action="store_true", help="Execute the rewrite now."
+            "--now",
+            action="store_true",
+            help="Rewrite and prune now. Fails fast if the repo is locked or unreachable.",
         )
         parser.add_argument(
-            "--later", action="store_true", help="Arm the next scheduled run."
+            "--later",
+            action="store_true",
+            help="Queue the rewrite for the next eligible scheduled run. Preferred on a remote or busy repo.",
         )
         # A flag that takes a value must consume it: `apply excludes
         # --excludes-file f` refusing without the value would leave `f` as a
@@ -1150,15 +1197,22 @@ def _main_parser() -> argparse.ArgumentParser:
         description="Btrfs Snapshot -> Restic Backup Orchestrator",
         epilog=(
             "Subcommands (run with no subcommand for a normal backup run):\n"
-            "  show excludes [SELECTOR]   inspect exclude patterns; read-only.\n"
-            "                             --live (default, local) --snaps (local)\n"
-            "                             --repo (network) --all\n"
-            "                             --excludes-file PATH  try a working\n"
-            "                             pattern file against the real config\n"
+            "  show excludes [SELECTOR]\n"
+            "      Inspect what the exclude rules match in the live filesystem,\n"
+            "      local snapshots, or the restic repo. Read-only.\n"
+            "      Selectors: --live (default) --snaps --repo --all\n"
+            "      Ask what a new rule would hide: --reveal PATTERN,\n"
+            "      --reveal-file PATH. Try a working rule set: -e/--exclude,\n"
+            "      --excludes-file PATH. Output: --format text|csv|markdown,\n"
+            "      --json, --limit N. Exact or per-file detail: --price, -v.\n"
             "  apply excludes [--now|--later]\n"
-            "                           rewrite excluded files out of restic\n"
+            "      Remove files that the configured rules match from snapshots\n"
+            "      already in the repo, then prune. The default prints the plan.\n"
+            "      --now runs it; --later queues it for the next scheduled run.\n"
             "\n"
-            "Config: see -c, or SNAPBAK_CONFIG_FILE / SNAPBAK_JOB"
+            "Worked examples: README.md, section 'Common requests'.\n"
+            "\n"
+            "Config: see -c, or SNAPBACK_CONFIG_FILE / SNAPBACK_JOB"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

@@ -1,4 +1,6 @@
-"""Tests for snap_bak.cli: exit-code ladder and restic-update gating."""
+"""Tests for snap_bak.cli: exit-code ladder, restic-update gating and help."""
+
+import pytest
 
 from snap_bak import cli, config
 from snap_bak.job import Result, ResultStatus
@@ -57,3 +59,55 @@ class TestResticUpdateDue:
 
     def test_after_with_mixed(self):
         assert cli._restic_update_due([_r("skipped"), _r("success")], "after") is True
+
+
+class TestHelp:
+    @staticmethod
+    def _help(parser, capsys):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--help"])
+        return " ".join(capsys.readouterr().out.split())
+
+    def test_top_level_help_names_verbs_and_flags(self, capsys):  # [[R-CLI-31]] [[R-CLI-34]]
+        out = self._help(cli._main_parser(), capsys)
+        assert "show excludes" in out
+        assert "apply excludes" in out
+        for needle in (
+            "--reveal",
+            "-e",
+            "--excludes-file",
+            "--price",
+            "--format",
+            "--json",
+            "--limit",
+        ):
+            assert needle in out
+        assert "Common requests" in out
+
+    def test_show_help_opens_with_the_inspect_task(self, capsys):  # [[R-CLI-32]]
+        out = self._help(cli.excludes_parser("show"), capsys)
+        assert "Inspect what the exclude rules match" in out
+        assert out.index("Inspect what") < out.index("options:")
+
+    def test_apply_help_opens_with_the_remove_task(self, capsys):  # [[R-CLI-32]]
+        out = self._help(cli.excludes_parser("apply"), capsys)
+        assert "Remove files that the configured exclude rules match" in out
+        assert out.index("Remove files") < out.index("options:")
+
+    def test_every_exclude_flag_answers_a_question(self, capsys):  # [[R-CLI-33]]
+        show = self._help(cli.excludes_parser("show"), capsys)
+        for phrase in (
+            "This is the default when no selector is given",
+            "reads the repo over the network",
+            "without editing the config",
+            "candidate rule would newly exclude",
+            "every excluded file",
+        ):
+            assert phrase in show
+        apply = self._help(cli.excludes_parser("apply"), capsys)
+        for phrase in ("Fails fast", "next eligible scheduled run"):
+            assert phrase in apply
+        for out in (show, apply):
+            assert "The noun to act on" in out
+            assert "Path to config JSON" in out
+            assert "Restrict to one job" in out

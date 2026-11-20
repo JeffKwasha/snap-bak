@@ -266,6 +266,10 @@ Conventions:
 | [[R-CLI-28]] | SPEC.md | CLI |
 | [[R-CLI-29]] | SPEC.md | CLI |
 | [[R-CLI-30]] | SPEC.md | CLI |
+| [[R-CLI-31]] | SPEC.md | CLI, Help |
+| [[R-CLI-32]] | SPEC.md | CLI, Help |
+| [[R-CLI-33]] | SPEC.md | CLI, Help |
+| [[R-CLI-34]] | SPEC.md | CLI, Help |
 | [[R-ENV-01]] | SPEC.md | CLI, Environment Variables |
 | [[R-ENV-02]] | SPEC.md | CLI, Environment Variables |
 | [[R-ENV-03]] | SPEC.md | CLI, Environment Variables |
