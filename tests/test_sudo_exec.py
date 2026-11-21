@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from snap_bak import config
+from snap_bak import config, restic
 
 _WRAPPER_PATH = Path(__file__).parent.parent / "src" / "sudo-exec.py"
 _loader = importlib.machinery.SourceFileLoader("sudo_exec", str(_WRAPPER_PATH))
@@ -600,6 +600,11 @@ class TestResticOps:
         monkeypatch.setattr(
             io, "_run_restic", lambda cmd, **kw: calls.append((cmd, kw))
         )
+        monkeypatch.setattr(
+            io.restic,
+            "read_capability",
+            lambda path: io.restic.CapabilityState.EFFECTIVE,
+        )
         return calls
 
     def test_backup_derives_repo_mount_tag_and_json(self, tmp_path, monkeypatch):
@@ -732,3 +737,180 @@ class TestResticOps:
         )
         io._run_restic(["restic", "cat", "config"])
         assert calls == [(4242, io.signal.SIGTERM)]
+
+
+class TestCapabilityPreflight:
+    def _rj(self, tmp_path):
+        cfg = config.Config.load(_write_config(tmp_path))
+        rj = cfg.get("home")
+        assert rj is not None
+        return rj
+
+    def test_parse_distinguishes_three_states(self, monkeypatch):  # [[R-PRIV-16]]
+        effective = (
+            bytes.fromhex("01000002") + bytes.fromhex("04000000") + b"\x00" * 12
+        )
+        ineffective = (
+            bytes.fromhex("00000002") + bytes.fromhex("04000000") + b"\x00" * 12
+        )
+
+        monkeypatch.setattr(restic.os, "getxattr", lambda p, n: effective)
+        assert restic.read_capability("x") is restic.CapabilityState.EFFECTIVE
+
+        monkeypatch.setattr(restic.os, "getxattr", lambda p, n: ineffective)
+        assert restic.read_capability("x") is restic.CapabilityState.INEFFECTIVE
+
+        def missing(path, name):
+            raise OSError("no such attribute")
+
+        monkeypatch.setattr(restic.os, "getxattr", missing)
+        assert restic.read_capability("x") is restic.CapabilityState.ABSENT
+
+    @pytest.mark.parametrize(
+        "state",
+        [restic.CapabilityState.ABSENT, restic.CapabilityState.INEFFECTIVE],
+    )
+    def test_preflight_refuses_with_the_named_code(  # [[R-PRIV-10]]
+        self, monkeypatch, capsys, state
+    ):
+        monkeypatch.setattr(io.restic, "read_capability", lambda p: state)
+        with pytest.raises(SystemExit) as exc:
+            io._require_restic_capability()
+        assert exc.value.code == io.EXIT_RESTIC_CAPABILITY
+        assert "update-restic" in capsys.readouterr().err
+
+    def test_preflight_accepts_effective(self, monkeypatch):  # [[R-PRIV-16]]
+        monkeypatch.setattr(
+            io.restic,
+            "read_capability",
+            lambda p: restic.CapabilityState.EFFECTIVE,
+        )
+        io._require_restic_capability()
+
+    def test_code_is_named_and_distinct(self):  # [[R-PRIV-10]]
+        assert io.EXIT_RESTIC_CAPABILITY == 5
+        assert io.EXIT_RESTIC_CAPABILITY not in (1, 2, 3, 4)
+        assert io.EXIT_RESTIC_MISSING == 3
+
+    def test_missing_binary_exits_three(self, monkeypatch, tmp_path):  # [[R-PRIV-10]]
+        monkeypatch.setattr(io, "RESTIC", str(tmp_path / "missing"))
+        with pytest.raises(SystemExit) as exc:
+            io._require_restic_capability()
+        assert exc.value.code == io.EXIT_RESTIC_MISSING
+
+    def test_both_backup_ops_call_preflight(  # [[R-PRIV-16]]
+        self, monkeypatch, tmp_path
+    ):
+        rj = self._rj(tmp_path)
+        calls = []
+        monkeypatch.setattr(io, "_require_restic_capability", lambda: calls.append(1))
+        monkeypatch.setattr(io, "_run_restic", lambda cmd, **kw: None)
+        io._op_restic_backup(rj, dry_run=False)
+        io._op_restic_backup(rj, dry_run=True)
+        assert len(calls) == 2
+
+    @pytest.mark.parametrize(
+        "state",
+        [restic.CapabilityState.ABSENT, restic.CapabilityState.INEFFECTIVE],
+    )
+    def test_backup_ops_refuse_without_executing_restic(  # [[R-PRIV-10]]
+        self, monkeypatch, tmp_path, state
+    ):
+        rj = self._rj(tmp_path)
+        monkeypatch.setattr(io.restic, "read_capability", lambda p: state)
+        executed = []
+        monkeypatch.setattr(
+            io, "_run_restic", lambda cmd, **kw: executed.append(cmd)
+        )
+        for dry_run in (False, True):
+            with pytest.raises(SystemExit) as exc:
+                io._op_restic_backup(rj, dry_run=dry_run)
+            assert exc.value.code == io.EXIT_RESTIC_CAPABILITY
+        assert executed == []
+
+
+class TestResticExecBoundary:
+    """Prove the wrapper's argv and environment at the exec boundary."""
+
+    @staticmethod
+    def _install_fake(monkeypatch, tmp_path):
+        fake = tmp_path / "fake-restic"
+        fake.write_text((Path(__file__).parent / "fake_restic.py").read_text())
+        fake.chmod(0o755)
+
+        (tmp_path / "snaps").mkdir(exist_ok=True)
+        cfg = {
+            "mount_base": "/mnt/bak",
+            "repos": [
+                {
+                    "name": "primary",
+                    "path": "rclone:test",
+                    "password_file": "/opt/snap-bak/passwords/primary",
+                }
+            ],
+            "jobs": [
+                {
+                    "name": "home",
+                    "snapshot_dir": str(tmp_path / "snaps"),
+                    "source_subvolume": "home",
+                    "repo": "primary",
+                    "excludes": ["*.tmp"],
+                }
+            ],
+        }
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps(cfg))
+
+        monkeypatch.setattr(io, "CONFIG_PATH", str(cfg_path))
+        monkeypatch.setattr(io, "RESTIC", str(fake))
+        monkeypatch.setattr(io, "_service_ids", lambda: (os.getuid(), os.getgid()))
+        monkeypatch.setattr(
+            io.restic,
+            "read_capability",
+            lambda path: io.restic.CapabilityState.EFFECTIVE,
+        )
+        real_popen = io.subprocess.Popen
+
+        def popen_without_drop(cmd, **kwargs):
+            for key in ("user", "group", "extra_groups"):
+                kwargs.pop(key, None)
+            return real_popen(cmd, **kwargs)
+
+        monkeypatch.setattr(io.subprocess, "Popen", popen_without_drop)
+        return fake, cfg_path
+
+    @staticmethod
+    def _record(tmp_path):
+        records = sorted((tmp_path / "cache").glob("fake-restic-*.json"))
+        assert len(records) == 1, records
+        return json.loads(records[0].read_text())
+
+    @pytest.mark.parametrize("dry_run", [False, True])
+    def test_wrapper_builds_argv_and_environment(  # [[R-PRIV-20]] [[R-PRIV-22]]
+        self, monkeypatch, tmp_path, dry_run
+    ):
+        fake, cfg_path = self._install_fake(monkeypatch, tmp_path)
+        rj = config.Config.load(cfg_path).get("home")
+        assert rj is not None
+
+        io._op_restic_backup(rj, dry_run=dry_run)
+
+        record = self._record(tmp_path)
+        argv = record["argv"]
+        assert argv[0] == str(fake)
+        assert argv[1:3] == ["-r", rj.repo.path]
+        assert argv[3] == "backup"
+        assert argv[argv.index("--password-file") + 1] == rj.repo.password_file
+        assert argv[argv.index("--tag") + 1] == rj.tag
+        assert str(rj.mount_point) in argv
+        assert "--json" in argv
+        assert ("--dry-run" in argv) is dry_run
+        assert "*.tmp" in argv
+        assert record["env"] == {
+            "HOME": str(tmp_path),
+            "RCLONE_CONFIG": str(tmp_path / ".config/rclone/rclone.conf"),
+            "RESTIC_CACHE_DIR": str(tmp_path / "cache"),
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+        }
+        assert record["uid"] == os.getuid()
+        assert record["gid"] == os.getgid()

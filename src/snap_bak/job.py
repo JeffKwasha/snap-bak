@@ -12,6 +12,7 @@ import functools
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -103,9 +104,16 @@ def _stderr_excerpt(e: subprocess.CalledProcessError, limit: int = 200) -> str:
     return text[:limit] or f"restic exited {e.returncode}"
 
 
-def categorize_restic_error(e: subprocess.CalledProcessError) -> BackupError:
+def categorize_restic_error(
+    e: subprocess.CalledProcessError, mount_point: Path | None = None
+) -> BackupError:
     """Map a restic exit code to a categorized BackupError."""
-    msg = f"restic failed (rc={e.returncode}): {e.stderr or ''}".strip()
+    detail = (
+        _summarize_restic_stderr(e.stderr or "", mount_point)
+        if mount_point is not None
+        else (e.stderr or "")
+    )
+    msg = f"restic failed (rc={e.returncode}): {detail}".strip()
     cls = {11: RepoLockedError, 12: CredentialsError}.get(
         e.returncode, RemoteUnavailableError
     )
@@ -326,14 +334,14 @@ class GlobalLock:
                 break
         self._fh: TextIO | None = fh
         _write_lock_info()
-        logger.info(_lock_transition("acquired"))
+        logger.debug(_lock_transition("acquired"))
         return self
 
     def __exit__(self, *exc):
         if self._fh is not None:
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
             self._fh.close()
-        logger.info(_lock_transition("released"))
+        logger.debug(_lock_transition("released"))
         config.GLOBAL_LOCK_FILE.unlink(missing_ok=True)
 
 
@@ -438,7 +446,7 @@ def write_status(
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(path)
-    logger.info(f"STATUS: {job} - {status} - {message}")
+    logger.debug(f"STATUS: {job} - {status} - {message}")
 
 
 class ResultStatus(str, Enum):
@@ -473,6 +481,75 @@ class Decision:
     action: str  # "backup" | "skip" | "delayed"
     reason: str | None
     snapshot: Path | None
+
+
+def _job_exit_code(result: Result | None) -> int:
+    """The per-job code the aggregate ladder would apply to this result."""
+    if result is None:
+        return config.EXIT_ERROR
+    if result.status == ResultStatus.FAILED:
+        return config.EXIT_PERM_FAILED
+    if result.timeout:
+        return config.EXIT_PERM_TIMEOUT
+    if result.status == ResultStatus.DELAYED:
+        return (
+            config.EXIT_TEMP_UNREACHABLE
+            if result.reason == "unreachable"
+            else config.EXIT_TEMP_SIZE_LIMIT
+        )
+    return config.EXIT_SUCCESS
+
+
+def _is_restic_command(cmd) -> bool:
+    return bool(cmd) and (
+        cmd[0] == "restic"
+        or (
+            len(cmd) > 2
+            and cmd[1] == config.SUDO_EXEC
+            and cmd[2].startswith("restic-")
+        )
+    )
+
+
+def _summarize_restic_stderr(stderr: str, mount_point: Path) -> str:
+    """One line naming the top-level paths restic could not read.
+
+    A permission-denied walk can produce hundreds of lines. The operator needs
+    the directory that is unreadable, not every file beneath it. Wrapper lines
+    carry the recovery instruction, so pass them through unchanged.
+    """
+    root = str(mount_point).rstrip("/") + "/"
+    paths: dict[str, set[str]] = {}
+    other = 0
+    boundary: list[str] = []
+    for line in stderr.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("sudo-exec:"):
+            boundary.append(stripped)
+            continue
+        if "permission denied" not in line.lower():
+            if stripped:
+                other += 1
+            continue
+        match = re.search(re.escape(root) + r"([^:\s]+)", line)
+        if not match:
+            other += 1
+            continue
+        rel = match.group(1).rstrip("/")
+        top = rel.split("/", 1)[0]
+        key = f"{mount_point.name}/{top}" if top else mount_point.name
+        paths.setdefault(key, set()).add(rel)
+    if boundary:
+        return " ".join(boundary)
+    parts = [
+        f"{key} ({len(seen)} path{'s' if len(seen) != 1 else ''})"
+        for key, seen in sorted(paths.items())
+    ]
+    if parts:
+        return "lack permission to read " + ", ".join(parts)
+    if other:
+        return f"restic reported {other} error line{'s' if other != 1 else ''}"
+    return "restic failed"
 
 
 def check_password_file(repo: config.Repo) -> None:
@@ -562,19 +639,38 @@ class Runner:
 
     def run(self) -> Result:
         with config.job_log_context(self.job.name):
+            result: Result | None = None
             try:
-                return self._run_backup_phase()
+                result = self._run_backup_phase()
+                return result
             finally:
-                logger.info(f"--- Finished Job: {self.job.name} ---")
+                self._log_job_end(result)
+
+    def _log_job_end(self, result: Result | None) -> None:
+        status = read_status(self.state_file) or {}
+        reason = (
+            (result.reason if result and result.reason else None)
+            or status.get("message")
+            or "-"
+        )
+        logger.info(
+            f"JOB end "
+            f"status={result.status if result else 'failed'} "
+            f"rc={_job_exit_code(result)} "
+            f"reason={reason!r} "
+            f"snapshot={status.get('snapshot_name') or '-'} "
+            f"at={datetime.now(UTC).isoformat(timespec='seconds')}"
+        )
+        logger.debug(f"--- Finished Job: {self.job.name} ---")
 
     # --- command execution ---
 
-    def run_command(self, cmd, check=True, timeout=None):
+    def run_command(self, cmd, check=True, timeout=None, log_level=logging.INFO):
         """Single chokepoint for external commands; dry-run logs instead of running."""
         if self.dry_run:
-            logger.info(f"DRY-RUN: would execute: {' '.join(cmd)}")
+            logger.log(log_level, f"DRY-RUN: would execute: {' '.join(cmd)}")
             return subprocess.CompletedProcess(cmd, 0, "", "")
-        logger.info(f"CMD: {' '.join(cmd)}")
+        logger.log(log_level, f"CMD: {' '.join(cmd)}")
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, check=check, timeout=timeout
@@ -595,9 +691,16 @@ class Runner:
                             logger.warning(f"restic cache: {line.strip()}")
             return result
         except subprocess.CalledProcessError as e:
-            logger.error(
-                f"Command failed (rc={e.returncode}): {e.cmd} | stderr: {e.stderr}"
-            )
+            if _is_restic_command(cmd):
+                summary = _summarize_restic_stderr(
+                    e.stderr or "", self.mount_point
+                )
+                logger.error(f"Command failed (rc={e.returncode}): {summary}")
+                logger.debug(f"FULL STDERR: {e.stderr}")
+            else:
+                logger.error(
+                    f"Command failed (rc={e.returncode}): {e.cmd} | stderr: {e.stderr}"
+                )
             raise
 
     def _restic_cmd(self, subcommand, repo=None):
@@ -684,10 +787,12 @@ class Runner:
         cmd = [config.SUDO, config.SUDO_EXEC, "status", self.job.name]
         # A dry run never runs the query, so the empty stub stdout is not a failure.
         if self.dry_run:
-            logger.info(f"DRY-RUN: power-saving gate not evaluated: {' '.join(cmd)}")
+            logger.debug(f"DRY-RUN: power-saving gate not evaluated: {' '.join(cmd)}")
             return {}
         try:
-            result = self.run_command(cmd, timeout=config.REPO_CHECK_TIMEOUT)
+            result = self.run_command(
+                cmd, timeout=config.REPO_CHECK_TIMEOUT, log_level=logging.DEBUG
+            )
             data = json.loads(result.stdout)
             return data if isinstance(data, dict) else {}
         # The wrapper is optional; any failure disables one gate, never the run.
@@ -1035,6 +1140,10 @@ class Runner:
         if self._time_for_backup():
             if was_delayed:
                 self.delay.missed_slots += 1
+                logger.info(
+                    f"DELAY cleared; "
+                    f"missed_slots={self.delay.missed_slots}"
+                )
             self.delay.delayed = False
             self.delay.reason = None
             self.delay.protected_snapshot = None
@@ -1067,7 +1176,7 @@ class Runner:
             )
             return total_size
         except subprocess.CalledProcessError as e:
-            raise categorize_restic_error(e) from e
+            raise categorize_restic_error(e, mount_point) from e
         except (json.JSONDecodeError, IndexError) as e:
             logger.warning(f"Could not parse preflight output: {e}")
             return 0
@@ -1078,10 +1187,12 @@ class Runner:
         try:
             result = self.run_command(cmd)
         except subprocess.CalledProcessError as e:
-            raise categorize_restic_error(e) from e
+            raise categorize_restic_error(e, mount_point) from e
         if result.stderr and result.stderr.strip():
-            for line in result.stderr.strip().splitlines():
-                logger.warning(f"restic: {line}")
+            logger.warning(
+                f"restic: {_summarize_restic_stderr(result.stderr, self.mount_point)}"
+            )
+            logger.debug(f"restic stderr: {result.stderr.strip()}")
         summary = restic.find_summary(result.stdout)
         if summary is None:
             return None
@@ -1173,7 +1284,17 @@ class Runner:
             return Result(self.job.name, ResultStatus.DRY_RUN)
 
         self._update_repo_throughput(repo, total_size, backup_time)
+        released = self.delay.protected_snapshot
         self.delay.reset()
+        if released:
+            logger.info(
+                f"PROTECTED snapshot {released} released after successful backup"
+            )
+        if retry:
+            logger.info(
+                f"RETRY cleared snapshot={snapshot_name}; "
+                f"failed status replaced"
+            )
         self._bump_repo_size(repo, total_size)
 
         message = (
@@ -1241,16 +1362,25 @@ class Runner:
                     "skipped", "Previous backup failed but snapshot is gone"
                 )
                 return Result(self.job.name, ResultStatus.SKIPPED)
-            logger.info(f"Retrying failed backup for snapshot: {failed_name}")
+            logger.info(
+                f"JOB plan action=retry snapshot={failed_name}"
+            )
             return self._backup_snapshot(failed_path, retry=True)
 
         decision = self.decide()
 
         if decision.action == "delayed":
+            logger.info(
+                f"JOB plan action=delay reason={decision.reason}"
+            )
             self._delay(decision.reason)
             return Result(self.job.name, ResultStatus.DELAYED, reason=decision.reason)
 
         if decision.action == "skip":
+            logger.info(
+                f"JOB plan action=skip "
+                f"reason={decision.reason or 'not time for backup'}"
+            )
             self._write_status(
                 "skipped", (decision.reason or "not time for backup").capitalize()
             )
@@ -1258,14 +1388,18 @@ class Runner:
 
         snapshot_path = decision.snapshot or self._candidate_snapshot()
         if snapshot_path is None:
+            logger.info(
+                "JOB plan action=skip reason='no snapshot found'"
+            )
             self._write_status("skipped", "No snapshot found")
             return Result(self.job.name, ResultStatus.SKIPPED)
 
         # Never back up a snapshot younger than the safety floor; a graceful skip.
         if self._snapshot_too_young(snapshot_path):
             logger.info(
-                f"Deferring '{snapshot_path.name}': snapshot younger than "
-                f"{config.DEFAULT_SNAPSHOT_AGE_MIN}s; will retry on a later run."
+                f"JOB plan action=defer "
+                f"snapshot={snapshot_path.name} "
+                f"reason='younger than {config.DEFAULT_SNAPSHOT_AGE_MIN}s'"
             )
             self._write_status(
                 "skipped",
@@ -1275,9 +1409,14 @@ class Runner:
 
         # If the window closed between planning and execution, the slot is missed.
         if not self.within_backup_window():
+            logger.info("JOB plan action=skip reason='backup window closed'")
             self._write_status(
                 "skipped", "Backup window closed before backup could run"
             )
             return Result(self.job.name, ResultStatus.SKIPPED, timeout=True)
 
+        logger.info(
+            f"JOB plan action=backup "
+            f"snapshot={snapshot_path.name} source={self.mount_point}"
+        )
         return self._backup_snapshot(snapshot_path)

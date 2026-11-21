@@ -1184,6 +1184,28 @@ help too.
 flags `--reveal`, `-e/--exclude`, `--excludes-file`, `--price`, `--format`,
 `--json` and `--limit`, and points at the README section with worked examples.
 
+### Logging
+
+[[R-CLI-35]] A normal run logs, at INFO, a start line with the version, build
+timestamp, run id and job count, and an end line with the exit code, per-status
+counts, duration and UTC timestamp.
+
+[[R-CLI-36]] Each job logs, at INFO, a plan line naming the action (`backup`,
+`retry`, `skip`, `delay`, `defer`) and its snapshot or reason, and an end line
+with the status, the snap-bak exit code, the reason, the snapshot and a UTC
+timestamp. The job name comes from the `[job]` log context and is not repeated
+in the line. `snapshot=-` means no snapshot is attached to the outcome, as on a
+skip or a delay before selection; a backup, a failed retry and a defer name the
+snapshot.
+
+[[R-CLI-37]] A restic failure logs one high-level error line grouped by the
+top-level directory under the backup root, for example
+`lack permission to read home/jk (12 paths)`. The full stderr is logged at
+DEBUG.
+
+[[R-CLI-38]] Lock transitions and per-job status writes log at DEBUG. The
+version and build timestamp remain visible at INFO in the run start line.
+
 ### Exit codes
 
 [[R-CLI-28]] A verb's status reaches the process: `show` and `apply` exit with
@@ -1246,7 +1268,8 @@ deliberately NOT used because sudo-rs mishandles it. The wrapper:
   capability, and the mode is what keeps it to root and the service group.
   [[R-PRIV-10]] Exit codes: `0` ok, `2` self-update failed (existing binary
   retained, restricted and capable), `3` binary missing/unusable, `4`
-  restriction or setcap failed.
+  restriction or setcap failed, `5` the capability is absent or not effective
+  when a backup op starts; run `update-restic`.
 
 [[R-PRIV-11]] Because the wrapper derives paths from config at runtime, changing
 `mount_base` or `snapshot_dir` never requires editing sudoers.

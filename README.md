@@ -412,6 +412,9 @@ completed — never for skipped, dry-run, or failed runs. `never` leaves updates
 to you. Run it by hand anytime with
 `sudo /opt/snap-bak/sudo-exec.py update-restic`.
 
+Both backup ops check the capability before exec. If it is absent or not
+effective, the wrapper exits 5 and names `update-restic` as the recovery.
+
 ## Snapshot and Backup Flow
 
 snap-bak is the exclusive authority for both snapshot creation and backup execution.
@@ -969,7 +972,18 @@ State for a job removed from the config is deleted once it has been gone for
 `state_retention_days` (default 90). A job still in the config is never touched,
 and queued work is never discarded for being old.
 
-(Logs go to stderr — captured by the systemd journal. A file log is opt-in via `--log-file`.)
+(Logs go to stderr, captured by the systemd journal. A normal run opens with
+`Starting snap-bak <version> (build <time>)` and closes with `RUN end`, and each
+job logs a `JOB plan` and `JOB end` line. The job name is already in the `[job]`
+prefix, so the line does not repeat it. On `JOB end`, `snapshot=-` means no
+snapshot is attached to the outcome, as on a skip; a backup or a failed retry
+names the snapshot. Lock transitions and per-job status writes are at debug. A
+file log is opt-in via `--log-file`.
+
+The unit sets `SyslogIdentifier=snap-bak`, so `journalctl -u snap-bak -t snap-bak`
+shows snap-bak's lines and `-t sudo` shows sudo's audit lines. The sudo and PAM
+session lines cannot be suppressed per command by sudo-rs, so filter them in the
+query.)
 
 ### Lock file crash recovery
 
@@ -1028,9 +1042,9 @@ the journal, how to configure and edit a job safely — ships as a **skill**, so
 agent loads it only when it is working with backups rather than carrying it in
 every session.
 
-The skill is [`SKILL.md`](.opencode/skills/snap-bak/SKILL.md), with the full
+The skill is [`SKILL.md`](skills/snap-bak/SKILL.md), with the full
 config and flag tables in
-[`references/reference.md`](.opencode/skills/snap-bak/references/reference.md).
+[`references/reference.md`](skills/snap-bak/references/reference.md).
 It is plain markdown with no dependency on this repository, so it can be
 installed from a clone, from a mirror, or by pasting it into an agent's context.
 
@@ -1041,7 +1055,7 @@ your global skills directory to use it from anywhere:
 
 ```bash
 mkdir -p ~/.config/opencode/skills
-cp -r .opencode/skills/snap-bak ~/.config/opencode/skills/
+cp -r skills/snap-bak ~/.config/opencode/skills/
 ```
 
 **From a URL** — the better route once the repo is public:
@@ -1049,12 +1063,12 @@ cp -r .opencode/skills/snap-bak ~/.config/opencode/skills/
 ```bash
 # opencode
 hermes skills install \
-  https://raw.githubusercontent.com/JeffKwasha/snap-bak/main/.opencode/skills/snap-bak/SKILL.md
+  https://raw.githubusercontent.com/JeffKwasha/snap-bak/main/skills/snap-bak/SKILL.md
 
 # Hermes, into the category you want (Hermes loads from ~/.hermes/skills/)
 mkdir -p ~/.hermes/skills/devops
 curl -fsSL -o ~/.hermes/skills/devops/snap-bak-SKILL.md \
-  https://raw.githubusercontent.com/JeffKwasha/snap-bak/main/.opencode/skills/snap-bak/SKILL.md
+  https://raw.githubusercontent.com/JeffKwasha/snap-bak/main/skills/snap-bak/SKILL.md
 ```
 
 The raw URL 404s while the repo is private — use the clone route until it is
@@ -1065,6 +1079,13 @@ self-contained and deliberately short.
 
 Confirm with `/skills list`, load it with `/snap-bak`. Installed skills apply to
 new sessions; `/reset` picks one up in the current one.
+
+A second skill,
+[`snap-bak-watch`](skills/snap-bak-watch/SKILL.md), is for a periodic
+watcher. It reads the capability, the log and the state files, separates hard
+failures from soft drift, and states when to notify an operator. Install it the
+same way by copying `skills/snap-bak-watch` into the global skills
+directory. It is short enough to load on every tick.
 
 ### What the agent is told to do
 
