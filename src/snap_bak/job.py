@@ -515,14 +515,20 @@ def _summarize_restic_stderr(stderr: str, mount_point: Path) -> str:
     """One line naming the top-level paths restic could not read.
 
     A permission-denied walk can produce hundreds of lines. The operator needs
-    the directory that is unreadable, not every file beneath it.
+    the directory that is unreadable, not every file beneath it. Wrapper lines
+    carry the recovery instruction, so pass them through unchanged.
     """
     root = str(mount_point).rstrip("/") + "/"
     paths: dict[str, set[str]] = {}
     other = 0
+    boundary: list[str] = []
     for line in stderr.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("sudo-exec:"):
+            boundary.append(stripped)
+            continue
         if "permission denied" not in line.lower():
-            if line.strip():
+            if stripped:
                 other += 1
             continue
         match = re.search(re.escape(root) + r"([^:\s]+)", line)
@@ -533,6 +539,8 @@ def _summarize_restic_stderr(stderr: str, mount_point: Path) -> str:
         top = rel.split("/", 1)[0]
         key = f"{mount_point.name}/{top}" if top else mount_point.name
         paths.setdefault(key, set()).add(rel)
+    if boundary:
+        return " ".join(boundary)
     parts = [
         f"{key} ({len(seen)} path{'s' if len(seen) != 1 else ''})"
         for key, seen in sorted(paths.items())

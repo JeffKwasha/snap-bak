@@ -78,6 +78,17 @@ class TestCategorize:
     def _err(self, rc):
         return subprocess.CalledProcessError(rc, "restic", output="", stderr="boom")
 
+    def test_wrapper_recovery_text_reaches_the_status_reason(self):
+        stderr = (
+            "sudo-exec: /usr/local/bin/restic has no effective "
+            "cap_dac_read_search (absent); run update-restic\n"
+        )
+        err = categorize_restic_error(
+            subprocess.CalledProcessError(5, "restic", stderr=stderr),
+            Path("/mnt/bak/home"),
+        )
+        assert "run update-restic" in str(err)
+
     def test_permission_errors_are_summarized(self):  # [[R-CLI-37]]
         stderr = "\n".join(
             [
