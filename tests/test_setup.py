@@ -2,6 +2,7 @@
 
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -83,6 +84,18 @@ def test_update_line_is_time_version_commit():
     assert setup.update_line("c0ffee", "0.6.0", "2026-11-18T00:00:00Z") == (
         "2026-11-18T00:00:00Z 0.6.0 c0ffee"
     )
+
+
+def test_package_version_matches_lockfile():
+    root = Path(__file__).resolve().parents[1]
+    spec = re.search(
+        r'^version = "([^"]+)"', (root / "pyproject.toml").read_text(), re.MULTILINE
+    )
+    lock = re.search(
+        r'name = "snap-bak"\nversion = "([^"]+)"', (root / "uv.lock").read_text()
+    )
+    assert spec is not None and lock is not None
+    assert spec.group(1) == lock.group(1)
 
 
 def make_repo(path):
