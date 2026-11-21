@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from conftest import install_fake_restic, resolved_job
 
 from snap_bak import __version__, config
 from snap_bak import job as job_mod
@@ -568,6 +569,41 @@ class TestWrapperResticOps:
         commands = self._record(runner)
         runner.prune()
         assert commands == [[config.SUDO, config.SUDO_EXEC, "restic-prune", "j"]]
+
+
+class TestFakeResticHarness:
+    """The fake behaves as a working restic, so callers can be tested fast."""
+
+    def test_read_only_queries_succeed_without_a_real_repo(  # [[R-PRIV-23]]
+        self, monkeypatch, tmp_path
+    ):
+        fake = install_fake_restic(tmp_path, monkeypatch)
+        rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=[])
+        runner = job_mod.Runner(rj)
+
+        assert runner.repo_ping() is None
+        assert runner.repo_snapshots() == []
+        assert runner.repo_listing("f" * 64) == []
+
+        subcommands = [r["argv"][3] for r in fake.records()]
+        assert subcommands == ["cat", "snapshots", "ls"]
+
+    def test_scenario_supplies_repository_data(  # [[R-PRIV-23]]
+        self, monkeypatch, tmp_path
+    ):
+        fake = install_fake_restic(tmp_path, monkeypatch)
+        fake.scenario(
+            snapshots=[{"id": "a" * 64, "short_id": "abc", "tags": ["Test"]}],
+            listing=[
+                "-rw-r--r-- 0 0 4 2026-01-01 00:00 /bak/Test/keep.txt",
+            ],
+        )
+        rj, _src, _repo = resolved_job(tmp_path, monkeypatch, excludes_list=[])
+        runner = job_mod.Runner(rj)
+
+        assert runner.repo_snapshots()[0]["short_id"] == "abc"
+        listing = runner.repo_listing("a" * 64)
+        assert listing == [("/bak/Test/keep.txt", 4, False)]
 
 
 class TestLogSummary:

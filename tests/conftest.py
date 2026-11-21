@@ -163,6 +163,38 @@ def direct_rewrite_cmd(runner, snapshot_ids):
     )
 
 
+def install_fake_restic(tmp_path, monkeypatch):
+    """Put the fake restic on PATH with a writable cache.
+
+    Returns a helper with a `scenario` setter and a `records` reader. The fake
+    answers as a working restic would; a scenario only supplies repository
+    data, never restic's decisions.
+    """
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "restic"
+    fake.write_text((pathlib.Path(__file__).parent / "fake_restic.py").read_text())
+    fake.chmod(0o755)
+    cache = tmp_path / "fake-cache"
+    cache.mkdir()
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("RESTIC_CACHE_DIR", str(cache))
+
+    class FakeRestic:
+        @staticmethod
+        def scenario(**data):
+            (cache / "fake-restic-scenario.json").write_text(json.dumps(data))
+
+        @staticmethod
+        def records():
+            return [
+                json.loads(path.read_text())
+                for path in sorted(cache.glob("fake-restic-*.json"))
+            ]
+
+    return FakeRestic
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     """Print the taxonomy counts; commit messages carry them forward."""
     from taxonomy import counts
