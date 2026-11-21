@@ -98,6 +98,7 @@ RESTIC_OPS = frozenset(
 RESTIC_TIMEOUT_ENV = "SNAPBAK_RESTIC_TIMEOUT"
 RESTIC_GRACE_SECONDS = 30
 RESTIC_TIMEOUT_S = 30
+EXIT_RESTIC_MISSING = 3
 EXIT_RESTIC_CAPABILITY = 5
 
 
@@ -571,6 +572,11 @@ def _tagged_snapshot_ids(rj) -> set[str]:
 
 def _require_restic_capability() -> None:
     """Refuse a backup op unless restic can read root-owned snapshot files."""
+    if not Path(RESTIC).is_file():
+        _exit_err(
+            f"{RESTIC} is missing; install restic or run update-restic",
+            code=EXIT_RESTIC_MISSING,
+        )
     state = restic.read_capability(RESTIC)
     if state is not restic.CapabilityState.EFFECTIVE:
         _exit_err(

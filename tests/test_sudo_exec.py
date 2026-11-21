@@ -785,6 +785,13 @@ class TestCapabilityPreflight:
     def test_code_is_named_and_distinct(self):  # [[R-PRIV-10]]
         assert io.EXIT_RESTIC_CAPABILITY == 5
         assert io.EXIT_RESTIC_CAPABILITY not in (1, 2, 3, 4)
+        assert io.EXIT_RESTIC_MISSING == 3
+
+    def test_missing_binary_exits_three(self, monkeypatch, tmp_path):  # [[R-PRIV-10]]
+        monkeypatch.setattr(io, "RESTIC", str(tmp_path / "missing"))
+        with pytest.raises(SystemExit) as exc:
+            io._require_restic_capability()
+        assert exc.value.code == io.EXIT_RESTIC_MISSING
 
     def test_both_backup_ops_call_preflight(  # [[R-PRIV-16]]
         self, monkeypatch, tmp_path
