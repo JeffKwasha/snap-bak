@@ -720,12 +720,12 @@ class TestResticOps:
             def wait(self, timeout=None):
                 waits.append(timeout)
                 if len(waits) == 1:
-                    raise subprocess.TimeoutExpired("restic", timeout)
+                    raise subprocess.TimeoutExpired("restic", 5)
                 return 0
 
         monkeypatch.setattr(io.subprocess, "Popen", lambda *a, **k: FakeProc())
         monkeypatch.setattr(io, "_service_ids", lambda: (1000, 1000))
-        monkeypatch.setattr(io, "_restic_env", lambda: {})
+        monkeypatch.setattr(io, "_restic_env", dict)
         monkeypatch.setattr(io, "_restic_timeout", lambda: 5)
         monkeypatch.setattr(
             io.os, "killpg", lambda pid, sig: calls.append((pid, sig))
