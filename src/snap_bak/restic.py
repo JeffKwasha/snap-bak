@@ -8,7 +8,9 @@ This module STAYS dependency-free. It MUST NOT be writable by non-root users.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable, Sequence
+from enum import Enum
 
 # Default graceful-timeout options applied to EVERY restic subcommand.
 #
@@ -250,3 +252,37 @@ def find_summary(stdout: str, message_type: str = "summary") -> dict | None:
         if isinstance(obj, dict) and obj.get("message_type") == message_type:
             return obj
     return None
+
+
+# --- file capability parsing ---
+# File capabilities live in a VFS capability struct in the security.capability
+# xattr. A name-only match is not enough: a bounding-only value would pass and
+# reproduce a partial walk over files the process cannot read.
+
+CAP_DAC_READ_SEARCH = 2
+_VFS_CAP_FLAGS_EFFECTIVE = 0x000001
+_VFS_CAP_REVISION_MASK = 0xFF000000
+
+
+class CapabilityState(Enum):
+    ABSENT = "absent"
+    INEFFECTIVE = "ineffective"
+    EFFECTIVE = "effective"
+
+
+def read_capability(path: str) -> CapabilityState:
+    """Return the effective state of cap_dac_read_search on a binary."""
+    try:
+        raw = os.getxattr(path, "security.capability")
+    except OSError:
+        return CapabilityState.ABSENT
+    if len(raw) < 8:
+        return CapabilityState.ABSENT
+    magic = int.from_bytes(raw[0:4], "little")
+    permitted = int.from_bytes(raw[4:8], "little")
+    if not permitted & (1 << CAP_DAC_READ_SEARCH):
+        return CapabilityState.ABSENT
+    flags = magic & ~_VFS_CAP_REVISION_MASK
+    if flags & _VFS_CAP_FLAGS_EFFECTIVE:
+        return CapabilityState.EFFECTIVE
+    return CapabilityState.INEFFECTIVE

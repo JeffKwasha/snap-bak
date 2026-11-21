@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from snap_bak import config
+from snap_bak import config, restic
 
 _WRAPPER_PATH = Path(__file__).parent.parent / "src" / "sudo-exec.py"
 _loader = importlib.machinery.SourceFileLoader("sudo_exec", str(_WRAPPER_PATH))
@@ -732,3 +732,67 @@ class TestResticOps:
         )
         io._run_restic(["restic", "cat", "config"])
         assert calls == [(4242, io.signal.SIGTERM)]
+
+
+class TestCapabilityPreflight:
+    def _rj(self, tmp_path):
+        cfg = config.Config.load(_write_config(tmp_path))
+        rj = cfg.get("home")
+        assert rj is not None
+        return rj
+
+    def test_parse_distinguishes_three_states(self, monkeypatch):  # [[R-PRIV-16]]
+        effective = (
+            bytes.fromhex("01000002") + bytes.fromhex("04000000") + b"\x00" * 12
+        )
+        ineffective = (
+            bytes.fromhex("00000002") + bytes.fromhex("04000000") + b"\x00" * 12
+        )
+
+        monkeypatch.setattr(restic.os, "getxattr", lambda p, n: effective)
+        assert restic.read_capability("x") is restic.CapabilityState.EFFECTIVE
+
+        monkeypatch.setattr(restic.os, "getxattr", lambda p, n: ineffective)
+        assert restic.read_capability("x") is restic.CapabilityState.INEFFECTIVE
+
+        def missing(path, name):
+            raise OSError("no such attribute")
+
+        monkeypatch.setattr(restic.os, "getxattr", missing)
+        assert restic.read_capability("x") is restic.CapabilityState.ABSENT
+
+    @pytest.mark.parametrize(
+        "state",
+        [restic.CapabilityState.ABSENT, restic.CapabilityState.INEFFECTIVE],
+    )
+    def test_preflight_refuses_with_the_named_code(  # [[R-PRIV-10]]
+        self, monkeypatch, capsys, state
+    ):
+        monkeypatch.setattr(io.restic, "read_capability", lambda p: state)
+        with pytest.raises(SystemExit) as exc:
+            io._require_restic_capability()
+        assert exc.value.code == io.EXIT_RESTIC_CAPABILITY
+        assert "update-restic" in capsys.readouterr().err
+
+    def test_preflight_accepts_effective(self, monkeypatch):  # [[R-PRIV-16]]
+        monkeypatch.setattr(
+            io.restic,
+            "read_capability",
+            lambda p: restic.CapabilityState.EFFECTIVE,
+        )
+        io._require_restic_capability()
+
+    def test_code_is_named_and_distinct(self):  # [[R-PRIV-10]]
+        assert io.EXIT_RESTIC_CAPABILITY == 5
+        assert io.EXIT_RESTIC_CAPABILITY not in (3, 4)
+
+    def test_both_backup_ops_call_preflight(  # [[R-PRIV-16]]
+        self, monkeypatch, tmp_path
+    ):
+        rj = self._rj(tmp_path)
+        calls = []
+        monkeypatch.setattr(io, "_require_restic_capability", lambda: calls.append(1))
+        monkeypatch.setattr(io, "_run_restic", lambda cmd, **kw: None)
+        io._op_restic_backup(rj, dry_run=False)
+        io._op_restic_backup(rj, dry_run=True)
+        assert len(calls) == 2
