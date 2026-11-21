@@ -600,6 +600,11 @@ class TestResticOps:
         monkeypatch.setattr(
             io, "_run_restic", lambda cmd, **kw: calls.append((cmd, kw))
         )
+        monkeypatch.setattr(
+            io.restic,
+            "read_capability",
+            lambda path: io.restic.CapabilityState.EFFECTIVE,
+        )
         return calls
 
     def test_backup_derives_repo_mount_tag_and_json(self, tmp_path, monkeypatch):
