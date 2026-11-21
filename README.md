@@ -412,6 +412,9 @@ completed — never for skipped, dry-run, or failed runs. `never` leaves updates
 to you. Run it by hand anytime with
 `sudo /opt/snap-bak/sudo-exec.py update-restic`.
 
+Both backup ops check the capability before exec. If it is absent or not
+effective, the wrapper exits 5 and names `update-restic` as the recovery.
+
 ## Snapshot and Backup Flow
 
 snap-bak is the exclusive authority for both snapshot creation and backup execution.

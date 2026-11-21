@@ -1268,7 +1268,8 @@ deliberately NOT used because sudo-rs mishandles it. The wrapper:
   capability, and the mode is what keeps it to root and the service group.
   [[R-PRIV-10]] Exit codes: `0` ok, `2` self-update failed (existing binary
   retained, restricted and capable), `3` binary missing/unusable, `4`
-  restriction or setcap failed.
+  restriction or setcap failed, `5` the capability is absent or not effective
+  when a backup op starts; run `update-restic`.
 
 [[R-PRIV-11]] Because the wrapper derives paths from config at runtime, changing
 `mount_base` or `snapshot_dir` never requires editing sudoers.
