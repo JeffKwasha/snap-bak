@@ -91,11 +91,9 @@ class TestCategorize:
         assert "run update-restic" in str(err)
 
     def test_permission_errors_are_summarized(self):  # [[R-CLI-37]]
-        stderr = "\n".join(
-            [
-                "error: open /mnt/bak/home/jk/a: permission denied",
-                "error: open /mnt/bak/home/jk/b: permission denied",
-            ]
+        stderr = (
+            "error: open /mnt/bak/home/jk/a: permission denied\n"
+            "error: open /mnt/bak/home/jk/b: permission denied"
         )
         err = categorize_restic_error(
             subprocess.CalledProcessError(3, "restic", stderr=stderr),
@@ -608,13 +606,11 @@ class TestFakeResticHarness:
 
 class TestLogSummary:
     def test_summarizes_permission_denials_by_top_directory(self, tmp_path):  # [[R-CLI-37]]
-        stderr = "\n".join(
-            [
-                "error: open /mnt/bak/home/jk/a: permission denied",
-                "error: open /mnt/bak/home/jk/b: permission denied",
-                "error: open /mnt/bak/home/claude/snap: permission denied",
-                "error: something else",
-            ]
+        stderr = (
+            "error: open /mnt/bak/home/jk/a: permission denied\n"
+            "error: open /mnt/bak/home/jk/b: permission denied\n"
+            "error: open /mnt/bak/home/claude/snap: permission denied\n"
+            "error: something else"
         )
         summary = job_mod._summarize_restic_stderr(stderr, Path("/mnt/bak/home"))
         assert summary == (
