@@ -104,6 +104,13 @@ prune and forget. snap-bak uses one credential per repo today, so a compromised
 service process can prune. Splitting the credentials is a repo-schema change and
 is not part of 0.7.0.
 
+Arbitrary code execution in the service process is out of scope for this design.
+If it enters the threat model, the direct-exec path becomes real. The service
+group can run the capable binary itself, and no wrapper hardening stops it.
+Closing that path needs the binary removed from the service group's execute set,
+which means root execution or ambient capabilities. Record this as a potential
+future item, not a defect in the wrapper.
+
 ## Verification
 
 Unit tests import the wrapper and assert each op's derived argv, the refusal of
