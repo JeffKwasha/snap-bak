@@ -13,6 +13,15 @@ never pass arbitrary paths to btrfs/mount. Accepted operations:
   sudo-exec.py status       <job>        -> pool disk state + subvolume generations (JSON)
   sudo-exec.py update-restic             -> validate + self-update + setcap
 
+  sudo-exec.py restic-backup <job>             -> restic backup (mutating)
+  sudo-exec.py restic-backup-dry-run <job>     -> restic backup --dry-run
+  sudo-exec.py restic-forget <job>             -> restic forget --tag + retention
+  sudo-exec.py restic-prune <job>              -> restic prune
+  sudo-exec.py restic-rewrite <job> <id>...    -> restic rewrite --forget
+
+  The restic ops build the command from the root-owned config and drop to the
+  service user before exec. Restic never runs as root.
+
   Mount points live at <mount_base>/<source_subvolume final component>
   (e.g. /mnt/data -> /mnt/bak/data), always derived from the source
   subvolume's last path component — never configurable. Snapshots are bound
@@ -43,13 +52,16 @@ mount points; the JSONC handling lives in exactly one place.
 import grp
 import json
 import os
+import pwd
+import re
+import signal
 import stat
 import subprocess
 import sys
 from pathlib import Path
 from typing import NoReturn
 
-from snap_bak import config, snapshot
+from snap_bak import config, restic, snapshot
 
 CONFIG_PATH = "/opt/snap-bak/config.json"
 
@@ -70,8 +82,22 @@ RESTIC = "/usr/local/bin/restic"
 SETCAP = "/usr/sbin/setcap"
 CHGRP = "/usr/bin/chgrp"
 CHMOD = "/usr/bin/chmod"
+SERVICE_USER = "snap-bak"
 SERVICE_GROUP = "snap-bak"
 _PROC_PATH = "/proc"
+
+RESTIC_OPS = frozenset(
+    {
+        "restic-backup",
+        "restic-backup-dry-run",
+        "restic-forget",
+        "restic-prune",
+        "restic-rewrite",
+    }
+)
+RESTIC_TIMEOUT_ENV = "SNAPBAK_RESTIC_TIMEOUT"
+RESTIC_GRACE_SECONDS = 30
+RESTIC_TIMEOUT_S = 30
 
 
 def _restic_running() -> bool:
@@ -408,11 +434,218 @@ def _update_restic() -> None:
         )
 
 
+# --- restic ops (mutating only) ---
+# The service process may ask for these by job name. Every argument that decides
+# what is read, where it goes, and how retention is applied comes from the
+# root-owned config; the caller supplies only the job name, and for rewrite the
+# snapshot ids, which are validated against the job's tagged snapshots first.
+
+
+def _service_ids() -> tuple[int, int]:
+    """uid/gid to drop to before exec, so restic never runs as root."""
+    try:
+        pw = pwd.getpwnam(SERVICE_USER)
+        gr = grp.getgrnam(SERVICE_GROUP)
+    except KeyError as e:
+        _exit_err(f"service user or group missing: {e}", code=4)
+    return pw.pw_uid, gr.gr_gid
+
+
+def _restic_env() -> dict[str, str]:
+    """Explicit environment for restic after sudo-rs resets the caller's.
+
+    rclone discovers its config through HOME, the shared cache is under the
+    install, and rclone lives in /usr/local/bin. A root-run restic would read
+    /root instead of the service home without these.
+    """
+    install = Path(CONFIG_PATH).parent
+    return {
+        "HOME": str(install),
+        "RCLONE_CONFIG": str(install / ".config" / "rclone" / "rclone.conf"),
+        "RESTIC_CACHE_DIR": str(install / "cache"),
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+    }
+
+
+def _restic_timeout() -> float | None:
+    raw = os.environ.get(RESTIC_TIMEOUT_ENV)
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        _exit_err(f"{RESTIC_TIMEOUT_ENV} must be seconds, got {raw!r}", code=2)
+
+
+def _signal_group(pid: int, sig: int) -> None:
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def _run_restic(cmd: list[str]) -> None:
+    """Run restic as the service user in its own process group.
+
+    The wrapper is root, but restic must not be: the capability, not uid 0,
+    reads the snapshot. A new session lets a timeout wind down restic and every
+    child it spawned, instead of leaving a root-owned grandchild alive with a
+    repository lock or a mount.
+    """
+    print("sudo-exec CMD: " + " ".join(cmd), file=sys.stderr)
+    uid, gid = _service_ids()
+    proc = subprocess.Popen(
+        cmd,
+        env=_restic_env(),
+        user=uid,
+        group=gid,
+        extra_groups=[],
+        start_new_session=True,
+    )
+    try:
+        rc = proc.wait(timeout=_restic_timeout())
+    except subprocess.TimeoutExpired:
+        _signal_group(proc.pid, signal.SIGTERM)
+        try:
+            rc = proc.wait(timeout=RESTIC_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            _signal_group(proc.pid, signal.SIGKILL)
+            rc = proc.wait()
+    if rc != 0:
+        sys.exit(rc)
+
+
+def _restic_build(rj, subcommand: str, **kwargs) -> list[str]:
+    """One command line from the same builder the service process uses.
+
+    Importing `restic` keeps the option classification in one place; the
+    wrapper's docstring forbids only `job` and `cli`, which reach back into the
+    service process.
+    """
+    cmd = restic.build(
+        subcommand,
+        repo_path=rj.repo.path,
+        password_file=rj.repo.password_file,
+        options=list(rj.repo.restic_options) + list(rj.job.restic_options),
+        warn=lambda opt: print(
+            f"sudo-exec: restic_options contains reserved flag {opt!r}; ignoring it",
+            file=sys.stderr,
+        ),
+        **kwargs,
+    )
+    cmd[0] = RESTIC
+    return cmd
+
+
+def _tagged_snapshot_ids(rj) -> set[str]:
+    """IDs of this job's tagged snapshots, for rewrite validation."""
+    cmd = _restic_build(rj, "snapshots") + ["--json", "--tag", rj.tag]
+    uid, gid = _service_ids()
+    try:
+        out = subprocess.run(
+            cmd,
+            env=_restic_env(),
+            user=uid,
+            group=gid,
+            extra_groups=[],
+            start_new_session=True,
+            capture_output=True,
+            text=True,
+            timeout=RESTIC_TIMEOUT_S,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        # Keep restic's code: 10/11/12 are the retryable repo states.
+        _exit_err(f"could not read tagged snapshots: {e}", code=e.returncode)
+    except subprocess.TimeoutExpired as e:
+        _exit_err(f"could not read tagged snapshots: {e}")
+    try:
+        data = json.loads(out.stdout or "[]")
+    except ValueError as e:
+        _exit_err(f"unparseable snapshots output: {e}")
+    if not isinstance(data, list):
+        _exit_err("expected a JSON list from restic snapshots")
+    return {str(s.get("id", "")) for s in data if s.get("id")}
+
+
+def _op_restic_backup(rj, *, dry_run: bool) -> None:
+    cmd = _restic_build(
+        rj,
+        "backup",
+        exclude_file=rj.job.ignore_file or None,
+        excludes=rj.job.excludes,
+    )
+    cmd.extend([str(rj.mount_point), "--tag", rj.tag, "--json"])
+    if dry_run:
+        cmd.append("--dry-run")
+    _run_restic(cmd)
+
+
+def _op_restic_forget(rj) -> None:
+    if not rj.job.backup_retention:
+        _exit_err("restic-forget requires backup_retention in config")
+    cmd = _restic_build(rj, "forget")
+    cmd.extend(["--tag", rj.tag])
+    for key, val in rj.job.backup_retention.items():
+        cmd.extend([f"--keep-{key}", str(val)])
+    _run_restic(cmd)
+
+
+def _op_restic_prune(rj) -> None:
+    _run_restic(_restic_build(rj, "prune"))
+
+
+def _op_restic_rewrite(rj, ids: list[str]) -> None:
+    if not ids:
+        _exit_err("restic-rewrite requires at least one snapshot id")
+    for sid in ids:
+        if not re.fullmatch(r"[0-9a-f]{8,64}", sid):
+            _exit_err(f"invalid snapshot id: {sid!r}")
+    known = _tagged_snapshot_ids(rj)
+    unknown = [sid for sid in ids if not any(k.startswith(sid) for k in known)]
+    if unknown:
+        _exit_err(f"snapshot id not tagged {rj.tag}: {', '.join(unknown)}")
+    cmd = _restic_build(
+        rj,
+        "rewrite",
+        exclude_file=rj.job.ignore_file or None,
+        excludes=rj.job.excludes,
+        forget=True,
+        extra_args=ids,
+    )
+    _run_restic(cmd)
+
+
+def _op_restic(op: str, rj, args: list[str]) -> None:
+    if op == "restic-backup":
+        if args:
+            _exit_err("restic-backup takes: <job>")
+        _op_restic_backup(rj, dry_run=False)
+    elif op == "restic-backup-dry-run":
+        if args:
+            _exit_err("restic-backup-dry-run takes: <job>")
+        _op_restic_backup(rj, dry_run=True)
+    elif op == "restic-forget":
+        if args:
+            _exit_err("restic-forget takes: <job>")
+        _op_restic_forget(rj)
+    elif op == "restic-prune":
+        if args:
+            _exit_err("restic-prune takes: <job>")
+        _op_restic_prune(rj)
+    elif op == "restic-rewrite":
+        _op_restic_rewrite(rj, args)
+    else:
+        _exit_err(f"unknown operation: {op}")
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         _exit_err(
             "usage: sudo-exec.py "
-            "<snapshot|delete|mount|umount|status|update-restic> <job> [name]"
+            "<snapshot|delete|mount|umount|status|update-restic|"
+            "restic-backup|restic-backup-dry-run|restic-forget|restic-prune|"
+            "restic-rewrite> <job> [args]"
         )
     op = sys.argv[1]
 
@@ -428,6 +661,10 @@ def main() -> None:
     if rj is None:
         _exit_err(f"unknown job: {job_name}")
     job = rj.job
+
+    if op in RESTIC_OPS:
+        _op_restic(op, rj, sys.argv[3:])
+        return
 
     if op == "status":
         if len(sys.argv) != 3:

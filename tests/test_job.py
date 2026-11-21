@@ -506,3 +506,41 @@ class TestGlobalLockLog:
         assert job_mod._build_time() == expected
         job_mod._build_time.cache_clear()
         job_mod._program_mtime.cache_clear()
+
+
+class TestWrapperResticOps:
+    def _record(self, runner):
+        commands = []
+        runner.dry_run = False
+        runner.run_command = lambda cmd, **kw: (
+            commands.append(cmd)
+            or types.SimpleNamespace(stdout="", stderr="", returncode=0)
+        )
+        return commands
+
+    def test_preflight_asks_the_wrapper(self, monkeypatch, tmp_path):
+        runner = _runner(monkeypatch, tmp_path)
+        commands = self._record(runner)
+        runner._preflight(tmp_path / "mnt")
+        assert commands == [
+            [config.SUDO, config.SUDO_EXEC, "restic-backup-dry-run", "j"]
+        ]
+
+    def test_backup_asks_the_wrapper(self, monkeypatch, tmp_path):
+        runner = _runner(monkeypatch, tmp_path)
+        commands = self._record(runner)
+        runner._backup(tmp_path / "mnt")
+        assert commands == [[config.SUDO, config.SUDO_EXEC, "restic-backup", "j"]]
+
+    def test_forget_asks_the_wrapper(self, monkeypatch, tmp_path):
+        runner = _runner(monkeypatch, tmp_path)
+        runner.job.backup_retention = {"daily": 1}
+        commands = self._record(runner)
+        runner._forget_only()
+        assert commands == [[config.SUDO, config.SUDO_EXEC, "restic-forget", "j"]]
+
+    def test_prune_asks_the_wrapper(self, monkeypatch, tmp_path):
+        runner = _runner(monkeypatch, tmp_path)
+        commands = self._record(runner)
+        runner.prune()
+        assert commands == [[config.SUDO, config.SUDO_EXEC, "restic-prune", "j"]]
