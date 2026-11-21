@@ -1166,6 +1166,24 @@ since they name sources apply never removes files from. So are
 `--excludes-file`, `-e`, `--reveal`, `--reveal-file` and `--price`, since a trial
 or survey rule set must never drive a rewrite of real backups.
 
+### Help
+
+[[R-CLI-31]] The top-level `--help` names `show excludes` and `apply excludes`
+with one line each in the words a request would use: inspect what the rules
+match, and remove matching files from snapshots already in the repo.
+
+[[R-CLI-32]] Each excludes subcommand's `--help` opens with the task, not the
+mechanism: what the rules match for `show`, and removing matching files from
+stored snapshots for `apply`.
+
+[[R-CLI-33]] Every excludes option's help says what question it answers, not
+only how it works. The positional object, `-c/--config` and `-j/--job` carry
+help too.
+
+[[R-CLI-34]] The top-level help names the verbs and the mechanism-changing
+flags `--reveal`, `-e/--exclude`, `--excludes-file`, `--price`, `--format`,
+`--json` and `--limit`, and points at the README section with worked examples.
+
 ### Exit codes
 
 [[R-CLI-28]] A verb's status reaches the process: `show` and `apply` exit with
@@ -1252,15 +1270,46 @@ Invariants snap-bak must never breach:
    `cap_dac_read_search=+ep` and is `root:snap-bak 0750`, so only root and the
    service group can run it. That capability reads any file, so execution is the
    boundary: the wrapper restricts the mode *before* it hands out the capability,
-   and a failure at either step leaves no capable binary others can run.
+   and a failure at either step leaves no capable binary others can run. The
+   wrapper builds every mutating invocation (R-PRIV-18); a read-only query may
+   still invoke the binary directly (R-PRIV-23).
    — [file capabilities](https://restic.readthedocs.io/en/stable/080_examples.html#using-file-capabilities)
 
 [[R-PRIV-17]] restic does not run as root. It runs as the service user, and the
 capability is what lets it read the root-owned snapshot mount, whose files keep
-their original owners and modes. snap-bak invokes restic itself, deriving the
-source and repository from the root-owned config, so the paths it backs up come
-from a trusted file even though the process is unprivileged; the wrapper is not
-in that path.
+their original owners and modes. The root-owned wrapper builds every mutating
+invocation (backup, backup dry run, forget, prune, rewrite) from the root-owned
+config, then drops to the service user before exec, so the repository, password
+file, source path, tag and options come from a trusted file. Read-only repo
+queries (`cat config`, `stats`, `snapshots`, `ls`) still run in the service
+process, because they need no snapshot read and their password file is already
+service-readable.
+
+[[R-PRIV-18]] Every mutating restic invocation is built inside `sudo-exec.py`
+from the root-owned config. No service-side code assembles a `backup`, `forget`,
+`prune` or `rewrite` command line.
+
+[[R-PRIV-19]] The wrapper exposes one allowlisted op per mutating subcommand:
+`restic-backup`, `restic-backup-dry-run`, `restic-forget`, `restic-prune` and
+`restic-rewrite`. Unknown ops and extra arguments are refused.
+
+[[R-PRIV-20]] The wrapper derives the repository path, password file, source
+mount point, tag and `restic_options` from config. A caller supplies only the job
+name, and for `restic-rewrite` the snapshot IDs, which the wrapper validates
+against the job's tagged snapshots before `--forget` deletes originals.
+
+[[R-PRIV-21]] Restic keeps `cap_dac_read_search=+ep` and `root:snap-bak 0750`.
+The wrapper drops to the service user before exec, so restic never runs as root.
+The sudoers rule stays a single bare command name.
+
+[[R-PRIV-22]] A wrapped restic run has an explicit environment (`HOME`,
+`RCLONE_CONFIG`, `RESTIC_CACHE_DIR`, `PATH`) and its own process group. On
+timeout the wrapper signals the group and waits for a graceful exit before a
+force signal.
+
+[[R-PRIV-23]] Read-only repo queries that do not read the mounted snapshot stay
+in the service process. They keep the service-readable password file and the
+existing query timeouts.
 
 ---
 

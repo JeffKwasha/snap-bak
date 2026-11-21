@@ -24,7 +24,14 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from conftest import backup, init_repo, resolved_job, restic, stored_files
+from conftest import (
+    backup,
+    direct_rewrite_cmd,
+    init_repo,
+    resolved_job,
+    restic,
+    stored_files,
+)
 
 from snap_bak import apply, config, excludes, job, todo
 
@@ -165,9 +172,8 @@ class TestPlan:
             listings={"id0": _cache_listing(), "id1": _cache_listing()},
         )
         cmd = list(apply.plan(runner).command)
-        assert "rewrite" in cmd
-        assert "--forget" in cmd
-        assert {"id0", "id1"} <= set(cmd)
+        assert cmd[2] == "restic-rewrite"
+        assert cmd[4:] == ["id0", "id1"]
 
     def test_plan_never_executes_anything(self):
         runner = FakeRunner(
@@ -193,7 +199,7 @@ class TestExecute:
         runner, p = _planned(state_dir / "Test.json")
         result = apply.execute(runner, p)
         assert result.status == job.ResultStatus.SUCCESS
-        assert any("rewrite" in c for c in runner.commands)
+        assert any(c[2] == "restic-rewrite" for c in runner.commands)
 
     def test_dry_run_reports_without_executing(self, state_dir):
         runner, p = _planned(state_dir / "Test.json", dry_run=True)
@@ -487,7 +493,7 @@ class TestReporting:
     def test_plan_json_carries_scope_and_the_exact_command(self):
         body = self._plan().to_json()
         assert body["snapshot_ids"] == ["id0", "id1"]
-        assert "rewrite" in body["command"]
+        assert "restic-rewrite" in body["command"]
         assert body["count"] == 1
         # Totals accumulate across snapshots — this is the space reclaimable by
         # rewriting all of them, where `--live` totals the bytes on disk.
@@ -553,6 +559,9 @@ needs_restic = pytest.mark.skipif(
 )
 
 
+
+
+
 @needs_restic
 class TestScheduledWork:
     """The wiring that did not exist: arming was a silent no-op, the phase had no
@@ -565,6 +574,7 @@ class TestScheduledWork:
         return cli._apply_excludes_phase(runs)
 
     def _armed(self, tmp_path, monkeypatch, state_dir):
+        monkeypatch.setattr(apply, "_rewrite_cmd", direct_rewrite_cmd)
         rj, src, repo = resolved_job(
             tmp_path, monkeypatch, excludes_list=["*.tmp", "cache"]
         )
@@ -654,6 +664,7 @@ class TestOrchestratorWiring:
     def _run(self, tmp_path, monkeypatch, prune_calls):
         from snap_bak import cli
 
+        monkeypatch.setattr(apply, "_rewrite_cmd", direct_rewrite_cmd)
         (tmp_path / "bak").mkdir(exist_ok=True)
         monkeypatch.setattr(job, "check_password_file", lambda repo: None)
         monkeypatch.setattr(
@@ -756,3 +767,15 @@ class TestVerbSurface:
 
         assert exc.value.code != 0
         assert restic(repo, "snapshots", "--json").stdout == before
+
+
+def test_rewrite_asks_the_wrapper(state_dir):
+    runner, _ = _planned(state_dir / "Test.json")
+    assert apply._rewrite_cmd(runner, ["id0", "id1"]) == [
+        config.SUDO,
+        config.SUDO_EXEC,
+        "restic-rewrite",
+        "Test",
+        "id0",
+        "id1",
+    ]

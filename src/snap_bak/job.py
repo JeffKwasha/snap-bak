@@ -585,7 +585,10 @@ class Runner:
                 logger.debug(f"STDERR: {result.stderr}")
                 # restic sometimes only warns on cache problems yet still succeeds;
                 # surface those so a misconfigured cache dir is visible.
-                if cmd and cmd[0] == "restic":
+                if cmd and (
+                    cmd[0] == "restic"
+                    or (len(cmd) > 2 and cmd[1] == config.SUDO_EXEC)
+                ):
                     for line in result.stderr.splitlines():
                         low = line.lower()
                         if "cache" in low and any(k in low for k in _CACHE_KEYWORDS):
@@ -610,6 +613,10 @@ class Runner:
                 f"restic_options contains reserved flag '{opt}' which snap-bak manages; ignoring it."
             ),
         )
+
+    def _wrapper_restic_op(self, op, *args):
+        """A mutating restic call the root wrapper builds from config."""
+        return [config.SUDO, config.SUDO_EXEC, op, self.job.name, *args]
 
     def _write_status(self, status, message, **fields):
         if not self.dry_run:
@@ -755,11 +762,7 @@ class Runner:
                 "remote snapshots are kept forever."
             )
             return
-        cmd = self._restic_cmd("forget", repo)
-        cmd.extend(["--tag", self.tag])
-        for key, val in self.job.backup_retention.items():
-            cmd.extend([f"--keep-{key}", str(val)])
-        self.run_command(cmd)
+        self.run_command(self._wrapper_restic_op("restic-forget"))
 
     def retention(self) -> Result | None:
         """Forget policy; reports (never raises) retention_failed."""
@@ -791,7 +794,7 @@ class Runner:
         """
         started = time.monotonic()
         try:
-            self.run_command(self._restic_cmd("prune"))
+            self.run_command(self._wrapper_restic_op("restic-prune"))
         except Exception as e:
             msg = str(e)
             logger.exception(f"Prune failed for {self.repo.path}: {msg}")
@@ -1050,8 +1053,8 @@ class Runner:
 
     def _preflight(self, mount_point, repo=None) -> int:
         logger.debug("Running preflight")
-        cmd = self._restic_cmd("backup", repo)
-        cmd.extend([str(mount_point), "--tag", self.tag, "--json", "--dry-run"])
+        # The wrapper derives the mount point, tag, repo and options from config.
+        cmd = self._wrapper_restic_op("restic-backup-dry-run")
         try:
             result = self.run_command(cmd)
             summary = restic.last_json_line(result.stdout)
@@ -1070,8 +1073,8 @@ class Runner:
             return 0
 
     def _backup(self, mount_point, repo=None) -> str | None:
-        cmd = self._restic_cmd("backup", repo)
-        cmd.extend([str(mount_point), "--tag", self.tag, "--json"])
+        # The wrapper derives the mount point, tag, repo and options from config.
+        cmd = self._wrapper_restic_op("restic-backup")
         try:
             result = self.run_command(cmd)
         except subprocess.CalledProcessError as e:

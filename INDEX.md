@@ -266,6 +266,10 @@ Conventions:
 | [[R-CLI-28]] | SPEC.md | CLI |
 | [[R-CLI-29]] | SPEC.md | CLI |
 | [[R-CLI-30]] | SPEC.md | CLI |
+| [[R-CLI-31]] | SPEC.md | CLI, Help |
+| [[R-CLI-32]] | SPEC.md | CLI, Help |
+| [[R-CLI-33]] | SPEC.md | CLI, Help |
+| [[R-CLI-34]] | SPEC.md | CLI, Help |
 | [[R-ENV-01]] | SPEC.md | CLI, Environment Variables |
 | [[R-ENV-02]] | SPEC.md | CLI, Environment Variables |
 | [[R-ENV-03]] | SPEC.md | CLI, Environment Variables |
@@ -289,6 +293,12 @@ Conventions:
 | [[R-PRIV-15]] | SPEC.md | Privileged Operations & Security |
 | [[R-PRIV-16]] | SPEC.md | Privileged Operations & Security |
 | [[R-PRIV-17]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-18]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-19]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-20]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-21]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-22]] | SPEC.md | Privileged Operations & Security |
+| [[R-PRIV-23]] | SPEC.md | Privileged Operations & Security |
 | [[R-FLOW-01]] | SPEC.md | Execution Flow |
 | [[R-FLOW-02]] | SPEC.md | Execution Flow |
 | [[R-FLOW-03]] | SPEC.md | Execution Flow |
