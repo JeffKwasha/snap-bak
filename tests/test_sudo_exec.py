@@ -784,7 +784,7 @@ class TestCapabilityPreflight:
 
     def test_code_is_named_and_distinct(self):  # [[R-PRIV-10]]
         assert io.EXIT_RESTIC_CAPABILITY == 5
-        assert io.EXIT_RESTIC_CAPABILITY not in (3, 4)
+        assert io.EXIT_RESTIC_CAPABILITY not in (1, 2, 3, 4)
 
     def test_both_backup_ops_call_preflight(  # [[R-PRIV-16]]
         self, monkeypatch, tmp_path
@@ -796,3 +796,22 @@ class TestCapabilityPreflight:
         io._op_restic_backup(rj, dry_run=False)
         io._op_restic_backup(rj, dry_run=True)
         assert len(calls) == 2
+
+    @pytest.mark.parametrize(
+        "state",
+        [restic.CapabilityState.ABSENT, restic.CapabilityState.INEFFECTIVE],
+    )
+    def test_backup_ops_refuse_without_executing_restic(  # [[R-PRIV-10]]
+        self, monkeypatch, tmp_path, state
+    ):
+        rj = self._rj(tmp_path)
+        monkeypatch.setattr(io.restic, "read_capability", lambda p: state)
+        executed = []
+        monkeypatch.setattr(
+            io, "_run_restic", lambda cmd, **kw: executed.append(cmd)
+        )
+        for dry_run in (False, True):
+            with pytest.raises(SystemExit) as exc:
+                io._op_restic_backup(rj, dry_run=dry_run)
+            assert exc.value.code == io.EXIT_RESTIC_CAPABILITY
+        assert executed == []
